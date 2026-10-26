@@ -2,7 +2,7 @@
 //! audio for a while, prints timing statistics and writes the bitstream.
 //! Run it on the host itself to get exact latencies (same clock).
 //!
-//!   probe [-C X,Y (click)] [-k KEYS] [-g PAD_BUTTONS] [-x N (stress reconfiguration)] [-m 0 (no pointer motion)] [-c h264|hevc|av1] [-s WxH] [-r HZ] [-b KBPS] [-t SECONDS] [-o FILE] HOST:PORT TOKEN
+//!   probe [-1 FLAGS (Hello flags: 1 one video stream, 2 video datagrams)] [-C X,Y (click)] [-k KEYS] [-g PAD_BUTTONS] [-x N (stress reconfiguration)] [-m 0 (no pointer motion)] [-c h264|hevc|av1] [-s WxH] [-r HZ] [-b KBPS] [-t SECONDS] [-o FILE] HOST:PORT
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -58,6 +58,10 @@ async fn main() -> Result<()> {
     let secs: u64 = opt("-t", "5").parse()?;
     let out = opt("-o", "");
     let wiggle = opt("-m", "1") != "0";
+    // -1 FLAGS: Hello flags, 1 = all video on one stream (as WebKit clients
+    // do), 2 = video as datagrams.
+    let flags: u8 = opt("-1", "0").parse()?;
+    let one_stream = flags == 1;
     // -x N: every 300 ms alternate bitrate, size (full/half) and refresh (as is/30 Hz), N times.
     let stress: u32 = opt("-x", "0").parse()?;
     // -X MASK: what -x changes: 1 bitrate, 2 size, 4 refresh (default all).
@@ -71,21 +75,21 @@ async fn main() -> Result<()> {
     };
     // -g BUTTONS: tap these standard-gamepad buttons on pad 0, 600 ms apart.
     let pad_buttons: Vec<u32> = opt("-g", "").split(',').filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect();
-    let [addr, token] = &args[..] else { bail!("usage: probe [opts] HOST:PORT TOKEN") };
+    let [addr] = &args[..] else { bail!("usage: probe [opts] HOST:PORT") };
 
     let config = ClientConfig::builder().with_bind_default().with_no_cert_validation().build();
     let endpoint = Endpoint::client(config)?;
     let conn = endpoint.connect(format!("https://{addr}/")).await?;
     let (mut send, mut recv) = conn.open_bi().await?.await?;
     let mut hello = Vec::new();
-    hello.extend_from_slice(&1u16.to_le_bytes());
+    hello.extend_from_slice(&2u16.to_le_bytes());
     hello.extend_from_slice(&w.to_le_bytes());
     hello.extend_from_slice(&h.to_le_bytes());
     hello.extend_from_slice(&refresh.to_le_bytes());
     hello.extend_from_slice(&kbps.to_le_bytes());
     hello.push(1 << codec);
     hello.push(codec);
-    hello.extend_from_slice(token.as_bytes());
+    hello.push(flags);
     send.write_all(&message(0x01, &hello)).await?;
 
     let mut head = [0u8; 5];
@@ -209,14 +213,37 @@ async fn main() -> Result<()> {
         }
     });
 
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, u64)>();
     let audio = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let audio_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let audio_loud = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     {
-        let (conn, audio, audio_bytes, audio_loud) =
-            (conn.clone(), audio.clone(), audio_bytes.clone(), audio_loud.clone());
+        let (conn, audio, audio_bytes, audio_loud, tx) =
+            (conn.clone(), audio.clone(), audio_bytes.clone(), audio_loud.clone(), tx.clone());
         tokio::spawn(async move {
+            // Datagram video: frame id → (pieces, pieces received).
+            let mut frames: std::collections::HashMap<u32, (Vec<Option<Vec<u8>>>, usize)> = Default::default();
             while let Ok(d) = conn.receive_datagram().await {
+                let p = d.payload();
+                if p.len() > 9 && p[0] == 2 {
+                    let id = u32::from_le_bytes(p[1..5].try_into().unwrap());
+                    let index = u16::from_le_bytes(p[5..7].try_into().unwrap()) as usize;
+                    let count = u16::from_le_bytes(p[7..9].try_into().unwrap()) as usize;
+                    if frames.len() > 16 {
+                        let oldest = *frames.keys().min().unwrap();
+                        frames.remove(&oldest);
+                    }
+                    let (parts, got) = frames.entry(id).or_insert_with(|| (vec![None; count], 0));
+                    if index < parts.len() && parts[index].is_none() {
+                        parts[index] = Some(p[9..].to_vec());
+                        *got += 1;
+                    }
+                    if *got == parts.len() {
+                        let (parts, _) = frames.remove(&id).unwrap();
+                        let _ = tx.send((parts.into_iter().flatten().flatten().collect(), now_ns()));
+                    }
+                    continue;
+                }
                 let opus = d.payload().len().saturating_sub(13);
                 audio.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 audio_bytes.fetch_add(opus, std::sync::atomic::Ordering::Relaxed);
@@ -229,9 +256,25 @@ async fn main() -> Result<()> {
     }
 
     let mut file = if out.is_empty() { None } else { Some(std::fs::File::create(&out)?) };
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, u64)>();
     let c2 = conn.clone();
     tokio::spawn(async move {
+        if flags == 2 {
+            return;
+        }
+        if one_stream {
+            let Ok(mut s) = c2.accept_uni().await else { return };
+            loop {
+                let mut len = [0u8; 4];
+                if s.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let mut data = vec![0u8; u32::from_le_bytes(len) as usize];
+                if s.read_exact(&mut data).await.is_err() {
+                    return;
+                }
+                let _ = tx.send((data, now_ns()));
+            }
+        }
         while let Ok(mut s) = c2.accept_uni().await {
             let tx = tx.clone();
             tokio::spawn(async move {

@@ -1,4 +1,4 @@
-//! gmstream: stream SteamOS Game Mode to a browser.
+//! gmstram: stream SteamOS Game Mode to a browser.
 //!
 //! One process: the C core (core/) is the Wayland host gamescope draws into
 //! and encodes every frame the moment it is presented; this side serves the
@@ -6,6 +6,8 @@
 
 mod core;
 mod session;
+mod transport;
+mod udp;
 mod web;
 
 use std::process::exit;
@@ -86,11 +88,6 @@ fn main() {
         eprintln!("gmstream: {}: {e}", dir.display());
         exit(1);
     }
-    let token = web::load_token(&dir).unwrap_or_else(|e| {
-        eprintln!("gmstream: token: {e:#}");
-        exit(1)
-    });
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .thread_name("gmstream-net")
@@ -99,9 +96,9 @@ fn main() {
         .expect("tokio runtime");
     let hash: session::CertHash = Arc::new(RwLock::new(String::from("[]")));
     {
-        let (token, hash) = (token.clone(), hash.clone());
+        let hash = hash.clone();
         runtime.spawn(async move {
-            if let Err(e) = session::serve(port, token, hash).await {
+            if let Err(e) = session::serve(port, hash).await {
                 eprintln!("gmstream: WebTransport: {e:#}");
                 exit(1);
             }
@@ -116,7 +113,7 @@ fn main() {
             }
         });
     }
-    eprintln!("gmstream: open https://{}.local:{port}/#{token}", web::hostname());
+    eprintln!("gmstream: open https://{}.local:{port}/", web::hostname());
 
     // The compositor thread can end up blocked inside the GPU driver (seen
     // with Mesa's VA-API: a spin while holding its lock). Nothing recovers

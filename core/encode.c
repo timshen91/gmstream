@@ -82,6 +82,10 @@ struct gm_encoder {
 	unsigned stats_encoded, stats_dropped;
 	uint64_t stats_encode_ns;
 
+	// PyroWave runs instead of VA-API while it is the session's codec.
+	struct gm_pyrowave *pw;
+	bool pw_active; // compositor thread
+
 	// Worker thread only. Frame ids run on across encoder sessions so the
 	// client can tell a gap from a restart.
 	uint32_t next_frame_id;
@@ -338,6 +342,10 @@ static bool copy_frame(struct gm_encoder *enc, VASurfaceID src,
 
 void encoder_submit(struct gm_encoder *enc, struct wlr_buffer *buffer,
 		int width, int height, uint64_t slot_ns) {
+	if (enc->pw_active) {
+		pyrowave_submit(enc->pw, buffer, width, height, slot_ns);
+		return;
+	}
 	pthread_mutex_lock(&enc->lock);
 	bool active = enc->active;
 	pthread_mutex_unlock(&enc->lock);
@@ -432,6 +440,8 @@ static bool session_open(struct gm_encoder *enc, struct session *s,
 		case GM_CODEC_AV1:
 			ctx->profile = AV_PROFILE_AV1_MAIN;
 			break;
+		case GM_CODEC_PYROWAVE:
+			break; // not a VA-API codec (pyrowave.c)
 		}
 		av_opt_set(ctx->priv_data, "async_depth", "1", 0);
 		av_opt_set(ctx->priv_data, "rc_mode", rc_modes[i], 0);
@@ -620,6 +630,11 @@ struct gm_encoder *encoder_create(int drm_fd, const struct gm_callbacks *cb) {
 		goto err;
 	}
 
+	enc->pw = pyrowave_create(cb);
+	if (enc->pw != NULL) {
+		enc->supported |= 1u << GM_CODEC_PYROWAVE;
+	}
+
 	pthread_mutex_init(&enc->lock, NULL);
 	pthread_cond_init(&enc->cond, NULL);
 	pthread_create(&enc->thread, NULL, encoder_thread, enc);
@@ -647,6 +662,7 @@ void encoder_destroy(struct gm_encoder *enc) {
 	pthread_mutex_unlock(&enc->lock);
 	pthread_join(enc->thread, NULL);
 	av_frame_free(&enc->pending.frame);
+	pyrowave_destroy(enc->pw);
 
 	struct import *imp, *tmp;
 	wl_list_for_each_safe(imp, tmp, &enc->imports, link) {
@@ -671,6 +687,19 @@ uint32_t encoder_supported_codecs(struct gm_encoder *enc) {
 
 void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 		int bitrate_kbps, int refresh_mhz) {
+	enc->pw_active = codec == GM_CODEC_PYROWAVE && enc->pw != NULL;
+	if (enc->pw_active) {
+		pyrowave_start(enc->pw, bitrate_kbps, refresh_mhz);
+		pthread_mutex_lock(&enc->lock);
+		enc->active = false; // the VA-API worker closes its session
+		av_frame_free(&enc->pending.frame);
+		pthread_cond_signal(&enc->cond);
+		pthread_mutex_unlock(&enc->lock);
+		return;
+	}
+	if (enc->pw != NULL) {
+		pyrowave_stop(enc->pw);
+	}
 	pthread_mutex_lock(&enc->lock);
 	enc->active = true;
 	enc->codec = codec;
@@ -681,6 +710,10 @@ void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 }
 
 void encoder_stop(struct gm_encoder *enc) {
+	if (enc->pw != NULL) {
+		pyrowave_stop(enc->pw);
+	}
+	enc->pw_active = false;
 	pthread_mutex_lock(&enc->lock);
 	enc->active = false;
 	av_frame_free(&enc->pending.frame);
@@ -689,6 +722,9 @@ void encoder_stop(struct gm_encoder *enc) {
 }
 
 void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps) {
+	if (enc->pw != NULL) {
+		pyrowave_set_rate(enc->pw, bitrate_kbps, 0);
+	}
 	pthread_mutex_lock(&enc->lock);
 	if (enc->bitrate_kbps != bitrate_kbps) {
 		enc->bitrate_kbps = bitrate_kbps;
@@ -698,6 +734,9 @@ void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps) {
 }
 
 void encoder_set_refresh(struct gm_encoder *enc, int refresh_mhz) {
+	if (enc->pw != NULL) {
+		pyrowave_set_rate(enc->pw, 0, refresh_mhz);
+	}
 	pthread_mutex_lock(&enc->lock);
 	if (enc->refresh_mhz != refresh_mhz) {
 		enc->refresh_mhz = refresh_mhz;
@@ -717,6 +756,16 @@ void encoder_take_stats(struct gm_encoder *enc, unsigned *encoded,
 	pthread_mutex_lock(&enc->lock);
 	*encoded = enc->stats_encoded;
 	*dropped = enc->stats_dropped;
+	if (enc->pw != NULL) {
+		unsigned pe, pd;
+		uint64_t pns;
+		pyrowave_take_stats(enc->pw, &pe, &pd, &pns);
+		enc->stats_encoded += pe;
+		enc->stats_dropped += pd;
+		enc->stats_encode_ns += pns;
+		*encoded = enc->stats_encoded;
+		*dropped = enc->stats_dropped;
+	}
 	*avg_encode_ms = enc->stats_encoded > 0 ?
 		(double)enc->stats_encode_ns / enc->stats_encoded / 1e6 : 0;
 	enc->stats_encoded = enc->stats_dropped = 0;

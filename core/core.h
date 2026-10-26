@@ -27,6 +27,20 @@ void encoder_submit(struct gm_encoder *enc, struct wlr_buffer *buffer,
 void encoder_take_stats(struct gm_encoder *enc, unsigned *encoded,
 	unsigned *dropped, double *avg_encode_ms);
 
+/* pyrowave.c: PyroWave encode straight from gamescope's dma-buf; its own
+ * worker thread. NULL from create when there is no usable Vulkan device. */
+struct gm_pyrowave;
+struct gm_pyrowave *pyrowave_create(const struct gm_callbacks *cb);
+void pyrowave_destroy(struct gm_pyrowave *pw);
+void pyrowave_start(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz);
+void pyrowave_stop(struct gm_pyrowave *pw);
+void pyrowave_set_rate(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz);
+// Compositor thread. False if the buffer cannot be encoded (not a dma-buf).
+bool pyrowave_submit(struct gm_pyrowave *pw, struct wlr_buffer *buffer,
+	int width, int height, uint64_t slot_ns);
+void pyrowave_take_stats(struct gm_pyrowave *pw, unsigned *encoded,
+	unsigned *dropped, uint64_t *encode_ns);
+
 /* audio.c: PipeWire capture of the default sink → Opus. */
 struct gm_audio;
 struct gm_audio *audio_create(const struct gm_callbacks *cb);

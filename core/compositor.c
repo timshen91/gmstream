@@ -140,6 +140,11 @@ struct vd_server {
 	struct wl_event_source *pace_source;
 	bool pace_armed;
 	uint64_t last_slot_ns;
+	// The client's display grid (host clock), when it reports one: gamescope
+	// then gets fixed-refresh presentation feedback on it instead of VRR, and
+	// its own just-in-time scheduler lines frames up with the client's
+	// refreshes. 0: none.
+	uint64_t grid_anchor_ns, grid_interval_ns, grid_last_vblank_ns;
 
 	struct gm_encoder *encoder;
 	struct gm_audio *audio;
@@ -390,20 +395,47 @@ static void focus_view(struct vd_server *server) {
 		server->cursor_x, server->cursor_y);
 }
 
-// Answers the commit's presentation feedback, if it asked for any, as shown
-// at `when_ns` on a VRR display.
+// The vblank of the client's display grid a new frame flips on: the next
+// grid point, one later than the last one reported. A commit without a new
+// frame gets the last one again, so reported times never run ahead.
+static uint64_t grid_vblank(struct vd_server *server, uint64_t now, bool frame) {
+	if (!frame && server->grid_last_vblank_ns != 0) {
+		return server->grid_last_vblank_ns;
+	}
+	uint64_t a = server->grid_anchor_ns, i = server->grid_interval_ns;
+	uint64_t vb = now <= a ? a : a + (now - a + i - 1) / i * i;
+	while (vb > i && vb - i >= now) {
+		vb -= i; // an anchor in the future
+	}
+	if (vb <= server->grid_last_vblank_ns) {
+		vb = server->grid_last_vblank_ns + i;
+	}
+	server->grid_last_vblank_ns = vb;
+	return vb;
+}
+
+// Answers the commit's presentation feedback, if it asked for any: shown at
+// `when_ns`, or with a client display grid, at that grid's next vblank.
+// Always as a VRR display (refresh 0): gamescope's Wayland backend reports
+// VRR support only then, and Steam hides its VRR toggle otherwise. With
+// Steam's toggle off gamescope still paces to these timestamps (its vblank
+// timer, at the output mode's refresh), so a client grid still sets where
+// frames land; with it on, gamescope presents as soon as frames are ready.
 static void send_feedback(struct vd_server *server, struct wlr_surface *surface,
-		uint64_t when_ns) {
+		uint64_t when_ns, bool frame) {
 	struct wlr_presentation_feedback *feedback =
 		wlr_presentation_surface_sampled(surface);
 	if (feedback == NULL) {
 		return;
 	}
+	if (server->grid_interval_ns != 0) {
+		when_ns = grid_vblank(server, gm_now_ns(), frame);
+	}
 	struct wlr_presentation_event event = {
 		.output = server->output,
 		.tv_sec = when_ns / 1000000000,
 		.tv_nsec = when_ns % 1000000000,
-		.refresh = 0, // variable refresh rate
+		.refresh = 0,
 	};
 	wlr_presentation_feedback_send_presented(feedback, &event);
 	wlr_presentation_feedback_destroy(feedback);
@@ -429,7 +461,7 @@ static void handle_view_commit(struct wl_listener *listener, void *data) {
 	}
 	if (view->toplevel->base->initial_commit) {
 		view->trace_commits = 20;
-		send_feedback(server, surface, gm_now_ns());
+		send_feedback(server, surface, gm_now_ns(), false);
 		wlr_log(WLR_INFO, "Configuring toplevel %p", (void *)view);
 		configure_view(server, view);
 		// The client waits for a configure before it maps. When a toplevel
@@ -442,7 +474,7 @@ static void handle_view_commit(struct wl_listener *listener, void *data) {
 	if (server->output == NULL ||
 			!(surface->current.committed & WLR_SURFACE_STATE_BUFFER) ||
 			surface->current.buffer == NULL) {
-		send_feedback(server, surface, gm_now_ns());
+		send_feedback(server, surface, gm_now_ns(), false);
 		return;
 	}
 	if (server->view != view) {
@@ -462,7 +494,9 @@ static void handle_view_commit(struct wl_listener *listener, void *data) {
 	} else {
 		uint64_t period = 1000000000000ull / (uint64_t)server->refresh;
 		slot = gm_now_ns();
-		if (server->last_slot_ns != 0 && slot < server->last_slot_ns + period) {
+		// On a client grid gamescope paces itself; no VRR cap.
+		if (server->grid_interval_ns == 0 && server->last_slot_ns != 0 &&
+				slot < server->last_slot_ns + period) {
 			slot = server->last_slot_ns + period;
 		}
 		server->last_slot_ns = slot;
@@ -473,7 +507,7 @@ static void handle_view_commit(struct wl_listener *listener, void *data) {
 	// instead), and it composites into a fixed ring of three images without
 	// waiting for releases: a late timestamp would let it composite again
 	// and again into the frame we are holding.
-	send_feedback(server, surface, slot);
+	send_feedback(server, surface, slot, true);
 
 	// gamescope sends the whole composited frame on its root surface when
 	// run with --force-composition; anything on subsurfaces is not shown.
@@ -910,6 +944,7 @@ enum cmd_type {
 	CMD_KEY,
 	CMD_PAD_UPDATE,
 	CMD_PAD_REMOVE,
+	CMD_DISPLAY_GRID,
 };
 
 struct cmd {
@@ -919,6 +954,7 @@ struct cmd {
 		struct { double x, y; int32_t v120_x, v120_y; } motion;
 		struct { uint32_t code; bool pressed; } key;
 		struct { uint8_t pad; struct gm_gamepad_state state; } pad;
+		struct { uint64_t anchor_ns, interval_ns; } grid;
 	};
 };
 
@@ -966,6 +1002,8 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		break;
 	case CMD_STREAM_START:
 		set_screen_size(server, c->stream.w, c->stream.h, c->stream.refresh);
+		server->grid_anchor_ns = server->grid_interval_ns = 0; // until this client reports one
+		server->grid_last_vblank_ns = 0;
 		if (server->encoder != NULL) {
 			encoder_start(server->encoder, c->stream.codec, c->stream.kbps,
 				server->refresh);
@@ -987,12 +1025,22 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		break;
 	case CMD_STREAM_STOP:
 		server->streaming = false;
+		server->grid_anchor_ns = server->grid_interval_ns = 0;
+		server->grid_last_vblank_ns = 0;
 		if (server->encoder != NULL) {
 			encoder_stop(server->encoder);
 		}
 		audio_stop(server->audio);
 		release_all_input(server);
 		gamepads_remove_all(server->gamepads);
+		break;
+	case CMD_DISPLAY_GRID:
+		if (server->grid_interval_ns == 0 && c->grid.interval_ns != 0) {
+			wlr_log(WLR_INFO, "Presenting on the client's display grid (%.3f Hz)",
+				1e9 / (double)c->grid.interval_ns);
+		}
+		server->grid_anchor_ns = c->grid.anchor_ns;
+		server->grid_interval_ns = c->grid.interval_ns;
 		break;
 	case CMD_KEYFRAME:
 		if (server->encoder != NULL) {
@@ -1075,6 +1123,11 @@ void gm_stream_configure(int width, int height, int refresh_mhz) {
 
 void gm_stream_stop(void) {
 	push((struct cmd){ .type = CMD_STREAM_STOP });
+}
+
+void gm_set_display_grid(uint64_t anchor_ns, uint64_t interval_ns) {
+	push((struct cmd){ .type = CMD_DISPLAY_GRID,
+		.grid = { anchor_ns, interval_ns } });
 }
 
 void gm_request_keyframe(void) {
