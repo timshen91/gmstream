@@ -1,0 +1,30 @@
+#!/bin/sh
+# Game Mode on gmstream: SteamOS's own session script, forked at every start
+# so it follows SteamOS updates, with one change to the gamescope command.
+# It runs our patched build of Valve's gamescope (~/gmstream/bin/gamescope,
+# see gamescope/ in the gmstream tree) when present, Valve's otherwise:
+# - WAYLAND_DISPLAY=gmstream-0: gamescope runs as a Wayland client of gmstream
+#   (that variable is what makes it pick its Wayland backend).
+# - --force-composition: every frame composited into one buffer.
+# The variables are set for gamescope only, so Steam and the other session
+# services never see them.
+#
+# LIBDECOR_PLUGIN_DIR: as a Wayland client gamescope creates its window
+# through libdecor, whose GTK plugin blocks on a D-Bus call to the settings
+# portal; at boot the portal starts only after this session is ready, so
+# gamescope would hang past the unit's 5 s start timeout. gmstream always
+# asks for server-side decorations, so libdecor draws nothing anyway; with no
+# plugins it uses its built-in fallback.
+set -eu
+stock=/usr/lib/steamos/gamescope-session
+fork="$XDG_RUNTIME_DIR/gmstream-gamescope-session"
+gamescope="$HOME/gmstream/bin/gamescope"
+[ -x "$gamescope" ] || gamescope=gamescope
+sed "s|^exec gamescope \\\\\$|WAYLAND_DISPLAY=gmstream-0 LIBDECOR_PLUGIN_DIR=/var/empty exec $gamescope --force-composition \\\\|" \
+	"$stock" > "$fork"
+if ! grep -q '^WAYLAND_DISPLAY=gmstream-0 .*exec [^ ]*gamescope --force-composition \\$' "$fork"; then
+	# The stock script changed shape: run it unmodified rather than break Game Mode.
+	echo "gmstream: unexpected $stock, starting stock Game Mode" >&2
+	exec "$stock"
+fi
+exec /bin/bash "$fork"

@@ -1,0 +1,40 @@
+Keep gamescope's toplevel mapped when the Wayland backend has nothing to show.
+
+--- a/src/Backends/WaylandBackend.cpp	2026-10-26 17:05:31
++++ b/src/Backends/WaylandBackend.cpp	2026-10-26 17:05:34
+@@ -1609,11 +1609,32 @@
+             wl_surface_set_opaque_region( m_pSurface, oState->bOpaque ? m_pBackend->GetFullRegion() : nullptr );
+             wl_surface_set_buffer_scale( m_pSurface, 1 );
+         }
+-        else
++        else if ( m_pFrame )
+         {
+-            if ( m_pFrame )
+-                m_bUnmappedAwaitingConfigure = true;
++            // Keep the toplevel mapped while there is nothing to show (for
++            // example while focus moves on as a game exits): show black.
++            // Attaching no buffer would unmap it, and xdg-shell then needs a
++            // fresh configure before anything can be shown again. Only the
++            // first detach of a mapped toplevel brings one; a second one
++            // before the next configure left us waiting forever.
++            if ( m_bUnmappedAwaitingConfigure )
++                return;
+ 
++            const uint32_t uScale = GetScale();
++            m_pBackend->GetBlackFb()->OnCompositorAcquire();
++            wp_viewport_set_source( m_pViewport,
++                wl_fixed_from_int( 0 ), wl_fixed_from_int( 0 ),
++                wl_fixed_from_int( 1 ), wl_fixed_from_int( 1 ) );
++            wp_viewport_set_destination( m_pViewport,
++                WaylandScaleToLogical( g_nOutputWidth, uScale ),
++                WaylandScaleToLogical( g_nOutputHeight, uScale ) );
++            wl_surface_attach( m_pSurface, m_pBackend->GetBlackFb()->GetHostBuffer(), 0, 0 );
++            wl_surface_damage( m_pSurface, 0, 0, INT32_MAX, INT32_MAX );
++            wl_surface_set_opaque_region( m_pSurface, m_pBackend->GetFullRegion() );
++            wl_surface_set_buffer_scale( m_pSurface, 1 );
++        }
++        else
++        {
+             wl_surface_attach( m_pSurface, nullptr, 0, 0 );
+             wl_surface_damage( m_pSurface, 0, 0, INT32_MAX, INT32_MAX );
+         }

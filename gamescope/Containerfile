@@ -1,0 +1,22 @@
+# Build environment for our patched gamescope: Arch pointed at SteamOS 3.9's
+# own package repos, so every library and glibc matches the device and the
+# binary uses the host's shared libraries exactly like Valve's build does.
+FROM docker.io/library/archlinux:latest
+RUN printf '%s\n' \
+	'[options]' 'HoldPkg = pacman glibc' 'Architecture = auto' 'ParallelDownloads = 10' \
+	'SigLevel = Never' \
+	'[jupiter-3.9]' 'Include = /etc/pacman.d/mirrorlist' \
+	'[holo-3.9]' 'Include = /etc/pacman.d/mirrorlist' \
+	'[core-3.9]' 'Include = /etc/pacman.d/mirrorlist' \
+	'[extra-3.9]' 'Include = /etc/pacman.d/mirrorlist' \
+	'[multilib-3.9]' 'Include = /etc/pacman.d/mirrorlist' > /etc/pacman.conf \
+	&& echo 'Server = https://steamdeck-packages.steamos.cloud/archlinux-mirror/$repo/os/$arch' > /etc/pacman.d/mirrorlist \
+	&& pacman -Syuu --noconfirm \
+	&& pacman -S --noconfirm --needed base-devel git openssh meson cmake ninja glslang glm \
+		vulkan-headers benchmark catch2 wayland-protocols \
+		xorg-xwayland libavif aom rav1e libxres xcb-util-errors freerdp xcb-util-wm \
+		libxcomposite pixman libinput seatd pipewire libxmu libxcursor libdecor libei luajit \
+		libxkbcommon libdrm wayland vulkan-icd-loader sdl2 libcap hwdata libdisplay-info \
+		lcms2 xcb-util-renderutil libxdamage libxtst \
+	&& pacman -Scc --noconfirm \
+	&& useradd -m builder
