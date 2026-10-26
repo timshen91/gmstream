@@ -15,7 +15,8 @@ enum Msg {
 }
 
 let protocolVersion: UInt16 = 2
-let datagramAudio: UInt8 = 1, datagramVideo: UInt8 = 2, datagramControl: UInt8 = 3, datagramPyroWave: UInt8 = 4
+let datagramAudio: UInt8 = 1, datagramVideo: UInt8 = 2, datagramControl: UInt8 = 3, datagramPyroWave: UInt8 = 4,
+    datagramAwake: UInt8 = 5
 let maxDatagram = 1400
 
 /// Little-endian message building.
@@ -71,6 +72,7 @@ final class Connection {
     private let sendLock = NSLock()
     private var sendSeq: UInt32 = 0
     private var running = true
+    private var awakeTimer: DispatchSourceTimer? // under sendLock
 
     // Host → client control stream reassembly (network thread only).
     private var controlNext: UInt32 = 0
@@ -134,6 +136,7 @@ final class Connection {
     }
 
     func stop() {
+        keepAwake(false)
         running = false
         shutdown(fd, SHUT_RDWR)
     }
@@ -164,6 +167,33 @@ final class Connection {
             }
             off += n
         }
+    }
+
+    /// Keeps this Mac's Wi-Fi out of power save: a 1-byte datagram 60 times
+    /// a second, which the host drops. Measured: a Mac that only receives
+    /// (pings every 500 ms) dozes about 10 times a minute and wakes at the
+    /// access point's next beacon (up to 102.4 ms later), so the stream
+    /// stalls 30-110 ms and the router drops what it can't hold. 200 Hz and
+    /// 60 Hz stopped every stall; 10 Hz did not help.
+    func keepAwake(_ on: Bool) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        awakeTimer?.cancel()
+        awakeTimer = nil
+        guard on, running else { return }
+        let t = DispatchSource.makeTimerSource(queue: .global(qos: .userInteractive))
+        t.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / 60), leeway: .milliseconds(1))
+        t.setEventHandler { [weak self] in self?.sendAwake() }
+        t.resume()
+        awakeTimer = t
+    }
+
+    private func sendAwake() {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        guard running else { return }
+        var b = datagramAwake
+        _ = Darwin.send(fd, &b, 1, 0)
     }
 
     /// Also the keepalive: the host ends a session after 10 s of silence.

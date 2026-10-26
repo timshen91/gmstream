@@ -44,6 +44,9 @@ struct Options {
     // than the game intends, as on Windows (no color management) or the
     // Steam Deck's screen (Steam's color vibrance).
     var vividColors = false
+    // A tiny datagram to the host 60 times a second, so this Mac's Wi-Fi
+    // doesn't doze while only receiving (Connection.keepAwake).
+    var keepWiFiAwake = true
     var layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:] // measuring
     var bgra = false // decoder output BGRA instead of NV12 (measuring)
     var probe: Double?
@@ -59,6 +62,7 @@ struct Options {
         if d.object(forKey: "showStats") != nil { showStats = d.bool(forKey: "showStats") }
         immediateFullScreen = d.bool(forKey: "immediateFullScreen")
         vividColors = d.bool(forKey: "vividColors")
+        if d.object(forKey: "keepWiFiAwake") != nil { keepWiFiAwake = d.bool(forKey: "keepWiFiAwake") }
 
         var it = args.makeIterator()
         while let a = it.next() {
@@ -78,6 +82,7 @@ struct Options {
             case "--mock": mock = true
             case "--no-vsync": immediateFullScreen = true
             case "--vivid": vividColors = true
+            case "--no-keep-awake": keepWiFiAwake = false
             case "--layer": layerKeys = Options.parseKeys(it.next() ?? "")
             case "--drawable": drawableKeys = Options.parseKeys(it.next() ?? "")
             case let s where s.hasPrefix("-"): _ = it.next() // e.g. -NSDocumentRevisionsDebugMode YES
@@ -114,6 +119,7 @@ struct Options {
         d.set(showStats, forKey: "showStats")
         d.set(immediateFullScreen, forKey: "immediateFullScreen")
         d.set(vividColors, forKey: "vividColors")
+        d.set(keepWiFiAwake, forKey: "keepWiFiAwake")
     }
 }
 
@@ -451,6 +457,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
             view.streamSize = CGSize(width: w, height: h)
             c.start(width: w, height: h, refreshMhz: refreshMhz(), kbps: options.mbps * 1000,
                     codecMask: clientCodecs, preferred: options.codec)
+            c.keepAwake(options.keepWiFiAwake)
         } catch {
             closed(reason: error.localizedDescription)
         }
@@ -620,6 +627,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         case .display: sendConfigure()
         case .stats: updateOverlay()
         case .present: applyPresentMode()
+        case .keepAwake: conn?.keepAwake(options.keepWiFiAwake)
         }
     }
 

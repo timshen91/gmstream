@@ -730,6 +730,21 @@ per-stage p50/p90 over 30–60 s; lessons that cost time:
   no stalls, total 12.4 / 14.4 → 10.9 / 12.3 ms (VRR display). Kept across
   replugs and reboots by a udev rule setting bConfigurationValue to 1 for
   0b95:1790.
+- Stalls with audio glitches (~10 a minute at 103 Mb/s, 30–110 ms with
+  nothing arriving, then a burst at air rate; the router held ~70 ms and
+  dropped the rest) were the Mac's Wi-Fi entering power save while only
+  receiving. Trace (GM_DEBUG_TRACE, mac/tools/trace.py): stall ends lock to
+  the access point's 102.4 ms beacon interval (the Mac wakes at the next
+  beacon's TIM); stall starts and the gaps of a real scan do not. The
+  firmware-sent frame count (`txFwFrames` in airportd's link-quality
+  stats) rises with stalls: Null frames entering and leaving power save.
+  Not BT coexistence (its PM counters stayed 0), not host scans (none
+  logged), no host log line near the stalls; fewer at 310 Mb/s. Uplink
+  datagrams from the Mac: 200 Hz and 60 Hz → no stall ≥ 30 ms in 3 min
+  (35 and ~30 in the 3 min before); 10 Hz → no change. macOS has no
+  setting for Wi-Fi power save (the APPLE80211 ioctls return EOPNOTSUPP),
+  so the Mac app sends a 1-byte keep-awake datagram 60 times a second
+  (Settings, on by default; PROTOCOL.md, "Plain UDP").
 - macOS Wi-Fi logs without root: `log stream --predicate 'process ==
   "airportd"'` shows link-quality stats every 5 s (RSSI, rates, A-MPDU and
   reorder counters, per-access-category TX), scans and who asked for them

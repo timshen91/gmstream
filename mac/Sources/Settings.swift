@@ -5,7 +5,7 @@
 import AppKit
 
 final class SettingsWindow: NSObject {
-    enum Change { case connection, bitrate, display, stats, present }
+    enum Change { case connection, bitrate, display, stats, present, keepAwake }
 
     let window: NSWindow
     /// Called after `options` has been updated and saved.
@@ -20,11 +20,12 @@ final class SettingsWindow: NSObject {
     private let stats = NSButton(checkboxWithTitle: "Show stats overlay (Cmd+I)", target: nil, action: nil)
     private let immediate = NSButton(checkboxWithTitle: "Lowest latency in full screen (vsync off, may tear)", target: nil, action: nil)
     private let vivid = NSButton(checkboxWithTitle: "Vivid colors (display's full gamut, as on Windows)", target: nil, action: nil)
+    private let awake = NSButton(checkboxWithTitle: "Keep Wi-Fi awake (60 tiny packets/s to the host)", target: nil, action: nil)
     private static let refreshRates = [30, 60, 90, 120, 144, 165, 240]
     private static let codecs: [(name: String, id: UInt8)] = [("H.264", 0), ("HEVC", 1), ("PyroWave", 3)]
 
     override init() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 290),
                           styleMask: [.titled, .closable], backing: .buffered, defer: true)
         super.init()
         window.title = "GMStream Settings"
@@ -38,7 +39,7 @@ final class SettingsWindow: NSObject {
             field.target = self
             field.action = #selector(changed(_:))
         }
-        for control in [codec, refresh, stats, immediate, vivid] as [NSControl] {
+        for control in [codec, refresh, stats, immediate, vivid, awake] as [NSControl] {
             control.target = self
             control.action = #selector(changed(_:))
         }
@@ -65,6 +66,7 @@ final class SettingsWindow: NSObject {
             [NSGridCell.emptyContentView, stats],
             [NSGridCell.emptyContentView, immediate],
             [NSGridCell.emptyContentView, vivid],
+            [NSGridCell.emptyContentView, awake],
         ])
         grid.rowSpacing = 10
         grid.columnSpacing = 8
@@ -105,6 +107,7 @@ final class SettingsWindow: NSObject {
         stats.state = options.showStats ? .on : .off
         immediate.state = options.immediateFullScreen ? .on : .off
         vivid.state = options.vividColors ? .on : .off
+        awake.state = options.keepWiFiAwake ? .on : .off
     }
 
     @objc private func changed(_ sender: NSControl) {
@@ -140,6 +143,9 @@ final class SettingsWindow: NSObject {
         case vivid:
             options.vividColors = vivid.state == .on
             change = .present
+        case awake:
+            options.keepWiFiAwake = awake.state == .on
+            change = .keepAwake
         default:
             options.showStats = stats.state == .on
             change = .stats
