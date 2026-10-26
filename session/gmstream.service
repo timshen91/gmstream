@@ -1,0 +1,9 @@
+# ~/.config/systemd/user/gmstream.service
+[Unit]
+Description=gmstream (Game Mode streaming host; gamescope's Wayland display)
+Before=gamescope-session.service
+
+[Service]
+ExecStart=%h/gmstream/gmstream -w gmstream-0 -s 1920x1080 -r 60
+Restart=on-failure
+Slice=session.slice

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gmstream</title>
+<style>
+  :root { color-scheme: dark; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; object-fit: contain; touch-action: none; }
+  #hud { position: fixed; top: 8px; left: 8px; font: 12px/1.35 ui-monospace, Menlo, monospace; color: #9f9;
+         background: #000a; padding: 4px 8px; border-radius: 4px; white-space: pre; pointer-events: none; }
+  #overlay { position: fixed; inset: 0; display: grid; place-items: center; background: #000c;
+             font: 16px system-ui, sans-serif; color: #ddd; text-align: center; }
+  #overlay button { font: inherit; padding: 10px 22px; margin: 6px; border-radius: 6px; border: 1px solid #666;
+                    background: #222; color: #eee; cursor: pointer; }
+  #overlay p { color: #999; font-size: 13px; max-width: 34em; }
+  #gear { position: fixed; top: 8px; right: 8px; width: 32px; height: 32px; border-radius: 16px; border: 0;
+          background: #0008; color: #ddd; font-size: 18px; line-height: 32px; cursor: pointer; opacity: 0.35; z-index: 2; }
+  #gear:hover { opacity: 1; }
+  #settings { position: fixed; top: 0; right: 0; bottom: 0; width: min(340px, 100vw); overflow-y: auto; box-sizing: border-box;
+              padding: 16px; background: #181818f2; color: #ddd; font: 13px system-ui, sans-serif; z-index: 3;
+              border-left: 1px solid #333; }
+  #settings h2 { font-size: 15px; margin: 0 0 12px; display: flex; justify-content: space-between; align-items: center; }
+  #settings h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #888; margin: 16px 0 6px; }
+  #settings label { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; align-items: center; margin: 8px 0; }
+  #settings label > span.note { grid-column: 1 / -1; color: #888; font-size: 11px; }
+  #settings input[type=range] { grid-column: 1 / -1; width: 100%; }
+  #settings input[type=text], #settings input[type=number], #settings select {
+    width: 110px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 3px 6px; font: inherit; }
+  #settings button { background: #2a2a2a; color: #eee; border: 1px solid #555; border-radius: 4px; padding: 4px 10px; font: inherit; cursor: pointer; }
+  #settings-info { color: #9c9; font-size: 11px; margin-top: 14px; }
+  #hint { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); font: 13px system-ui, sans-serif;
+          color: #ddd; background: #000b; padding: 6px 12px; border-radius: 4px; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div id="hud" hidden></div>
+<div id="hint" hidden>Click to capture the mouse</div>
+<button id="gear" title="Settings (Ctrl+Alt+Shift+S)">⚙</button>
+<form id="settings" hidden onsubmit="return false">
+  <h2>Settings <button type="button" id="settings-close">Close</button></h2>
+
+  <h3>Video</h3>
+  <label>Codec
+    <select name="codec"><option value="h264">H.264</option><option value="hevc">HEVC</option><option value="av1">AV1</option></select>
+    <span class="note">Changing it reconnects. Falls back if the host or browser can't do it.</span></label>
+  <label>Bitrate <output></output>
+    <input type="range" name="bitrateMbps" min="2" max="200" step="1"></label>
+  <label>Resolution scale <output></output>
+    <input type="range" name="scale" min="25" max="100" step="5">
+    <span class="note">Of this window's (or the screen's, in fullscreen) device pixels.</span></label>
+  <label>Max height <input type="number" name="maxHeight" min="0" step="2" placeholder="0 = none"></label>
+  <label>Fixed size <input type="text" name="customSize" placeholder="e.g. 2560x1600">
+    <span class="note">Overrides scale and max height.</span></label>
+  <label>Refresh rate
+    <select name="refresh"><option>30</option><option selected>60</option><option>90</option><option>120</option><option>144</option><option>165</option><option>240</option></select>
+    <span class="note">The host's frame-rate cap (VRR maximum).</span></label>
+  <label>Smooth scaling <input type="checkbox" name="smoothing"></label>
+
+  <h3>Network</h3>
+  <label>Missing-frame wait (ms) <input type="number" name="gapWaitMs" min="0" max="500" step="5">
+    <span class="note">How long a late frame may hold later ones before skipping to a keyframe.</span></label>
+
+  <h3>Audio</h3>
+  <label>Audio <input type="checkbox" name="audio"></label>
+  <label>Buffer target (ms) <input type="number" name="audioBufferMs" min="5" max="200" step="5">
+    <span class="note">Lower is less delay, more risk of crackles.</span></label>
+
+  <h3>Input</h3>
+  <label>Raw mouse (no OS acceleration) <input type="checkbox" name="rawMouse">
+    <span class="note">Applies to the next pointer capture.</span></label>
+
+  <h3>Display</h3>
+  <label>Stats overlay <input type="checkbox" name="hud"></label>
+
+  <p><button type="button" id="settings-reset">Reset to defaults</button></p>
+  <div id="settings-info"></div>
+</form>
+<div id="overlay">
+  <div>
+    <div id="status">gmstream</div>
+    <div><button id="fullscreen">Fullscreen</button><button id="window">Window</button><button id="overlay-settings">Settings</button></div>
+    <p>Hold Esc to leave fullscreen. Ctrl+Alt+Shift+S: settings, Ctrl+Alt+Shift+H: stats.</p>
+  </div>
+</div>
+<script type="module" src="client.js"></script>
+</body>
+</html>

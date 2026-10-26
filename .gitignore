@@ -1,0 +1,6 @@
+/target/
+/target-sym/
+/local.env
+/gamescope/cache/
+/gamescope/out/
+/gamescope/build.log
