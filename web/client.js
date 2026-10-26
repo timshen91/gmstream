@@ -1,12 +1,14 @@
 // gmstream web client: WebTransport + WebCodecs. See PROTOCOL.md.
 //
-// Latency choices: every video frame arrives on its own QUIC stream and is
-// decoded as soon as it is complete and in order; decoded frames are drawn to
+// Latency choices: every video frame arrives on its own QUIC stream (or, on
+// WebKit, all on one stream) and is decoded as soon as it is complete and in
+// order; decoded frames are drawn to
 // a desynchronized canvas from the decoder callback (no requestAnimationFrame
 // wait). The mouse cursor is gamescope's image set as the native browser
 // cursor, so it moves with zero stream latency.
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
+const HELLO_ONE_VIDEO_STREAM = 1, HELLO_VIDEO_DATAGRAMS = 2;
 const CODECS = [ // index = codec id on the wire
   { name: 'h264', string: 'avc1.640034' },
   { name: 'hevc', string: 'hev1.1.6.L156.B0' },
@@ -25,16 +27,23 @@ const params = new URLSearchParams(location.search);
 const canvas = document.getElementById('screen');
 const ctx2d = canvas.getContext('2d', { alpha: false, desynchronized: true });
 const hud = document.getElementById('hud');
+const hudText = document.getElementById('hud-text');
 const hint = document.getElementById('hint');
 const overlay = document.getElementById('overlay');
 const statusEl = document.getElementById('status');
 
-let token = location.hash.slice(1);
-try {
-  if (token) localStorage.setItem('gmstream-token', token);
-  else token = localStorage.getItem('gmstream-token') || '';
-} catch {}
+// Older versions kept an access token here and in the URL fragment.
+try { localStorage.removeItem('gmstream-token'); } catch {}
 if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+
+// Sends a line to the host's log (for clients without devtools, like iPad).
+function remoteLog(text) {
+  console.log(text);
+  fetch('log', { method: 'POST', body: String(text).slice(0, 2000), keepalive: true })
+    .catch(() => {});
+}
+window.addEventListener('error', e => remoteLog(`error: ${e.message} at ${e.filename}:${e.lineno}`));
+window.addEventListener('unhandledrejection', e => remoteLog(`unhandled rejection: ${e.reason?.stack || e.reason}`));
 
 let session = null;
 
@@ -54,6 +63,7 @@ const DEFAULTS = {
   gapWaitMs: 30,      // how long a missing frame may hold up later ones
   rawMouse: true,     // Pointer Lock without OS acceleration
   smoothing: true,    // scale the video smoothly (else pixelated)
+  videoStreams: 'auto', // 'auto', 'per-frame', 'one' or 'datagrams' (see helloVideoFlags)
   hud: true,
 };
 const settings = { ...DEFAULTS };
@@ -105,6 +115,20 @@ class ByteReader {
 
 /* ---- display mode ------------------------------------------------------ */
 
+// One stream per frame lets a late frame be skipped, but WebKit (Safari and
+// every iPad browser) grants new streams too slowly for 60 fps and stops
+// granting them after a reset, so there all video shares one stream.
+// Datagrams (every frame split into UDP-sized pieces, no retransmission) are
+// opt-in.
+function helloVideoFlags() {
+  switch (settings.videoStreams) {
+    case 'per-frame': return 0;
+    case 'one': return HELLO_ONE_VIDEO_STREAM;
+    case 'datagrams': return HELLO_VIDEO_DATAGRAMS;
+  }
+  return /AppleWebKit/.test(navigator.userAgent) && !/Chrome\//.test(navigator.userAgent) ? HELLO_ONE_VIDEO_STREAM : 0;
+}
+
 function refreshMhz() {
   return Math.round(Number(settings.refresh) * 1000);
 }
@@ -113,10 +137,9 @@ function wantedSize() {
   const custom = /^(\d+)x(\d+)$/.exec(settings.customSize.trim());
   if (custom) return { w: Number(custom[1]) & ~1, h: Number(custom[2]) & ~1 };
   const dpr = window.devicePixelRatio || 1;
-  const fs = document.fullscreenElement != null;
   const k = Math.max(10, Math.min(100, settings.scale)) / 100;
-  let w = Math.round((fs ? screen.width : window.innerWidth) * dpr * k);
-  let h = Math.round((fs ? screen.height : window.innerHeight) * dpr * k);
+  let w = Math.round(window.innerWidth * dpr * k);
+  let h = Math.round(window.innerHeight * dpr * k);
   const max = settings.maxHeight;
   if (max && h > max) { w = Math.round(w * max / h); h = max; }
   return { w: w & ~1, h: h & ~1 };
@@ -128,6 +151,7 @@ function scheduleConfigure() {
   resizeTimer = setTimeout(() => {
     if (!session) return;
     const { w, h } = wantedSize();
+    remoteLog(`configure ${w}x${h}@${settings.refresh} window ${innerWidth}x${innerHeight} fullscreen ${document.fullscreenElement != null}`);
     session.send(message(C_CONFIGURE, 8, v => {
       v.setUint16(0, w, true); v.setUint16(2, h, true); v.setUint32(4, refreshMhz(), true);
     }));
@@ -140,6 +164,21 @@ document.addEventListener('fullscreenchange', () => {
 });
 
 // The rectangle (CSS px) the video occupies inside the canvas (object-fit: contain).
+// Fits the canvas into the visible window, keeping the stream's aspect ratio.
+// Done here rather than with 100vw/100vh and object-fit: on iPad, 100vh
+// includes the area behind the browser's toolbars.
+function layoutCanvas() {
+  const W = window.innerWidth, H = window.innerHeight;
+  const vw = canvas.width || W, vh = canvas.height || H;
+  const s = Math.min(W / vw, H / vh);
+  const w = vw * s, h = vh * s;
+  Object.assign(canvas.style, { width: `${w}px`, height: `${h}px`, left: `${(W - w) / 2}px`, top: `${(H - h) / 2}px` });
+}
+window.addEventListener('resize', layoutCanvas);
+window.visualViewport?.addEventListener('resize', layoutCanvas);
+document.addEventListener('fullscreenchange', layoutCanvas);
+layoutCanvas();
+
 function videoRect() {
   const r = canvas.getBoundingClientRect();
   const vw = canvas.width || 1, vh = canvas.height || 1;
@@ -159,12 +198,14 @@ class Session {
     this.decoderConfig = '';
     this.nextId = -1; // next frame id to decode; -1 = waiting for a keyframe
     this.pending = new Map();
+    this.fragments = new Map(); // datagram mode: frame id → pieces so far
     this.gapTimer = 0;
     this.frameTimes = new Map(); // chunk timestamp → timing info
-    this.stats = { frames: 0, bytes: 0, drops: 0, lat: [], net: [], dec: [] };
+    this.stats = { frames: 0, recv: 0, bytes: 0, drops: 0, lat: [], net: [], dec: [] };
     this.codec = 0;
     this.locked = false;
     this.audio = null;
+    this.streamErrors = 0; // video streams that failed mid-read
   }
 
   send(bytes) {
@@ -180,7 +221,12 @@ class Session {
       congestionControl: 'low-latency',
     });
     await this.wt.ready;
-    this.wt.closed.then(() => this.close('Disconnected'), e => this.close(`Disconnected: ${e.message || e}`));
+    // A keyframe arrives as hundreds of datagrams at once; the default queue
+    // would drop most of them before this page reads them.
+    try { this.wt.datagrams.incomingHighWaterMark = 4096; } catch {}
+    this.wt.closed.then(info => info?.reason === 'replaced'
+      ? this.close('Another client connected', false, true) // final, like the Error message
+      : this.close(info?.reason ? `Disconnected: ${info.reason}` : 'Disconnected'), e => this.close(`Disconnected: ${e.message || e}`));
     const ctrl = await this.wt.createBidirectionalStream();
     this.writer = ctrl.writable.getWriter();
 
@@ -193,14 +239,16 @@ class Session {
     const pref = Math.max(0, CODECS.findIndex(c => c.name === settings.codec));
     const bitrate = Math.round(settings.bitrateMbps * 1000);
     const { w, h } = wantedSize();
-    const tok = new TextEncoder().encode(token);
-    this.send(message(C_HELLO, 16 + tok.length, (v, b) => {
+    remoteLog(`hello ${w}x${h}@${settings.refresh} codecs ${mask} screen ${screen.width}x${screen.height} window ${innerWidth}x${innerHeight} dpr ${devicePixelRatio} video flags ${helloVideoFlags()} ${navigator.userAgent}`);
+    const videoFlags = helloVideoFlags();
+    this.oneStream = videoFlags === HELLO_ONE_VIDEO_STREAM;
+    this.send(message(C_HELLO, 17, (v, b) => {
       v.setUint16(0, PROTOCOL_VERSION, true);
       v.setUint16(2, w, true); v.setUint16(4, h, true);
       v.setUint32(6, refreshMhz(), true);
       v.setUint32(10, bitrate, true);
       v.setUint8(14, mask); v.setUint8(15, pref);
-      b.set(tok, 16);
+      v.setUint8(16, videoFlags);
     }));
 
     this.readControl(new ByteReader(ctrl.readable.getReader()));
@@ -209,6 +257,8 @@ class Session {
     this.pingTimer = setInterval(() => this.ping(), 500);
     this.ping();
     this.hudTimer = setInterval(() => this.updateHud(), 1000);
+    latencyChart.clear();
+    this.chartTimer = setInterval(() => { if (settings.hud) latencyChart.draw(); }, 100);
     this.padTimer = setInterval(() => pollGamepads(this), 4);
   }
 
@@ -216,7 +266,8 @@ class Session {
   close(reason, quiet = false, final = false) {
     if (this.closed) return;
     this.closed = true;
-    clearInterval(this.pingTimer); clearInterval(this.hudTimer); clearInterval(this.padTimer);
+    remoteLog(`session closed: ${reason || '(no reason)'}${final ? ' (final)' : ''}`);
+    clearInterval(this.pingTimer); clearInterval(this.hudTimer); clearInterval(this.padTimer); clearInterval(this.chartTimer);
     try { this.wt.close(); } catch {}
     try { this.decoder?.close(); } catch {}
     this.audio?.close();
@@ -277,10 +328,37 @@ class Session {
   async readFrames() {
     const streams = this.wt.incomingUnidirectionalStreams.getReader();
     for (;;) {
-      const { value: stream, done } = await streams.read().catch(() => ({ done: true }));
-      if (done) return;
-      this.readFrame(stream);
+      let next;
+      try { next = await streams.read(); } catch (e) { next = { done: true, error: e }; }
+      if (next.done) {
+        // Without this loop the browser grants the host no more streams, so
+        // video stops while the session stays up: reconnect instead.
+        if (!this.closed) {
+          remoteLog(`incoming streams ended: ${next.error?.message || next.error || 'done'} (${this.streamErrors} stream errors)`);
+          this.close('Video streams ended');
+        }
+        return;
+      }
+      if (this.oneStream) this.readFrameStream(next.value);
+      else this.readFrame(next.value);
     }
+  }
+
+  // One-stream mode: frames back to back, each after its u32 length.
+  async readFrameStream(stream) {
+    const r = new ByteReader(stream.getReader());
+    try {
+      for (;;) {
+        const head = await r.read(4);
+        if (!head) break;
+        const data = await r.read(new DataView(head.buffer).getUint32(0, true));
+        if (!data) break;
+        this.gotFrame(data, performance.now());
+      }
+    } catch (e) {
+      if (!this.closed) remoteLog(`video stream failed: ${e.message || e}`);
+    }
+    if (!this.closed) this.close('Video stream ended');
   }
 
   async readFrame(stream) {
@@ -294,11 +372,42 @@ class Session {
         chunks.push(value);
         size += value.length;
       }
-    } catch { return; } // reset by the host or cancelled
+    } catch { this.streamErrors++; return; } // reset by the host or cancelled
     const recv = performance.now();
     const data = new Uint8Array(size);
     let off = 0;
     for (const c of chunks) { data.set(c, off); off += c.length; }
+    this.gotFrame(data, recv);
+  }
+
+  // Datagram mode: collect a frame's pieces; a frame with a piece missing is
+  // never completed, and the gap logic in pump() skips to a keyframe.
+  videoFragment(id, index, count, part) {
+    if (this.nextId >= 0 && ((id - this.nextId) | 0) < 0) return; // stale
+    let f = this.fragments.get(id);
+    if (!f) {
+      f = { parts: new Array(count), got: 0, size: 0 };
+      this.fragments.set(id, f);
+      // Drop the oldest incomplete frames (Map keeps insertion order).
+      for (const old of this.fragments.keys()) {
+        if (this.fragments.size <= 16) break;
+        this.fragments.delete(old);
+      }
+    }
+    if (index >= count || f.parts[index]) return;
+    f.parts[index] = part;
+    f.got++;
+    f.size += part.length;
+    if (f.got < count) return;
+    this.fragments.delete(id);
+    const data = new Uint8Array(f.size);
+    let off = 0;
+    for (const p of f.parts) { data.set(p, off); off += p.length; }
+    this.gotFrame(data, performance.now());
+  }
+
+  gotFrame(data, recv) {
+    const size = data.length;
     if (size < 32) return;
     const v = new DataView(data.buffer);
     const f = {
@@ -312,6 +421,7 @@ class Session {
       recv,
     };
     this.stats.bytes += size;
+    this.stats.recv++;
     this.onFrame(f);
   }
 
@@ -359,7 +469,7 @@ class Session {
         this.decoder = new VideoDecoder({
           output: frame => this.draw(frame),
           error: e => {
-            console.warn('decoder error', e);
+            remoteLog(`decoder error: ${e.message || e}`);
             this.decoderConfig = '';
             this.nextId = -1;
             this.send(message(C_KEYFRAME, 0));
@@ -383,6 +493,8 @@ class Session {
     if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
       canvas.width = frame.displayWidth;
       canvas.height = frame.displayHeight;
+      layoutCanvas();
+      remoteLog(`video ${canvas.width}x${canvas.height} shown at ${canvas.style.width} x ${canvas.style.height} in window ${innerWidth}x${innerHeight}`);
     }
     ctx2d.drawImage(frame, 0, 0);
     const now = performance.now();
@@ -397,6 +509,7 @@ class Session {
       const slot = Number(t.f.slotNs) / 1e6 - this.offsetMs;
       const encoded = Number(t.f.encodedNs) / 1e6 - this.offsetMs;
       this.stats.lat.push(now - slot);
+      latencyChart.push(now, now - slot);
       this.stats.net.push(t.f.recv - encoded);
     }
   }
@@ -406,9 +519,11 @@ class Session {
     for (;;) {
       const { value, done } = await r.read().catch(() => ({ done: true }));
       if (done) return;
+      const v = new DataView(value.buffer, value.byteOffset, value.byteLength);
       if (value.length > 13 && value[0] === 1 && this.audio) {
-        const v = new DataView(value.buffer, value.byteOffset, value.byteLength);
         this.audio.push(Number(v.getBigUint64(5, true) / 1000n), value.subarray(13));
+      } else if (value.length > 9 && value[0] === 2) {
+        this.videoFragment(v.getUint32(1, true), v.getUint16(5, true), v.getUint16(7, true), value.subarray(9));
       }
     }
   }
@@ -424,16 +539,86 @@ class Session {
     const s = this.stats;
     const avg = a => a.length ? (a.reduce((x, y) => x + y, 0) / a.length).toFixed(1) : '-';
     const max = a => a.length ? Math.max(...a).toFixed(1) : '-';
-    hud.textContent =
+    hudText.textContent =
       `${CODECS[this.codec]?.name} ${canvas.width}x${canvas.height} ${s.frames} fps ` +
       `${(s.bytes * 8 / 1e6).toFixed(1)} Mbps\n` +
       `capture→display ${avg(s.lat)} ms (max ${max(s.lat)})\n` +
       `network ${avg(s.net)} ms  decode ${avg(s.dec)} ms  rtt ${this.rtt?.toFixed(1) ?? '-'} ms\n` +
       `audio buffer ${this.audio?.bufferedMs().toFixed(0) ?? '-'} ms  drops ${s.drops}`;
-    this.stats = { frames: 0, bytes: 0, drops: s.drops, lat: [], net: [], dec: [] };
-    if (params.has('log')) console.log(hud.textContent.replaceAll('\n', ' | '));
+    // Frames arriving but none shown: say where they are stuck.
+    if (s.recv > 0 && s.frames === 0) {
+      remoteLog(`stall: received ${s.recv} frames, drew 0; decoder ${this.decoder?.state} queue ${this.decoder?.decodeQueueSize}; ` +
+        `next ${this.nextId} pending ${this.pending.size} [${[...this.pending.keys()].slice(0, 4)}] drops ${s.drops}`);
+    }
+    this.stats = { frames: 0, recv: 0, bytes: 0, drops: s.drops, lat: [], net: [], dec: [] };
+    if (params.has('log')) console.log(hudText.textContent.replaceAll('\n', ' | '));
   }
 }
+
+/* ---- latency chart ----------------------------------------------------- */
+
+// The last 10 s of per-frame capture→display latency, under the HUD text, so
+// spikes stand out. The scale grows to fit spikes, in steps (never below
+// 20 ms). Pauses in the stream (a static screen sends no frames) break the
+// line rather than being drawn across.
+const latencyChart = {
+  WINDOW_MS: 10000,
+  GAP_MS: 250,
+  el: document.getElementById('hud-chart'),
+  points: [], // [time, latency ms]
+
+  push(t, ms) {
+    this.points.push([t, ms]);
+    while (this.points.length && this.points[0][0] < t - this.WINDOW_MS) this.points.shift();
+  },
+  clear() { this.points = []; this.draw(); },
+
+  draw() {
+    const c = this.el, dpr = window.devicePixelRatio || 1;
+    const W = c.clientWidth, H = c.clientHeight;
+    if (c.width !== Math.round(W * dpr) || c.height !== Math.round(H * dpr)) {
+      c.width = Math.round(W * dpr); c.height = Math.round(H * dpr);
+    }
+    const g = c.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+    const now = performance.now();
+    const pts = this.points.filter(p => p[0] >= now - this.WINDOW_MS);
+    const peak = pts.reduce((m, p) => Math.max(m, p[1]), 0);
+    const top = [20, 40, 80, 160, 320, 640, 1280].find(v => v >= peak) ?? Math.ceil(peak / 1000) * 1000;
+    const y = ms => H - 1 - Math.min(ms, top) / top * (H - 12);
+    const x = t => (t - (now - this.WINDOW_MS)) / this.WINDOW_MS * W;
+
+    // Recessive grid: the top of the scale and its midpoint, labelled.
+    g.font = '10px ui-monospace, Menlo, monospace';
+    g.textBaseline = 'top';
+    g.fillStyle = '#c3c2b7';
+    g.strokeStyle = '#ffffff22';
+    g.lineWidth = 1;
+    for (const v of [top, top / 2]) {
+      g.beginPath(); g.moveTo(0, Math.round(y(v)) + 0.5); g.lineTo(W, Math.round(y(v)) + 0.5); g.stroke();
+    }
+    g.fillText(`${top} ms`, 2, 0);
+    g.textBaseline = 'bottom';
+    g.fillText(`${top / 2}`, 2, Math.round(y(top / 2)) - 1);
+    g.textBaseline = 'top';
+    if (pts.length) {
+      const label = `max ${peak.toFixed(1)} ms`;
+      g.fillText(label, W - g.measureText(label).width - 2, 0);
+    }
+
+    g.strokeStyle = '#3987e5';
+    g.lineWidth = 1.5;
+    g.lineJoin = 'round';
+    g.beginPath();
+    let last = -Infinity;
+    for (const [t, ms] of pts) {
+      if (t - last > this.GAP_MS) g.moveTo(x(t), y(ms)); else g.lineTo(x(t), y(ms));
+      last = t;
+    }
+    g.stroke();
+  },
+};
 
 /* ---- audio ------------------------------------------------------------- */
 
@@ -468,12 +653,26 @@ class Player extends AudioWorkletProcessor {
 }
 registerProcessor('gm-player', Player);`;
 
-let audioCtx = null;
+let audioCtx = null, workletReady = null;
+// iPadOS (and Safari) only let audio start inside a user gesture, and an
+// await before it (fullscreen) can use the gesture up: so the context is
+// created and resumed synchronously from taps and key presses.
+function unlockAudio() {
+  // Media playback rules, not the ringer's (iOS WebKit).
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch {}
+  if (!audioCtx) {
+    audioCtx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+    workletReady = audioCtx.audioWorklet.addModule(url);
+  }
+  if (settings.audio && audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
+}
+for (const ev of ['pointerdown', 'keydown', 'touchend']) {
+  window.addEventListener(ev, () => { if (audioCtx && settings.audio && audioCtx.state !== 'running') unlockAudio(); }, true);
+}
 async function initAudio() {
-  if (audioCtx) return;
-  audioCtx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
-  const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
-  await audioCtx.audioWorklet.addModule(url);
+  unlockAudio();
+  await workletReady;
 }
 
 class AudioPlayer {
@@ -483,9 +682,25 @@ class AudioPlayer {
     this.node.port.onmessage = e => { this.ms = e.data; };
     this.node.connect(audioCtx.destination);
     this.node.port.postMessage({ targetMs: settings.audioBufferMs });
-    if (settings.audio) audioCtx.resume(); else audioCtx.suspend();
+    if (settings.audio) audioCtx.resume().catch(() => {}); else audioCtx.suspend();
+    this.packets = 0; this.decoded = 0;
+    if (typeof AudioDecoder === 'undefined') {
+      remoteLog('audio: this browser has no WebCodecs AudioDecoder');
+      this.decoder = null;
+      return;
+    }
+    AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 })
+      .then(s => remoteLog(`audio: context ${audioCtx.state}, opus decoder supported ${s.supported}`))
+      .catch(e => remoteLog(`audio: opus support check failed: ${e.message || e}`));
+    // Packets arriving but nothing decoded, or a context that never started.
+    setTimeout(() => {
+      if (!this.closed && (this.decoded === 0 || audioCtx.state !== 'running')) {
+        remoteLog(`audio: after 3 s, ${this.packets} packets, ${this.decoded} decoded, context ${audioCtx.state}, decoder ${this.decoder?.state}`);
+      }
+    }, 3000);
     this.decoder = new AudioDecoder({
       output: d => {
+        this.decoded++;
         const n = d.numberOfFrames, ch = d.numberOfChannels;
         const planes = [];
         for (let c = 0; c < ch; c++) {
@@ -498,15 +713,16 @@ class AudioPlayer {
         for (let i = 0; i < n; i++) { out[2 * i] = planes[0][i]; out[2 * i + 1] = planes[ch > 1 ? 1 : 0][i]; }
         this.node.port.postMessage(out, [out.buffer]);
       },
-      error: e => console.warn('audio decoder', e),
+      error: e => remoteLog(`audio decoder error: ${e.message || e}`),
     });
     this.decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
   }
   push(ts, data) {
-    if (this.decoder.state === 'configured') this.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data }));
+    this.packets++;
+    if (this.decoder?.state === 'configured') this.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data }));
   }
   bufferedMs() { return this.ms; }
-  close() { try { this.decoder.close(); } catch {} this.node.disconnect(); }
+  close() { this.closed = true; try { this.decoder?.close(); } catch {} this.node.disconnect(); }
 }
 
 /* ---- cursor ------------------------------------------------------------ */
@@ -708,7 +924,7 @@ async function connect(fullscreen) {
     session = new Session();
     await session.start();
   } catch (e) {
-    console.error(e);
+    remoteLog(`connect failed: ${e.stack || e}`);
     const reason = `Connection failed: ${e.message || e}`;
     if (session) session.close(reason);
     else if (wantConnected) { showOverlay(`${reason} — reconnecting…`); scheduleReconnect(); }
@@ -717,8 +933,8 @@ async function connect(fullscreen) {
   }
 }
 
-document.getElementById('fullscreen').onclick = () => connect(true);
-document.getElementById('window').onclick = () => connect(false);
+document.getElementById('fullscreen').onclick = () => { unlockAudio(); connect(true); };
+document.getElementById('window').onclick = () => { unlockAudio(); connect(false); };
 /* ---- settings panel ---------------------------------------------------- */
 
 const panel = document.getElementById('settings');
@@ -757,7 +973,7 @@ function onSettingChange(e) {
     session.send(message(C_BITRATE, 4, v => v.setUint32(0, Math.round(settings.bitrateMbps * 1000), true)));
   }
   if (['scale', 'maxHeight', 'customSize', 'refresh'].includes(k)) scheduleConfigure();
-  if (k === 'codec' && session && old !== settings.codec) {
+  if ((k === 'codec' || k === 'videoStreams') && session && old !== settings[k]) {
     const fs = document.fullscreenElement != null;
     session.close('', true);
     connect(fs);

@@ -183,7 +183,7 @@ feedback uploads (FF_RUMBLE) are tracked and played effects are forwarded as
 - `web.rs`: tiny HTTPS/1.1 server for `index.html`, `client.js` and
   `config.json`; a persistent self-signed certificate (800 days, SANs:
   hostname, `hostname.local`, localhost, current IPs; regenerated when
-  those change) and the access token in `~/.local/state/gmstream/`.
+  those change) in `~/.local/state/gmstream/`.
 - `main.rs`: blocks SIGCHLD/SIGINT/SIGTERM before any thread starts (the
   compositor takes them through signalfd), starts tokio, runs the compositor
   on the main thread.
@@ -203,6 +203,85 @@ feedback uploads (FF_RUMBLE) are tracked and played effects are forwarded as
 - HUD (Ctrl+Alt+Shift+H): fps, bitrate, capture→display, network, decode,
   RTT, audio buffer. `?codec=`, `?bitrate=`, `?maxheight=`, `?hud=0`;
   `?autostart&log` are for automated tests.
+
+### 3.7 Native macOS client (`mac/`)
+
+A reference client for latency work: plain UDP (PROTOCOL.md, "Plain UDP"),
+built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
+
+- Video: H.264/HEVC through VideoToolbox (NV12 output, converted in our
+  shader), PyroWave through its Metal port (`build/pyrowave`, same commit
+  as the host). Frames are drawn on a CAMetalLayer from a render thread.
+- Presentation (measured on an M4 MacBook Air, 60 Hz panel, in §5):
+  - vsync on, and the private `CAMetalLayer.disableFIFO`: a newer drawable
+    replaces a queued one. With FIFO, one frame that misses its refresh
+    delays every later one by a refresh for good (the source runs at the
+    panel's rate, so the queue never drains): the display stage sat at 24,
+    39, 55 or 71 ms depending on history. Without FIFO it is dropped instead.
+  - Phase lock (`Sources/Phase.swift`, protocol `DisplayGrid`): the client
+    sends its refresh grid in the host's clock; gmstream reports
+    gamescope's frames as presented on it, so gamescope's own just-in-time
+    scheduler produces frames on that grid. The feedback still says VRR
+    (refresh 0): gamescope's Wayland backend calls the display VRR-capable
+    only then, and Steam hides its VRR toggle otherwise; with the toggle off
+    gamescope paces to the timestamps all the same. The client sweeps
+    the grid's shift through one refresh (the display stage is a sawtooth
+    with one cut-off), locks just before the cut-off, and a servo then
+    follows the drift between the two machines' clocks (tens of ppm, which
+    otherwise crosses the cut-off within a minute). The margin from the
+    cut-off comes from the measured arrival jitter (median − 0.5th
+    percentile of the display stage, + 0.5 ms, + 0.5 ms per dropped frame).
+  - Full screen with "lowest latency" (Settings; vsync off only while in
+    full screen): the window server stops compositing (private
+    `displayCompositingInternalStatus` 0) and frames flip straight to the
+    panel: display stage ~4 ms instead of ~20. It tears: Metal's presented
+    times (the flips) land anywhere in the refresh, while with vsync they all
+    land at one phase (GM_DEBUG_FLIP logs each flip's phase).
+  - Full screen on a variable-refresh (Adaptive-Sync) display, detected from
+    `NSScreen.minimumRefreshInterval` / `maximumRefreshInterval`: the panel
+    refreshes when a frame arrives, so vsync costs nothing. The app keeps
+    vsync on, sends an empty grid (interval 0: gamescope paces itself) and
+    shows frames as they come, tear-free. Measured on a Dell U2725QE
+    (48–120 Hz) from an M4 MacBook Air: total 12.6 / 13.7 ms p50 / p90,
+    display stage 3.1 / 3.6 ms, pacing p90 ~2 ms. `present(atTime:)` to
+    smooth pacing made both pacing and p90 worse. In a window the desktop is
+    composited at a fixed rate (22–25 ms total).
+- The stats overlay is drawn into the video frame (one extra blended quad),
+  not as AppKit views over the Metal layer: a view that changes (the chart,
+  10 times a second) makes macOS composite the window for that frame
+  instead of flipping it straight to the display. As views, on the VRR
+  display: display stage p90 6.9 ms, pacing p90 7.5; drawn in, 3.6 and 2.
+- Color: the Metal layer is tagged sRGB, so macOS converts the stream to
+  the display (checked with a test card through the whole Mac path, and
+  against gamescope's own screenshot: within ±1–3). That looks muted next
+  to Windows, which does not color-manage (sRGB stretched to a wide-gamut
+  panel), and the Steam Deck's screen (Steam's color vibrance). Settings →
+  "Vivid colors" tags the layer with the display's own color space
+  instead: the pixels go to the panel unconverted, as on Windows.
+- Keyboard: all of it goes to the host while the stream window has focus,
+  Command as Meta. A local event monitor takes key events before AppKit's
+  menus and key-view handling (Ctrl+Tab / Ctrl+Shift+Tab, Steam's Quick
+  Access, never reach keyDown otherwise; key-ups with Command held are
+  dropped by AppKit), and the private `CGSSetGlobalHotKeyOperatingMode`
+  turns off the window server's shortcuts (Cmd+Tab, Spotlight, Mission
+  Control, screenshots) until the window loses focus. The trackpad and
+  mouse stay macOS's, and are how to leave: menu bar, another window, a
+  Mission Control swipe. App menu items work by mouse only.
+- Stats overlay (menu, or Settings): per-stage p50 / p90 / max over 5 s (encode,
+  network, queue, decode, render, display, total present → on screen), a
+  pacing row (|presentation interval − capture interval|), dropped frames,
+  the phase state, and a 10 s latency chart.
+- Input: keyboard (evdev codes from macOS key codes; Cmd stays with macOS),
+  mouse, scroll, pointer capture when the game asks for relative input,
+  gamescope's cursor as the native cursor, game controllers through the
+  GameController framework (Home/Options released from macOS's system
+  gestures), rumble through CoreHaptics. Audio: Opus through Apple's
+  decoder into AVAudioEngine with a 20 ms jitter buffer.
+- Socket traffic class `SO_NET_SERVICE_TYPE` = interactive video.
+- Measuring switches: `--stats-log`, `--hide-stats`, `--fullscreen`,
+  `--no-vsync`, `--layer key=v,…` / `--drawable key=v,…` (private
+  CAMetalLayer / CAMetalDrawable properties by key), `--bgra`, `--probe N`;
+  env `GM_DEBUG_PHASE`, `GM_DEBUG_DECODE`, `GM_DEBUG_NET`, `GM_NET_SERVICE`.
 
 ## 4. gamescope facts this design depends on
 
@@ -302,6 +381,41 @@ offset error, decode ≈ 1.4 ms.) 120 fps sustained with zero gaps, zero
 encoder drops and zero fence waits. Almost all host-side latency is the
 VCN encode itself; the VPP copy, queueing and the network stack are
 sub-millisecond.
+
+End to end, 2026-10-27, steamtab (wired) → M4 MacBook Air (802.11ax,
+5 GHz, 1200 Mb/s PHY), native client, PyroWave 1920x1080@60 at 100 Mb/s,
+a game running; gamescope present → on the panel:
+
+| client presentation | total p50 | p90 | dropped | pacing p90 |
+|---|---|---|---|---|
+| vsync queue (FIFO), no phase lock | 38.0 ms | 38.0 | 0 (but the queue can deepen to 55–71) | 0.0 |
+| `disableFIFO` + phase lock, window | 29–30 | 30 | ~0.8/s | 0.1–0.3 |
+| same, full screen | 28.0 | 28.3 | ~0.8/s | ~0 |
+| full screen, vsync off ("lowest latency"; tears) | 13.6 | 16.7 | ~0 | (not measurable) |
+| full screen on a VRR display (Dell U2725QE), vsync on | 12.6 | 13.7 | 0 | ~2 (p90) |
+
+Stages in that last row: encode 1.0, network 6.7 (first packet ~4.2 after
+encode: host send path + ~2 ms Wi-Fi one way; then a 264-packet burst of
+~2.6 ms), decode 2.1 (of which ~1.3 ms GPU time for the Metal decoder at
+1080p), render 0.2, display 3.9. Remaining levers: the host's send path
+(one syscall and allocation per datagram; batch with `sendmmsg`/GSO, larger
+packets on plain UDP, DSCP marking), and AWDL on the Mac (`sudo ifconfig
+awdl0 down` is the usual fix for periodic Wi-Fi spikes; needs root).
+
+Tried and dropped on the Mac (details in §8): presenting with vsync off in a
+window (macOS composites such frames one or two refreshes later
+unpredictably: p90 and pacing regress), scheduling presents from frame
+timestamps (same reason), CAMetalDisplayLink (in a window it plans ~3
+refreshes ahead even at `preferredFrameLatency` 1; in full screen its
+deadline is still a whole refresh before the frame is on screen), timing
+vsync-off flips to the vblank in full screen (the flip lands up to ~10 ms
+after the present, so they still tear, and latency rose to 28/46 ms), `present(atTime:)`, fewer drawables or frames
+in flight, the private `lowLatency`, `serverSyncEnabled`, `fenceEnabled`,
+`allowsDisplayCompositingWithCopy`, `lowWorkload`, `needsLowLatency`,
+`preferredLatency` (all within noise once FIFO is off), GPU queue priority
+(`setGPUPriority:` 2; no change), keeping the GPU busy to hold clocks
+(−0.1 ms decode), GPU performance-state assertions (need an Apple
+entitlement).
 
 Where the rest could come from, in order of expected payoff:
 
@@ -450,7 +564,7 @@ Gamepads are unaffected by the compositor: Steam reads controllers directly
     --force-composition --adaptive-sync -W 1920 -H 1080 -r 120 -- vkcube --wsi xcb
   ```
 
-  Open the printed `https://steamtab.local:8443/#<token>` in Chrome
+  Open `https://steamtab.local:8443/` in Chrome
   (accept the self-signed certificate once, or trust
   `~/.local/state/gmstream/cert.pem`). To keep it running after the ssh
   session ends, start it with `systemd-run --user --collect` (plain `&` or
@@ -566,6 +680,68 @@ does not need any of it.
   encoding disabled). Harmless as far as seen (gamescope only skips a
   refcount decrement); not yet understood.
 
+**macOS presentation experiments (2026-10-27).** Each measured with
+per-stage p50/p90 over 30–60 s; lessons that cost time:
+
+- The vsync queue's depth is history, not phase: once one frame misses its
+  refresh, every later frame waits an extra refresh (FIFO), and a stream at
+  the panel's rate never drains it. Most of the earlier "unexplained" runs
+  (display 39, 55, 71 ms) were this. `disableFIFO` fixes it.
+- With vsync off in a window, the window server shows a frame 0–28 ms after
+  submission depending on its own composite timing, not ours; neither
+  scheduling presents from frame timestamps nor phase-locking made that
+  predictable. In full screen it is a different path (direct flips).
+- A CADisplayLink from the screen tracks this app's own presents; use
+  CVDisplayLink for the panel's refresh grid. Its timestamps are not the
+  vblank itself: on the M4 MacBook Air's panel, vsync flips land ~7 ms after
+  them.
+- The window server's vsync cut-off is a whole refresh before the vblank, not
+  the vblank (as a PC's exclusive full screen has): CAMetalDisplayLink in full
+  screen at frame latency 1 reports its deadline 16.7 ms before the frame is
+  on screen, and the vsync display stage (submit → screen) is ~19 ms in full
+  screen as in a window. Vsync off skips that wait but cannot avoid tearing.
+- Wi-Fi (M4 Air, 802.11ax 80 MHz at 1200 Mb/s, -39 dBm; host wired): frame
+  arrival p50 7.2, p90 7.6, p99 8.8 ms after the host's encode. 0.8% of
+  frames arrive 2+ ms late, every ~2.05 s (multiples of ~1.02 s): a
+  periodic radio event, likely AWDL (GM_DEBUG_NET logs each frame's first
+  packet, burst and largest gap).
+- steamtab's wired port is a USB AX88179 under the generic `cdc_ncm`
+  driver, which holds outgoing packets up to `tx_timer_usecs` (400 µs) to
+  batch them: host → router ping 1.67 ms. With
+  `echo 0 > /sys/class/net/<if>/cdc_ncm/tx_timer_usecs` (runtime, resets on
+  replug or reboot): 0.46 ms; Mac → host ping min 3.5 → 2.2 ms. The video
+  stage barely moved (a frame's burst fills the batches anyway).
+- Host send path (GM_DEBUG_SEND logs it every 5 s): encode done → first
+  sendmmsg 0.02 ms, all ~260 datagrams handed to the kernel in ~0.8 ms.
+  Batched sends + DSCP AF41 together: total 12.9 / 14.8 → 12.4 / 14.4 ms
+  (VRR display). The ~4 ms from encode done to the first packet's arrival
+  on the Mac is past the host's NIC; part of it may be the ping-based
+  clock offset (it assumes symmetric Wi-Fi delay).
+- Stream stalls (every few seconds 3–5 frames arriving together 50–110 ms
+  late) and ~2.5 ms of every frame's network time were steamtab's USB
+  Ethernet adapter (ASIX AX88179A, 0b95:1790) running in its CDC NCM USB
+  configuration under `cdc_ncm`. Kernel receive timestamps
+  (SO_TIMESTAMP_MONOTONIC; GM_DEBUG_NET's "readlag") showed the packets
+  reached the Mac late; DSCP, the NCM tx timer, host pacing, AWDL/AirDrop/
+  Handoff/Location scans were ruled out; streaming over steamtab's Wi-Fi
+  instead nearly removed the stalls. Switching the adapter to its vendor
+  configuration (`echo 1 > /sys/bus/usb/devices/8-1/bConfigurationValue`,
+  driver `ax88179_178a`): frame arrival p50 / p99 7.2 / 10–42 → 4.6 / 6.5 ms,
+  no stalls, total 12.4 / 14.4 → 10.9 / 12.3 ms (VRR display). Kept across
+  replugs and reboots by a udev rule setting bConfigurationValue to 1 for
+  0b95:1790.
+- macOS Wi-Fi logs without root: `log stream --predicate 'process ==
+  "airportd"'` shows link-quality stats every 5 s (RSSI, rates, A-MPDU and
+  reorder counters, per-access-category TX), scans and who asked for them
+  (e.g. locationd), and the "realtime session" state (RT = 0x0: not active;
+  scans check AWDL realtime / AirPlay / Sidecar before running).
+- Anything in the window that changes (views over the Metal layer) costs
+  the direct flip for that frame; screenshots do too.
+- zsh does not split `$var` into words: test loops that passed several
+  flags in one variable silently ran with defaults (`${=var}` splits).
+- Frames dropped by the compositor do not show in a "presentation interval
+  vs capture interval" pacing metric (both double); count them separately.
+
 ## 9. Risks and open questions
 
 - **gamescope's nested Wayland backend in Steam mode is a rarely used
@@ -587,8 +763,9 @@ does not need any of it.
 - **Audio:** local speakers keep playing while streaming; no microphone.
   Host/client clock drift is handled by trimming the jitter buffer (an
   occasional tiny glitch) rather than resampling.
-- **Security:** single shared token over TLS on a LAN; revisit before
-  exposing beyond the LAN.
+- **Security:** no authentication (removed 2026-10-26 at the owner's
+  request): anyone who can reach port 8443 can watch the stream and send
+  input. LAN only; add access control before exposing it further.
 - **Steam Deck-style pointer lock** in games that hide the cursor (gamescope
   relative mode → client Pointer Lock) is implemented but not yet exercised
   with a real game.

@@ -18,6 +18,7 @@ enum gm_codec {
 	GM_CODEC_H264 = 0,
 	GM_CODEC_HEVC = 1,
 	GM_CODEC_AV1 = 2,
+	GM_CODEC_PYROWAVE = 3, // GPU wavelet, intra-only, fixed bytes per frame
 };
 
 struct gm_config {
@@ -71,6 +72,10 @@ void gm_stream_start(enum gm_codec codec, int width, int height,
 	int refresh_mhz, int bitrate_kbps);
 void gm_stream_configure(int width, int height, int refresh_mhz);
 void gm_stream_stop(void);
+// The client's display refresh grid in host CLOCK_MONOTONIC ns: a vblank and
+// the interval. gamescope then presents on it (fixed refresh) instead of as
+// on a VRR display. Cleared when a stream starts or stops.
+void gm_set_display_grid(uint64_t anchor_ns, uint64_t interval_ns);
 void gm_request_keyframe(void);
 void gm_set_bitrate(int bitrate_kbps);
 // Which codecs this GPU can encode (bit 1 << enum gm_codec). Valid once

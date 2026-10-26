@@ -31,22 +31,6 @@ pub fn state_dir() -> PathBuf {
     base.join("gmstream")
 }
 
-/// The access token clients must present; created on first run.
-pub fn load_token(dir: &Path) -> Result<String> {
-    let path = dir.join("token");
-    if let Ok(t) = fs::read_to_string(&path) {
-        let t = t.trim().to_owned();
-        if !t.is_empty() {
-            return Ok(t);
-        }
-    }
-    let mut bytes = [0u8; 16];
-    std::io::Read::read_exact(&mut fs::File::open("/dev/urandom")?, &mut bytes)?;
-    let t: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    write_private(&path, t.as_bytes())?;
-    Ok(t)
-}
-
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
@@ -131,11 +115,19 @@ fn page_tls(dir: &Path) -> Result<rustls::ServerConfig> {
     Ok(config)
 }
 
+/// The value of header `name` (lowercase) in a raw request head.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
 pub async fn serve(port: u16, dir: PathBuf, hash: CertHash) -> Result<()> {
     let acceptor = TlsAcceptor::from(Arc::new(page_tls(&dir)?));
     let listener = TcpListener::bind(("::", port)).await.with_context(|| format!("binding TCP port {port}"))?;
     loop {
-        let (tcp, _) = listener.accept().await?;
+        let (tcp, peer) = listener.accept().await?;
         let _ = tcp.set_nodelay(true);
         let acceptor = acceptor.clone();
         let hash = hash.clone();
@@ -143,16 +135,40 @@ pub async fn serve(port: u16, dir: PathBuf, hash: CertHash) -> Result<()> {
             let Ok(mut tls) = acceptor.accept(tcp).await else { return };
             let mut req = Vec::new();
             let mut buf = [0u8; 4096];
-            while !req.windows(4).any(|w| w == b"\r\n\r\n") && req.len() < 16384 {
+            let head_end = loop {
+                if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+                if req.len() >= 16384 {
+                    return;
+                }
                 match tls.read(&mut buf).await {
                     Ok(0) | Err(_) => return,
                     Ok(n) => req.extend_from_slice(&buf[..n]),
                 }
-            }
-            let line = String::from_utf8_lossy(&req);
-            let path = line.split_whitespace().nth(1).unwrap_or("/");
+            };
+            let head = String::from_utf8_lossy(&req[..head_end]).into_owned();
+            let mut parts = head.split_whitespace();
+            let method = parts.next().unwrap_or("GET");
+            let path = parts.next().unwrap_or("/");
             let path = path.split(['?', '#']).next().unwrap_or("/");
             let (status, ty, body) = match path {
+                // Clients without devtools (iPad) report errors here.
+                "/log" if method == "POST" => {
+                    let len = header(&head, "content-length").and_then(|v| v.parse().ok()).unwrap_or(0usize).min(4096);
+                    while req.len() < head_end + len {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text: String = String::from_utf8_lossy(&req[head_end..head_end + len])
+                        .chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .collect();
+                    eprintln!("gmstream: client log {peer}: {text}");
+                    ("204 No Content", "text/plain", String::new())
+                }
                 "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX_HTML.to_owned()),
                 "/client.js" => ("200 OK", "text/javascript; charset=utf-8", CLIENT_JS.to_owned()),
                 "/config.json" => (

@@ -104,8 +104,17 @@ fn main() {
         let flag = if flag == "-lffi" { "-l:libffi.a".to_owned() } else { flag };
         println!("cargo:rustc-link-arg={flag}");
     }
+    // PyroWave (build/pyrowave.sh) and the parts of Granite it uses. Vulkan
+    // itself is loaded at run time by volk.
+    println!("cargo:rustc-link-arg=-L{prefix}/lib");
+    for lib in ["pyrowave-c", "pyrowave", "granite-vulkan", "granite-math", "granite-util", "granite-volk"] {
+        println!("cargo:rustc-link-arg=-l:lib{lib}.a");
+    }
     println!("cargo:rustc-link-arg=-Wl,--end-group");
     for flag in pkg_config(&["--libs"], DYNAMIC_PKGS) {
         println!("cargo:rustc-link-arg={flag}");
     }
+    // PyroWave is C++; the host's libstdc++ is newer than the build image's.
+    println!("cargo:rustc-link-arg=-lstdc++");
+    println!("cargo:rustc-link-arg=-ldl");
 }

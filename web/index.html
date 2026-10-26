@@ -8,9 +8,10 @@
   :root { color-scheme: dark; }
   [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; object-fit: contain; touch-action: none; }
+  canvas { position: fixed; touch-action: none; } /* placed by layoutCanvas() */
   #hud { position: fixed; top: 8px; left: 8px; font: 12px/1.35 ui-monospace, Menlo, monospace; color: #9f9;
          background: #000a; padding: 4px 8px; border-radius: 4px; white-space: pre; pointer-events: none; }
+  #hud-chart { display: block; position: static; width: 100%; min-width: 240px; height: 56px; margin-top: 4px; }
   #overlay { position: fixed; inset: 0; display: grid; place-items: center; background: #000c;
              font: 16px system-ui, sans-serif; color: #ddd; text-align: center; }
   #overlay button { font: inherit; padding: 10px 22px; margin: 6px; border-radius: 6px; border: 1px solid #666;
@@ -37,7 +38,7 @@
 </head>
 <body>
 <canvas id="screen"></canvas>
-<div id="hud" hidden></div>
+<div id="hud" hidden><div id="hud-text"></div><canvas id="hud-chart"></canvas></div>
 <div id="hint" hidden>Click to capture the mouse</div>
 <button id="gear" title="Settings (Ctrl+Alt+Shift+S)">⚙</button>
 <form id="settings" hidden onsubmit="return false">
@@ -63,6 +64,9 @@
   <h3>Network</h3>
   <label>Missing-frame wait (ms) <input type="number" name="gapWaitMs" min="0" max="500" step="5">
     <span class="note">How long a late frame may hold later ones before skipping to a keyframe.</span></label>
+  <label>Video streams
+    <select name="videoStreams"><option value="auto">Auto</option><option value="per-frame">One per frame</option><option value="one">One for all frames</option><option value="datagrams">Datagrams (UDP, no retransmission)</option></select>
+    <span class="note">Per frame lets late frames be skipped; Auto uses one stream on Safari and iPad, where per-frame streams stall. Datagrams send each frame as raw UDP-sized pieces with no retransmission (any loss costs a keyframe). Changing it reconnects.</span></label>
 
   <h3>Audio</h3>
   <label>Audio <input type="checkbox" name="audio"></label>

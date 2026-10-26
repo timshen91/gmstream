@@ -2,8 +2,9 @@
 //!
 //! One client streams at a time; a new one replaces the old. Video frames go
 //! out each on their own unidirectional stream (newer frames at higher
-//! priority, so a frame stuck on loss never delays the next), audio as
-//! datagrams, everything else on the client's bidirectional control stream.
+//! priority, so a frame stuck on loss never delays the next), all on one
+//! stream, or split into datagrams, as the client asks in Hello. Audio goes
+//! as datagrams, everything else on the client's bidirectional control stream.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,13 +13,21 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 use wtransport::endpoint::IncomingSession;
+use wtransport::quinn;
 use wtransport::quinn::congestion::CubicConfig;
 use wtransport::tls::Sha256DigestFmt;
-use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt};
+use wtransport::{Endpoint, Identity, ServerConfig};
 
 use crate::core;
+use crate::transport::{Conn, RecvStream, SendStream};
+use crate::udp;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+// Version 2 added the Hello flags byte; version 1 clients are still served.
+pub const PROTOCOL_VERSION: u16 = 2;
+
+// Hello flags.
+const HELLO_ONE_VIDEO_STREAM: u8 = 1;
+const HELLO_VIDEO_DATAGRAMS: u8 = 2;
 
 // Client → host control messages.
 const C_HELLO: u8 = 0x01;
@@ -33,6 +42,7 @@ const C_SCROLL: u8 = 0x09;
 const C_GAMEPAD: u8 = 0x0a;
 const C_GAMEPAD_REMOVE: u8 = 0x0b;
 const C_PING: u8 = 0x0c;
+const C_DISPLAY_GRID: u8 = 0x0d;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
@@ -42,6 +52,10 @@ const H_PONG: u8 = 0x85;
 const H_ERROR: u8 = 0x86;
 
 const DATAGRAM_AUDIO: u8 = 1;
+const DATAGRAM_VIDEO: u8 = 2;
+const VIDEO_FRAGMENT_HEADER: usize = 9;
+const DATAGRAM_PYROWAVE: u8 = 4;
+const CODEC_PYROWAVE: u8 = 3;
 const VIDEO_HEADER: usize = 32;
 // A frame that has not reached the client by then is abandoned; the client
 // asks for a keyframe instead.
@@ -56,10 +70,28 @@ fn message(ty: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 struct Client {
-    conn: Arc<Connection>,
+    conn: Arc<Conn>,
     video: mpsc::Sender<(u32, Vec<u8>)>,
     ctrl: mpsc::UnboundedSender<Vec<u8>>,
     audio_seq: AtomicU32,
+    stats: Arc<VideoStats>,
+}
+
+/// Where frames go missing, logged when anything does.
+#[derive(Default)]
+struct VideoStats {
+    encoded: AtomicU64,
+    queue_full: AtomicU64,
+    open_timeout: AtomicU64,
+    write_timeout: AtomicU64,
+    sent: AtomicU64,
+}
+
+impl VideoStats {
+    fn take(&self) -> [u64; 5] {
+        [&self.encoded, &self.queue_full, &self.open_timeout, &self.write_timeout, &self.sent]
+            .map(|c| c.swap(0, Ordering::Relaxed))
+    }
 }
 
 /// Routes the core's callbacks to the current client.
@@ -109,7 +141,9 @@ impl core::Sink for Hub {
         buf.extend_from_slice(&p.encoded_ns.to_le_bytes());
         buf.extend_from_slice(&[0, 0, 0, 0]);
         buf.extend_from_slice(data);
+        c.stats.encoded.fetch_add(1, Ordering::Relaxed);
         if c.video.try_send((p.frame_id, buf)).is_err() {
+            c.stats.queue_full.fetch_add(1, Ordering::Relaxed);
             // The network side is behind; the client will see a gap.
             core::request_keyframe();
         }
@@ -163,24 +197,44 @@ fn new_identity() -> Result<Identity> {
         .build()?)
 }
 
-fn server_config(port: u16, identity: Identity) -> ServerConfig {
-    let mut transport = wtransport::quinn::TransportConfig::default();
+fn transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
     // LAN: start with a window that fits a large keyframe instead of probing
     // up to it over several round trips.
     let mut cubic = CubicConfig::default();
     cubic.initial_window(4 << 20);
     transport.congestion_controller_factory(Arc::new(cubic));
     transport.send_window(16 << 20);
+    // Datagram video sends each keyframe as one burst (over 1 MB at high
+    // bitrates); when this buffer is full, quinn drops the oldest datagrams.
+    transport.datagram_send_buffer_size(16 << 20);
+    transport.keep_alive_interval(Some(Duration::from_secs(2)));
+    transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().expect("idle timeout")));
+    transport
+}
+
+fn server_config(port: u16, identity: Identity) -> ServerConfig {
     ServerConfig::builder()
         .with_bind_default(port)
-        .with_custom_transport(identity, transport)
+        .with_custom_transport(identity, transport_config())
         .keep_alive_interval(Some(Duration::from_secs(2)))
         .max_idle_timeout(Some(Duration::from_secs(10)))
         .expect("idle timeout")
         .build()
 }
 
-pub async fn serve(port: u16, token: String, hash: CertHash) -> Result<()> {
+pub async fn serve(port: u16, hash: CertHash) -> Result<()> {
+    // Native clients: plain UDP on the next port.
+    tokio::spawn(async move {
+        let result = udp::serve(port + 1, |peer, control| {
+            session(Arc::new(Conn::Udp(peer.clone())), SendStream::Udp(peer), RecvStream::Udp(control))
+        })
+        .await;
+        if let Err(e) = result {
+            eprintln!("gmstream: UDP: {e:#}");
+        }
+    });
+
     let identity = new_identity()?;
     *hash.write().unwrap() = identity.certificate_chain().as_slice()[0]
         .hash()
@@ -206,12 +260,10 @@ pub async fn serve(port: u16, token: String, hash: CertHash) -> Result<()> {
         }
     });
 
-    let token = Arc::new(token);
     loop {
         let incoming = endpoint.accept().await;
-        let token = token.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(incoming, &token).await {
+            if let Err(e) = handle_wt(incoming).await {
                 eprintln!("gmstream: session ended: {e:#}");
             }
         });
@@ -265,11 +317,62 @@ async fn send_error(send: &mut SendStream, text: &str) {
     let _ = send.finish().await;
 }
 
-async fn send_frame(conn: Arc<Connection>, id: u32, buf: Vec<u8>) {
-    let Ok(Ok(opening)) = tokio::time::timeout(FRAME_DEADLINE, conn.open_uni()).await else {
-        return;
+/// A PyroWave frame (frame header, then its packets each after a u16 length)
+/// as one datagram per packet, each carrying the frame's id, size and times:
+/// packets decode on their own, so a lost one only blurs part of the picture.
+/// Returns false if the transport failed.
+/// Measuring (GM_DEBUG_SEND): per PyroWave frame, encode done → send
+/// starts and send starts → last datagram handed to the kernel, ns.
+static SEND_TIMES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+fn send_times_summary() -> Option<String> {
+    let mut v = std::mem::take(&mut *SEND_TIMES.lock().unwrap());
+    if v.is_empty() {
+        return None;
+    }
+    let pct = |v: &mut Vec<(u64, u64)>, f: fn(&(u64, u64)) -> u64| {
+        v.sort_by_key(f);
+        let at = |q: f64| f(&v[((v.len() - 1) as f64 * q) as usize]) as f64 / 1e6;
+        format!("p50 {:.2} p90 {:.2} max {:.2} ms", at(0.5), at(0.9), at(1.0))
     };
-    let Ok(Ok(mut stream)) = tokio::time::timeout(FRAME_DEADLINE, opening).await else {
+    Some(format!("encoded→send {}, send {}", pct(&mut v, |t| t.0), pct(&mut v, |t| t.1)))
+}
+
+async fn send_pyrowave(conn: &Conn, buf: &[u8]) -> bool {
+    let start = core::now_ns();
+    let (head, mut rest) = buf.split_at(VIDEO_HEADER);
+    let mut packets = Vec::new();
+    while rest.len() >= 2 {
+        let len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+        let Some(p) = rest.get(2..2 + len) else { break };
+        packets.push(p);
+        rest = &rest[2 + len..];
+    }
+    let count = packets.len() as u16;
+    let mut ds = Vec::with_capacity(packets.len());
+    for (i, p) in packets.into_iter().enumerate() {
+        let mut d = Vec::with_capacity(29 + p.len());
+        d.push(DATAGRAM_PYROWAVE);
+        d.extend_from_slice(&head[0..4]); // frame id
+        d.extend_from_slice(&(i as u16).to_le_bytes());
+        d.extend_from_slice(&count.to_le_bytes());
+        d.extend_from_slice(&head[6..10]); // width, height
+        d.extend_from_slice(&head[12..28]); // slot_ns, encoded_ns
+        d.extend_from_slice(p);
+        ds.push(d);
+    }
+    let ok = conn.send_datagrams_wait(ds).await.is_ok();
+    if std::env::var_os("GM_DEBUG_SEND").is_some() {
+        let encoded = u64::from_le_bytes(head[20..28].try_into().unwrap());
+        SEND_TIMES.lock().unwrap().push((start.saturating_sub(encoded), core::now_ns() - start));
+    }
+    ok
+}
+
+async fn send_frame(conn: Arc<Conn>, stats: Arc<VideoStats>, id: u32, buf: Vec<u8>) {
+    // Opening waits for the client to grant stream credit.
+    let Ok(Ok(mut stream)) = tokio::time::timeout(FRAME_DEADLINE, conn.open_uni()).await else {
+        stats.open_timeout.fetch_add(1, Ordering::Relaxed);
         return;
     };
     stream.set_priority(id as i32);
@@ -278,16 +381,23 @@ async fn send_frame(conn: Arc<Connection>, id: u32, buf: Vec<u8>) {
         stream.finish().await
     })
     .await;
+    match sent {
+        Ok(Ok(_)) => stats.sent.fetch_add(1, Ordering::Relaxed),
+        _ => stats.write_timeout.fetch_add(1, Ordering::Relaxed),
+    };
     if sent.is_err() {
-        let _ = stream.reset(VarInt::from_u32(1));
+        stream.reset(1);
     }
 }
 
-async fn handle(incoming: IncomingSession, token: &str) -> Result<()> {
-    let request = incoming.await?;
-    let conn = Arc::new(request.accept().await?);
+async fn handle_wt(incoming: IncomingSession) -> Result<()> {
+    let conn = incoming.await?.accept().await?;
+    let (send, recv) = conn.accept_bi().await?;
+    session(Arc::new(Conn::Wt(conn)), SendStream::Wt(send), RecvStream::Wt(recv)).await
+}
+
+async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     let peer = conn.remote_address();
-    let (mut send, mut recv) = conn.accept_bi().await?;
 
     let (ty, body) = read_message(&mut recv).await?;
     let mut r = Reader(&body);
@@ -297,18 +407,17 @@ async fn handle(incoming: IncomingSession, token: &str) -> Result<()> {
     let version = r.u16()?;
     let (width, height, refresh, kbps) = (r.u16()?, r.u16()?, r.u32()?, r.u32()?);
     let (mask, pref) = (r.u8()?, r.u8()?);
-    if version != PROTOCOL_VERSION {
+    let flags = if version >= 2 { r.u8()? } else { 0 };
+    let datagrams = conn.is_udp() || flags & HELLO_VIDEO_DATAGRAMS != 0;
+    let one_stream = !datagrams && flags & HELLO_ONE_VIDEO_STREAM != 0;
+    if !(1..=PROTOCOL_VERSION).contains(&version) {
         send_error(&mut send, "Protocol version mismatch; reload the page").await;
         bail!("{peer}: protocol version {version}");
-    }
-    if r.0 != token.as_bytes() {
-        send_error(&mut send, "Wrong or missing token: open the URL gmstream printed").await;
-        bail!("{peer}: bad token");
     }
     let both = mask as u32 & core::supported_codecs();
     let codec = if both & (1 << pref) != 0 {
         pref
-    } else if let Some(c) = (0..3).find(|c| both & (1 << c) != 0) {
+    } else if let Some(c) = (0..4).find(|c| both & (1 << c) != 0) {
         c
     } else {
         send_error(&mut send, "No video codec in common with this host").await;
@@ -318,18 +427,33 @@ async fn handle(incoming: IncomingSession, token: &str) -> Result<()> {
 
     let (vtx, mut vrx) = mpsc::channel::<(u32, Vec<u8>)>(4);
     let (ctx, mut crx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let client = Arc::new(Client { conn: conn.clone(), video: vtx, ctrl: ctx, audio_seq: AtomicU32::new(0) });
+    let client = Arc::new(Client { conn: conn.clone(), video: vtx, ctrl: ctx, audio_seq: AtomicU32::new(0), stats: Arc::default() });
     // HelloAck goes first; the core's cursor and lock state follow it.
     let _ = client.ctrl.send(message(H_HELLO_ACK, &[codec]));
     if let Some(old) = HUB.replace(client.clone()) {
         let _ = old.ctrl.send(message(H_ERROR, b"Another client connected"));
-        old.conn.close(VarInt::from_u32(2), b"replaced");
+        // Give the Error a moment to arrive: a client that only sees the
+        // connection end takes it for a network drop and reconnects, and the
+        // two clients then take turns replacing each other.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            old.conn.close(2, b"replaced");
+        });
         core::stream_stop();
     }
     let n = HUB.sessions.fetch_add(1, Ordering::Relaxed) + 1;
     eprintln!(
-        "gmstream: client {n} from {peer}: {width}x{height}@{:.3}Hz, codec {codec}, {kbps} kbps",
-        refresh as f64 / 1000.0
+        "gmstream: client {n} from {peer}: {width}x{height}@{:.3}Hz, codec {codec}, {kbps} kbps{}",
+        refresh as f64 / 1000.0,
+        if conn.is_udp() {
+            ", plain UDP"
+        } else if datagrams {
+            ", video datagrams"
+        } else if one_stream {
+            ", one video stream"
+        } else {
+            ""
+        }
     );
     core::stream_start(codec, width, height, refresh, kbps);
 
@@ -341,9 +465,87 @@ async fn handle(incoming: IncomingSession, token: &str) -> Result<()> {
         }
     });
     let video_conn = conn.clone();
+    let stats = client.stats.clone();
     let video = tokio::spawn(async move {
-        while let Some((id, buf)) = vrx.recv().await {
-            tokio::spawn(send_frame(video_conn.clone(), id, buf));
+        if datagrams {
+            // Each frame split into datagrams; no retransmission, a lost
+            // fragment loses the frame and the client asks for a keyframe.
+            while let Some((id, buf)) = vrx.recv().await {
+                if buf[5] == CODEC_PYROWAVE {
+                    if send_pyrowave(&video_conn, &buf).await {
+                        stats.sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                let Some(max) = video_conn.max_datagram_size() else { return };
+                let chunk = max - VIDEO_FRAGMENT_HEADER;
+                let count = buf.len().div_ceil(chunk) as u16;
+                for (i, part) in buf.chunks(chunk).enumerate() {
+                    let mut d = Vec::with_capacity(VIDEO_FRAGMENT_HEADER + part.len());
+                    d.push(DATAGRAM_VIDEO);
+                    d.extend_from_slice(&id.to_le_bytes());
+                    d.extend_from_slice(&(i as u16).to_le_bytes());
+                    d.extend_from_slice(&count.to_le_bytes());
+                    d.extend_from_slice(part);
+                    if video_conn.send_datagram_wait(d).await.is_err() {
+                        return;
+                    }
+                }
+                stats.sent.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if one_stream {
+            // WebKit grants new streams slowly and stops for good after a
+            // reset, so these clients get every frame on one stream.
+            let Ok(mut stream) = video_conn.open_uni().await else { return };
+            stream.set_priority(i32::MAX);
+            while let Some((_, mut buf)) = vrx.recv().await {
+                if buf[5] == CODEC_PYROWAVE {
+                    if send_pyrowave(&video_conn, &buf).await {
+                        stats.sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                let len = (buf.len() as u32).to_le_bytes();
+                buf.splice(0..0, len);
+                if stream.write_all(&buf).await.is_err() {
+                    return;
+                }
+                stats.sent.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            while let Some((id, buf)) = vrx.recv().await {
+                if buf[5] == CODEC_PYROWAVE {
+                    if send_pyrowave(&video_conn, &buf).await {
+                        stats.sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                tokio::spawn(send_frame(video_conn.clone(), stats.clone(), id, buf));
+            }
+        }
+    });
+    let monitor_conn = conn.clone();
+    let stats = client.stats.clone();
+    let monitor = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let [encoded, queue_full, open_timeout, write_timeout, sent] = stats.take();
+            if let Some(s) = send_times_summary() {
+                eprintln!("gmstream: client {n} PyroWave, last 5 s: {s}");
+            }
+            if queue_full + open_timeout + write_timeout > 0 {
+                eprintln!(
+                    "gmstream: client {n} video, last 5 s: {encoded} encoded, {sent} sent, {queue_full} queue full, \
+                     {open_timeout} stream open timed out, {write_timeout} write timed out"
+                );
+            }
+            // The client has stopped granting streams: video would stay frozen
+            // while the session lives, so end it and let the client reconnect.
+            if sent == 0 && open_timeout > 0 {
+                eprintln!("gmstream: client {n} stopped accepting video streams; closing");
+                monitor_conn.close(3, b"client stopped accepting video streams");
+                return;
+            }
         }
     });
 
@@ -351,6 +553,7 @@ async fn handle(incoming: IncomingSession, token: &str) -> Result<()> {
 
     writer.abort();
     video.abort();
+    monitor.abort();
     if HUB.remove(&client) {
         core::stream_stop();
     }
@@ -388,6 +591,8 @@ async fn control_loop(recv: &mut RecvStream, client: &Client) -> Result<()> {
                 core::gamepad_update(pad, &state);
             }
             C_GAMEPAD_REMOVE => core::gamepad_remove(r.u8()?),
+            // u64 anchor_ns (a vblank, host clock), u32 interval_ns.
+            C_DISPLAY_GRID => core::set_display_grid(r.u64()?, r.u32()? as u64),
             C_PING => {
                 let mut p = r.u64()?.to_le_bytes().to_vec();
                 p.extend_from_slice(&core::now_ns().to_le_bytes());
