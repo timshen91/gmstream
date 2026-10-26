@@ -172,6 +172,7 @@ Every datagram starts with a type byte:
 | 1 | audio, as above |
 | 2 | video fragment, as in datagram mode above (always used over plain UDP; the Hello flags are ignored) |
 | 3 | control: `u32 sequence` then bytes of the control stream |
+| 5 | keep-awake (client → host): no payload; the host drops it |
 
 The control stream (the same messages as over WebTransport, both
 directions) is cut into type-3 datagrams numbered from 0 in each direction;
@@ -184,3 +185,9 @@ address replaces it, as over WebTransport. The host ends a session after
 10 s without a control datagram from the client, so clients send `Ping`
 every 500 ms. A lost control datagram stalls the stream behind it; once 256
 later ones are waiting, the host ends the session and the client reconnects.
+
+A client on Wi-Fi should send keep-awake datagrams at about 60 Hz. A client
+that only receives lets its Wi-Fi enter power save during the stream (seen
+on a MacBook's Broadcom chip about 10 times a minute); the access point then
+holds its packets until the next beacon, up to ~102 ms, and drops what it
+can't hold. 10 Hz was not enough; 60 Hz stopped every stall.
