@@ -4,6 +4,11 @@ Description=gmstream (Game Mode streaming host; gamescope's Wayland display)
 Before=gamescope-session.service
 
 [Service]
-ExecStart=%h/gmstream/gmstream -w gmstream-0 -s 1920x1080 -r 60
+# -r 120: the refresh gamescope (and so Steam) sees until a client connects.
+# Steam reads it once at startup and sets its frame limit to it; at 60 the
+# game stayed capped at 60 fps after a 120 Hz client connected (gamescope
+# then gives the game every other vblank). A lower client refresh needs no
+# limit, so start at the highest one in use.
+ExecStart=%h/gmstream/gmstream -w gmstream-0 -s 1920x1080 -r 120
 Restart=on-failure
 Slice=session.slice

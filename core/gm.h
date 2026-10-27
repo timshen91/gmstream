@@ -77,6 +77,11 @@ void gm_stream_stop(void);
 // the interval. gamescope then presents on it (fixed refresh) instead of as
 // on a VRR display. Cleared when a stream starts or stops.
 void gm_set_display_grid(uint64_t anchor_ns, uint64_t interval_ns);
+// What the client wants of Steam's VRR: 0 leave it, 1 off (report the grid as
+// a fixed refresh: gamescope calls the display VRR-incapable and Steam greys
+// the toggle), 2 on (the caller sets gamescope's adaptive_sync). Cleared when
+// a stream starts or stops.
+void gm_set_vrr_policy(int policy);
 void gm_request_keyframe(void);
 void gm_set_bitrate(int bitrate_kbps);
 // Which codecs this GPU can encode (bit 1 << enum gm_codec). Valid once

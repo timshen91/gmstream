@@ -14,7 +14,8 @@
 //   u16 index    fragment/packet index
 //   u16 count    fragment/packet count
 //   u64 host     audio pts / PyroWave encoded (host ns); presented: gamescope
-//                present (local ns, 0 if unknown); clock: host − local offset
+//                present (local ns, 0 if unknown); clock: this ping's host −
+//                local offset (host's answer − our round trip's midpoint)
 
 import Foundation
 

@@ -7,18 +7,26 @@
 // to gamescope as its display's vblanks, and gamescope's own just-in-time
 // scheduler then produces frames on that grid.
 //
-// Each frame is placed by its lead `a`: the time from its submit to the next
-// point in the refresh where flips land (0..refresh). An on-time frame is
-// shown a refresh after that point (display stage = a + refresh); one with a
-// lead under the cut-off misses its refresh and is not shown later but
-// replaced by the next frame (disableFIFO), so the screen stutters. The lead
-// belongs to the display, not to `shift`: the cut-off is a fixed lead, learned
-// from the leads of the frames that missed it (the second highest of the
-// last 20 near-misses, so one odd drop does not move it). Frames that never
-// show give no display stage, which is why the lead has to come from the
-// submit time: a cut-off taken from the shown frames' display stage alone
-// came out ~1.5 ms too optimistic and parked frames on the edge (~0.75
-// drops/s).
+// Each frame's lead `a` is the time from its submit to the next point in the
+// refresh where flips land (0..refresh). An on-time frame is shown a refresh
+// after that point; a late one is replaced by the next frame (disableFIFO),
+// and so is an early one whose successor comes in before the window server
+// takes it: the screen stutters. Which leads make it is not a sharp cut-off
+// (Dell at 120 Hz, in a window: about half the frames with leads under
+// 1.5 ms dropped, 3% from 2.25 to 4.75 ms, ~60% from 5 ms up), so it is
+// learned: per lead bin, the share of frames shown over the last ~25 s.
+//
+// The lock steers the host present's lead (from its present to the next
+// flip point), the same for every frame up to the host's sub-ms jitter; a
+// frame's own lead is that minus its lateness (submit − host present:
+// network, decode, render). Latenesses have no wrap and do not move with
+// the phase, so the lock picks the host lead under which the last ~10 s of
+// them would have been shown most often, and moves toward it the short way
+// round. (Submit leads alone are known only modulo the refresh; unwrapped
+// around their median, every frame more than half a refresh late read as
+// early, and at 120 Hz over Wi-Fi, lateness p50 9 / p99 17 ms, the lock went
+// a whole refresh round every few seconds: 12 drops/s, total p90 25.5 ms.
+// This way: 10.5 drops/s, the rest late arrivals, total p90 20.5 ms.)
 //
 // macOS can also start showing every frame a refresh late for good (the
 // window server's queue one deeper after a hiccup), with nothing dropped and
@@ -26,13 +34,12 @@
 // does: the lock asks the renderer to skip one (`takeDrain`). One repeated
 // frame instead of a refresh more latency from then on.
 //
-// To find a starting point, sweep `shift` through one whole refresh (the phase
-// is circular, so the cut-off is somewhere in it), recording the median
-// display stage at each step; lock at the lowest step without drops, moved
-// `margin` earlier. A servo then holds the late tail (1st percentile) of the
-// leads a guard above the cut-off. That also follows the drift between the
-// two machines' clocks (tens of ppm), which would otherwise carry frames past
-// the cut-off within a minute.
+// To find a starting point, sweep `shift` through one whole refresh,
+// recording the median display stage at each step, and start at the lowest
+// step without drops, moved `margin` earlier; the sweep also fills the lead
+// bins. Steering every step follows the drift between the two machines'
+// clocks (tens of ppm), which would otherwise carry frames off within a
+// minute.
 
 import Foundation
 
@@ -40,8 +47,13 @@ final class PhaseLock {
     private let lock = NSLock()
     private var nominal: Double            // refresh interval from the screen, ns
     private var first: UInt64?, last: UInt64? // presented refreshes
+    private var period: Double?            // measured refresh interval, ns
+    private var previous: UInt64?          // the flip before `last`
+    private var gaps: [Double] = []        // recent flip-to-flip gaps, per refresh
     private var samples: [Double] = []     // display stage, ns, since the last step
-    private var leads: [(a: Double, ok: Bool)] = [] // since the last step; ok: not dropped
+    // Since the last step; ok: not dropped; late: submit − the host's present
+    // (this Mac's clock), once the clock offset is known.
+    private var leads: [(a: Double, ok: Bool, late: Double?)] = []
     private var lateShown = 0, shown = 0   // since the last step: shown a refresh late, all shown
     private var drain = false              // the renderer should skip one frame
     private var since: UInt64 = 0          // ignore frames submitted before this
@@ -49,13 +61,17 @@ final class PhaseLock {
     private var sweep: [(shift: Double, display: Double, safe: Bool)] = []
     private var sweeping = true
     private var steps = 0
-    private var cutoff: Double?            // lead below which frames miss their refresh
-    private var misses: [Double] = []      // recent near-misses' leads
-    private var recent: [Double] = []      // leads, last ~10 s, as if at the current shift
-    private var margin = 3e6               // median lead above the cut-off (after the sweep: start)
+    private var target: Double?            // host present lead steered to; nil until locked
+    private var expected = 0.0             // share of recent frames shown at `target`
+    // Frames by submit lead in binNs bins: all, and dropped ones; decayed
+    // every step (~25 s memory).
+    private var binAll: [Double] = [], binDropped: [Double] = []
+    static let binNs = 0.25e6
+    private var recent: [Double] = []      // lateness (submit − host present), last ~10 s
+    private var margin = 3e6               // after the sweep: start this much earlier than its best step
     private var drops = 0
 
-    static let sweepStep = 1e6, settleSteps = 3, guardNs = 0.4e6, maxMisses = 20
+    static let sweepStep = 1e6, settleSteps = 3
 
     // Vsync off (full screen): macOS flips frames straight to the panel, so
     // there is no refresh cut-off to steer around (a sweep is flat, and where
@@ -85,6 +101,9 @@ final class PhaseLock {
             nominal = 1e9 / refreshHz
             first = nil
             last = nil
+            previous = nil
+            period = nil
+            gaps = []
         }
         startSweep()
     }
@@ -92,8 +111,9 @@ final class PhaseLock {
     private func startSweep() {
         sweeping = true
         sweep.removeAll()
-        cutoff = nil
-        misses.removeAll()
+        target = nil
+        binAll.removeAll()
+        binDropped.removeAll()
         recent.removeAll()
         margin = 3e6
         steps = 0
@@ -114,28 +134,49 @@ final class PhaseLock {
     func dropped(_ t: FrameTiming) {
         lock.lock(); defer { lock.unlock() }
         drops += 1
-        if t.submitted > since, let a = lead(t.submitted) { leads.append((a, false)) }
+        if t.submitted > since, let a = lead(t.submitted) { leads.append((a, false, Self.late(t))) }
     }
 
     /// A frame reached the screen (any thread).
     func presented(_ t: FrameTiming) {
         lock.lock(); defer { lock.unlock() }
         if first == nil { first = t.presented }
-        last = t.presented
+        if t.presented != last { previous = last; last = t.presented; measure() }
         guard t.submitted > since, t.submitted > 0 else { return }
         let display = Double(Int64(t.presented) - Int64(t.submitted))
         samples.append(display)
         guard let a = lead(t.submitted) else { return }
-        leads.append((a, true))
+        leads.append((a, true, Self.late(t)))
         shown += 1
         if display > a + interval * 1.5 { lateShown += 1 }
     }
 
-    /// The refresh interval, measured once enough refreshes have passed.
-    private var interval: Double {
-        guard let first, let last else { return nominal }
-        let n = (Double(last - first) / nominal).rounded()
-        return n >= 120 ? Double(last - first) / n : nominal
+    private static func late(_ t: FrameTiming) -> Double? {
+        t.presentLocal.map { Double(Int64(t.submitted) - Int64($0)) }
+    }
+
+    /// The refresh interval: measured once enough refreshes have passed,
+    /// the screen's nominal one until then.
+    private var interval: Double { period ?? nominal }
+
+    /// The refresh interval from consecutive flips only: each gap between two
+    /// is a whole number of refreshes, 1–4 of them, which the nominal interval
+    /// tells apart without doubt (a panel 1% off is 0.04 refresh off over 4);
+    /// the median of the last 512. The screen's real refresh can differ from
+    /// the nominal one: the Dell U2725QE runs at 8.3443 ms (119.84 Hz), not
+    /// 1/120 s. Counting the refreshes over a long span instead, with the
+    /// nominal interval, always read 8.333 (the grid then ran 1300 ppm fast,
+    /// the host followed it, and the lock slipped a refresh every ~6.5 s);
+    /// with the last estimate, any estimate a little off reproduced itself
+    /// (8.404 ms in full screen: the span divided by it rounds to the count
+    /// that gives it back).
+    private func measure() {
+        guard let previous, let last, last > previous else { return }
+        let d = Double(last - previous), k = (d / nominal).rounded()
+        guard k >= 1 && k <= 4 && abs(d / k - nominal) < nominal * 0.02 else { return }
+        gaps.append(d / k)
+        if gaps.count > 512 { gaps.removeFirst(gaps.count - 512) }
+        if gaps.count >= 60 { period = gaps.sorted()[gaps.count / 2] }
     }
 
     /// Every half second: adjusts `shift`, returns the grid to send (a recent
@@ -159,7 +200,6 @@ final class PhaseLock {
         // Settle first (gamescope switching from VRR to the grid), and skip
         // steps with too few frames (a static screen sends none).
         guard steps > Self.settleSteps && d.count >= 10 else { return (UInt64(Int64(last) - Int64(shift)), UInt64(t)) }
-        let before = shift
         if sweeping {
             // A step whose frames straddle the cut-off shows only the lucky
             // ones (low display stage): not a place to lock.
@@ -172,9 +212,6 @@ final class PhaseLock {
                     FileHandle.standardError.write("sweep \(table)\n".data(using: .utf8)!)
                 }
                 shift = best.shift + margin
-                // Its lead is ~display - refresh; the cut-off a little below
-                // until misses show where it is.
-                cutoff = max(0.3e6, best.display - t - 1e6)
                 sweeping = false
             } else {
                 shift -= Self.sweepStep // frames later
@@ -186,42 +223,63 @@ final class PhaseLock {
             if getenv("GM_DEBUG_PHASE") != nil {
                 FileHandle.standardError.write("locked: \(late)/\(all) frames a refresh late, skipping one\n".data(using: .utf8)!)
             }
-        } else if var cut = cutoff, !step.isEmpty {
-            // Leads unwrapped around this step's median: a frame later than the
-            // flip point reads as a small or negative lead, not as an early one.
-            let mid = step.map(\.a).sorted()[step.count / 2]
-            let unwrap = { (a: Double) -> Double in
-                var x = (a - mid).truncatingRemainder(dividingBy: t)
-                if x > t / 2 { x -= t } else if x <= -t / 2 { x += t }
-                return mid + x
+        } else if !step.isEmpty {
+            let around = { (x: Double, m: Double) -> Double in
+                var y = (x - m).truncatingRemainder(dividingBy: t)
+                if y > t / 2 { y -= t } else if y <= -t / 2 { y += t }
+                return m + y
             }
-            let a = step.map { (unwrap($0.a), $0.ok) }
-            recent += a.map(\.0)
-            if recent.count > 600 { recent.removeFirst(recent.count - 600) }
-            // Dropped near-misses (not frames far behind for other reasons) set
-            // the cut-off.
-            let missed = a.filter { !$0.1 && $0.0 > 0 && $0.0 < mid }.map(\.0)
-            misses += missed
-            if misses.count > Self.maxMisses { misses.removeFirst(misses.count - Self.maxMisses) }
-            let m = misses.sorted(by: >)
-            if m.count >= 2 { cut = max(cut, m[1]) }
-            cut = min(cut, t / 2)
-            cutoff = cut
-            // Hold the late tail (1st percentile over the last ~10 s; this
-            // step's until there are enough) a guard above it.
-            let r = (recent.count >= 120 ? recent : a.map(\.0)).sorted()
-            let tail = r[r.count / 100]
-            margin = mid - cut
-            shift -= (tail - (cut + Self.guardNs)) / 2 // later lowers every lead
-            if a.contains(where: { !$0.1 }) { shift += 0.25e6 } // react before the next step
-            if getenv("GM_DEBUG_PHASE") != nil {
-                FileHandle.standardError.write(String(format: "locked shift %+.1f lead p50 %.2f tail %.2f cut-off %.2f misses %d\n",
-                                                      shift / 1e6, mid / 1e6, tail / 1e6, cut / 1e6, missed.count).data(using: .utf8)!)
+            let host = step.compactMap { s in s.late.map { (s.a + $0).truncatingRemainder(dividingBy: t) } }
+            let a = step.map(\.a).sorted()
+            let mid = a[a.count / 2]
+            // Per lead bin, the share of frames shown (decayed: ~25 s).
+            let bins = Int((t / Self.binNs).rounded(.up))
+            if binAll.count != bins {
+                binAll = Array(repeating: 0, count: bins)
+                binDropped = binAll
+            }
+            for i in 0..<bins { binAll[i] *= 0.98; binDropped[i] *= 0.98 }
+            var missed = 0
+            for f in step {
+                let i = min(bins - 1, Int(f.a / Self.binNs))
+                binAll[i] += 1
+                if !f.ok { binDropped[i] += 1; missed += 1 }
+            }
+            // Unseen leads count as even odds.
+            let shownShare: [Double] = (0..<bins).map { i in
+                let shown: Double = binAll[i] - binDropped[i] + 1
+                return shown / (binAll[i] + 2)
+            }
+            recent += step.compactMap(\.late)
+            if recent.count > 1200 { recent.removeFirst(recent.count - 1200) }
+            if host.count * 2 > step.count && recent.count >= 60 {
+                var h = host.map { around($0, host[0]) }.sorted()[host.count / 2]
+                h -= (h / t).rounded(.down) * t
+                // The host present's lead, one bin apart round the refresh, under
+                // which the recent latenesses would have been shown most often.
+                var best = h, bestShown = -1.0
+                for c in 0..<bins {
+                    let lead = Double(c) * Self.binNs
+                    var sum = 0.0
+                    for l in recent {
+                        var a = (lead - l).truncatingRemainder(dividingBy: t)
+                        if a < 0 { a += t }
+                        sum += shownShare[min(bins - 1, Int(a / Self.binNs))]
+                    }
+                    if sum > bestShown { bestShown = sum; best = lead }
+                }
+                target = best
+                expected = bestShown / Double(recent.count)
+                // The phase is circular: the smaller way round.
+                var move = best - h
+                move -= (move / t).rounded() * t
+                shift += move / 2 // earlier raises every lead
+                if getenv("GM_DEBUG_PHASE") != nil {
+                    FileHandle.standardError.write(String(format: "locked shift %+.1f host lead %.2f target %.2f (%.0f%% shown expected) lead p50 %.2f dropped %d\n",
+                        shift / 1e6, h / 1e6, best / 1e6, expected * 100, mid / 1e6, missed).data(using: .utf8)!)
+                }
             }
         }
-        // Moving frames earlier lengthens every lead by as much.
-        let moved = shift - before
-        if moved != 0 { recent = recent.map { $0 + moved } }
         since = nowNs() + 100_000_000 // let the change settle
         return (UInt64(Int64(last) - Int64(shift)), UInt64(t))
     }
@@ -240,7 +298,7 @@ final class PhaseLock {
             return String(format: "phase: immediate flips (vsync off), refresh %.3f ms", (vsync.grid()?.interval ?? 0) / 1e6)
         }
         let state = sweeping ? "sweeping \(sweep.count)/\(Int((interval / Self.sweepStep).rounded(.up)))" : "locked"
-        return String(format: "phase: %@, shift %+.1f ms, margin %.2f ms, refresh %.3f ms", state, shift / 1e6, margin / 1e6, interval / 1e6)
-            + (cutoff.map { String(format: ", cut-off %.2f ms", $0 / 1e6) } ?? "")
+        return String(format: "phase: %@, shift %+.1f ms, refresh %.3f ms", state, shift / 1e6, interval / 1e6)
+            + (target.map { String(format: ", host lead %.2f ms, %.0f%% shown expected", $0 / 1e6, expected * 100) } ?? "")
     }
 }

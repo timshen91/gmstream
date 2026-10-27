@@ -63,7 +63,7 @@ final class PyroWaveDecoder {
         guard pyrowave_decoder_create(&info, &d) == PYROWAVE_SUCCESS, let d else { return false }
         decoder = d
         width = w; height = h
-        ring = (0..<4).map { _ in
+        ring = (0..<10).map { _ in
             [(w, h), (w / 2, h / 2), (w / 2, h / 2)].map { pw, ph in
                 let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: pw, height: ph, mipmapped: false)
                 desc.usage = [.shaderWrite, .shaderRead]

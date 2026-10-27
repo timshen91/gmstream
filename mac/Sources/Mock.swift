@@ -84,7 +84,7 @@ final class MockSource {
                 let timing = FrameTiming(slotNs: t, encodedNs: t, received: t) { $0 }
                 timing.decodeStart = t
                 timing.decoded = t
-                submit(.planes(frames[i % frames.count]), timing)
+                autoreleasepool { submit(.planes(frames[i % frames.count]), timing) }
                 i += 1
                 next += g?.interval ?? interval
             }

@@ -10,6 +10,9 @@ final class SettingsWindow: NSObject {
     let window: NSWindow
     /// Called after `options` has been updated and saved.
     var onChange: (Change) -> Void = { _ in }
+    /// What pacing is in effect (Auto picks it from the display): phase lock,
+    /// hold, and a line on what Auto chose and did to Steam's VRR toggle.
+    var pacingNow: () -> (phaseLock: Bool, hold: Bool, note: String) = { (options.phaseLock, options.holdFrames, "") }
 
     private let host = NSTextField()
     private let port = NSTextField()
@@ -22,6 +25,9 @@ final class SettingsWindow: NSObject {
     private let vivid = NSButton(checkboxWithTitle: "Vivid colors (display's full gamut, as on Windows)", target: nil, action: nil)
     private let awake = NSButton(checkboxWithTitle: "Keep Wi-Fi awake (60 tiny packets/s to the host)", target: nil, action: nil)
     private let pacing = NSButton(checkboxWithTitle: "Pace the host to this display's refreshes (phase lock)", target: nil, action: nil)
+    private let hold = NSButton(checkboxWithTitle: "Even out network jitter (fixed delay after the host)", target: nil, action: nil)
+    private let pacingMode = NSPopUpButton()
+    private let pacingNote = NSTextField(wrappingLabelWithString: "")
     private static let refreshRates = [30, 60, 90, 120, 144, 165, 240]
     private static let codecs: [(name: String, id: UInt8)] = [("H.264", 0), ("HEVC", 1), ("PyroWave", 3)]
 
@@ -33,6 +39,10 @@ final class SettingsWindow: NSObject {
         window.isReleasedWhenClosed = false
 
         codec.addItems(withTitles: Self.codecs.map(\.name))
+        pacingMode.addItems(withTitles: ["Auto (from the display)", "Manual"])
+        pacingNote.textColor = .secondaryLabelColor
+        pacingNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        pacingNote.preferredMaxLayoutWidth = 300
         refresh.addItem(withTitle: "Match display")
         refresh.addItems(withTitles: Self.refreshRates.map { "\($0) Hz" })
         size.placeholderString = "window size, e.g. 2560x1600"
@@ -40,7 +50,7 @@ final class SettingsWindow: NSObject {
             field.target = self
             field.action = #selector(changed(_:))
         }
-        for control in [codec, refresh, stats, immediate, pacing, vivid, awake] as [NSControl] {
+        for control in [codec, refresh, stats, immediate, pacingMode, pacing, hold, vivid, awake] as [NSControl] {
             control.target = self
             control.action = #selector(changed(_:))
         }
@@ -66,7 +76,10 @@ final class SettingsWindow: NSObject {
             row("Fixed size:", size, "Empty: follow the window"),
             [NSGridCell.emptyContentView, stats],
             [NSGridCell.emptyContentView, immediate],
+            [NSTextField(labelWithString: "Pacing:"), pacingMode],
+            [NSGridCell.emptyContentView, pacingNote],
             [NSGridCell.emptyContentView, pacing],
+            [NSGridCell.emptyContentView, hold],
             [NSGridCell.emptyContentView, vivid],
             [NSGridCell.emptyContentView, awake],
         ])
@@ -110,7 +123,13 @@ final class SettingsWindow: NSObject {
         immediate.state = options.immediateFullScreen ? .on : .off
         vivid.state = options.vividColors ? .on : .off
         awake.state = options.keepWiFiAwake ? .on : .off
-        pacing.state = options.phaseLock ? .on : .off
+        let now = pacingNow()
+        pacingMode.selectItem(at: options.pacingAuto ? 0 : 1)
+        pacing.state = now.phaseLock ? .on : .off
+        hold.state = now.hold ? .on : .off
+        pacing.isEnabled = !options.pacingAuto
+        hold.isEnabled = !options.pacingAuto
+        pacingNote.stringValue = now.note
     }
 
     @objc private func changed(_ sender: NSControl) {
@@ -148,6 +167,12 @@ final class SettingsWindow: NSObject {
             change = .present
         case pacing:
             options.phaseLock = pacing.state == .on
+            change = .phaseLock
+        case hold:
+            options.holdFrames = hold.state == .on
+            change = .phaseLock
+        case pacingMode:
+            options.pacingAuto = pacingMode.indexOfSelectedItem == 0
             change = .phaseLock
         case awake:
             options.keepWiFiAwake = awake.state == .on
