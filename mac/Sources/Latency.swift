@@ -10,7 +10,7 @@ import AppKit
 final class StageStats {
     // "pacing": per frame, |interval between presentations − interval between
     // gamescope presents|; 0 is perfect pacing.
-    static let stages = ["encode", "network", "queue", "decode", "render", "display", "total", "pacing"]
+    static let stages = ["encode", "network", "queue", "decode", "hold", "render", "display", "total", "pacing"]
     static let window: UInt64 = 5_000_000_000
 
     struct Row {
@@ -32,14 +32,15 @@ final class StageStats {
             ms(t.encodedLocal, t.received),
             ms(t.received, t.decodeStart),
             ms(t.decodeStart, t.decoded),
-            ms(t.decoded, t.submitted),
+            ms(t.decoded, t.released),
+            ms(t.released, t.submitted),
             ms(t.submitted, t.presented),
             ms(t.presentLocal, t.presented),
             nil,
         ]
         lock.lock(); defer { lock.unlock() }
         if let lp = lastPresented, let lc = lastPresent, let c = t.presentLocal, c > lc, c - lc < 100_000_000 {
-            values[7] = abs(Double(Int64(t.presented) - Int64(lp)) - Double(c - lc)) / 1e6
+            values[8] = abs(Double(Int64(t.presented) - Int64(lp)) - Double(c - lc)) / 1e6
         }
         lastPresented = t.presented
         lastPresent = t.presentLocal

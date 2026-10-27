@@ -48,6 +48,7 @@ Unknown types are skipped.
 | 0x0a | Gamepad | `u8 index, u32 buttons, i16 lx, i16 ly, i16 rx, i16 ry, u8 lt, u8 rt` |
 | 0x0b | GamepadRemove | `u8 index` |
 | 0x0c | Ping | `u64 client_time_us` |
+| 0x0e | VrrPolicy | `u8 policy`: what the client wants of Steam's VRR. 0 = leave Steam's toggle alone (the default); 1 = off: the host reports the client's grid as a fixed refresh, so gamescope calls the display VRR-incapable and Steam greys its toggle; 2 = on: the host sets gamescope's `adaptive_sync` (what Steam's toggle sets) and hands each frame to the encoder at once, stamped with gamescope's commit time (the client holds frames itself). Leaving 2, the host restores `adaptive_sync` from Steam's preference (`GAMESCOPE_VRR_ENABLED`). Cleared when a stream starts or stops. |
 | 0x0d | DisplayGrid | `u64 anchor_ns, u32 interval_ns`: the client display's refresh grid in host CLOCK_MONOTONIC (a vblank and the interval), shifted by the client to set where frames land. The host then reports gamescope's frames as presented on that grid (still as a VRR-capable display, so Steam's VRR toggle stays available; with it off, gamescope paces to the grid). Native clients send it every 500 ms; it is cleared when a stream starts, and by an interval of 0 (a client on a variable-refresh display, which shows frames as they arrive). |
 
 `Hello` must be first. Hello flags: bit 0 = one video stream, bit 1 = video

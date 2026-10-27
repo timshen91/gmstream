@@ -51,6 +51,12 @@ struct Options {
     // refresh grid. Off: an empty grid, so gamescope paces itself and frames
     // are shown as they arrive (as on a variable-refresh display).
     var phaseLock = true
+    // Hold each frame until a fixed delay after the host presented it
+    // (Video.swift, Hold): the network's jitter traded for a constant delay.
+    var holdFrames = false
+    // Pacing chosen from the display (Controller.pacing) instead of the two
+    // settings above, Steam's VRR toggle included.
+    var pacingAuto = true
     var layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:] // measuring
     var bgra = false // decoder output BGRA instead of NV12 (measuring)
     var probe: Double?
@@ -68,6 +74,8 @@ struct Options {
         vividColors = d.bool(forKey: "vividColors")
         if d.object(forKey: "keepWiFiAwake") != nil { keepWiFiAwake = d.bool(forKey: "keepWiFiAwake") }
         if d.object(forKey: "phaseLock") != nil { phaseLock = d.bool(forKey: "phaseLock") }
+        holdFrames = d.bool(forKey: "holdFrames")
+        if d.object(forKey: "pacingAuto") != nil { pacingAuto = d.bool(forKey: "pacingAuto") }
 
         var it = args.makeIterator()
         while let a = it.next() {
@@ -89,6 +97,10 @@ struct Options {
             case "--vivid": vividColors = true
             case "--no-keep-awake": keepWiFiAwake = false
             case "--no-phase": phaseLock = false
+            case "--hold": holdFrames = true; pacingAuto = false
+            case "--no-hold": holdFrames = false; pacingAuto = false
+            case "--auto-pacing": pacingAuto = true
+            case "--manual-pacing": pacingAuto = false
             case "--layer": layerKeys = Options.parseKeys(it.next() ?? "")
             case "--drawable": drawableKeys = Options.parseKeys(it.next() ?? "")
             case let s where s.hasPrefix("-"): _ = it.next() // e.g. -NSDocumentRevisionsDebugMode YES
@@ -127,6 +139,8 @@ struct Options {
         d.set(vividColors, forKey: "vividColors")
         d.set(keepWiFiAwake, forKey: "keepWiFiAwake")
         d.set(phaseLock, forKey: "phaseLock")
+        d.set(holdFrames, forKey: "holdFrames")
+        d.set(pacingAuto, forKey: "pacingAuto")
     }
 }
 
@@ -309,6 +323,32 @@ final class StreamView: NSView {
     override func scrollWheel(with e: NSEvent) { controller?.scroll(e) }
 }
 
+/// How frames are paced, from the settings or (Pacing: Auto) from the display.
+/// The two models do not mix. A variable-refresh display (Adaptive-Sync, in
+/// full screen: in a window macOS composites the desktop at a fixed rate)
+/// shows a frame when it comes, so the game runs free on Steam's VRR and the
+/// hold turns everything after the host into a constant delay. A
+/// fixed-refresh one has its own clock: Steam's VRR off, so the game steps at
+/// a fixed rate on gamescope's vblanks, and the phase lock makes those this
+/// display's refreshes. The Dell U2725QE in full screen does VRR (test frames
+/// at 100 Hz flipped 10.0 ms apart) as long as nothing redraws on another
+/// display and the host stays under its top rate (PanelRate).
+struct Pacing {
+    let vrr: Bool       // Auto: this display does VRR here
+    let phaseLock: Bool
+    let hold: Bool
+    let steamVRR: UInt8 // protocol VrrPolicy: 0 Steam's own, 1 off, 2 on
+
+    init(options: Options, fullScreen: Bool, screen: NSScreen?) {
+        vrr = fullScreen && screen.map { $0.maximumRefreshInterval > $0.minimumRefreshInterval * 1.01 } ?? false
+        if options.pacingAuto {
+            (phaseLock, hold, steamVRR) = vrr ? (false, true, 2) : (true, false, 1)
+        } else {
+            (phaseLock, hold, steamVRR) = (options.phaseLock, options.holdFrames, 0)
+        }
+    }
+}
+
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, ConnectionDelegate {
     var window: NSWindow!
     var view: StreamView!
@@ -322,6 +362,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     var clientCodecs: UInt8 { codecMask | (pyro != nil ? 1 << 3 : 0) }
     let chart = LatencyChart()
     let vsync = VsyncClock()
+    let panel = PanelRate()
+    // The host's frame-rate cap when the panel's real top rate is below its
+    // nominal one (PanelRate): its shortest refresh plus 0.2 ms, so every
+    // frame comes after the panel could refresh again (PanelRate).
+    var capHz: Double?
     lazy var phase = PhaseLock(refreshHz: Double(window.screen?.maximumFramesPerSecond ?? 60), vsync: vsync)
     let stats = Stats()
     let gate = FrameGate()
@@ -331,7 +376,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     var player: AudioPlayer?
     var locked = false, lockActive = false
     var keyMonitor: Any?
-    var vrr = false // full screen on a variable-refresh display
+    var fullScreen = false // as the present mode was last applied
+    var pacing = Pacing(options: options, fullScreen: false, screen: nil)
     var codecName = "-"
     var timers: [Timer] = []
     var configureTimer: Timer?
@@ -372,9 +418,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         decoder.onDecoded = { [renderer] image, timing in renderer.submit(.buffer(image), timing) }
         pyro?.onDecoded = { [renderer] planes, timing in renderer.submit(.planes(planes), timing) }
         pyro?.onIncomplete = { [stats] in stats.gap() }
-        renderer.onPresented = { [stages, chart, phase, vsync] t in
+        renderer.onPresented = { [stages, chart, phase, vsync, panel] t in
             stages.add(t)
             phase.presented(t)
+            panel.presented(t.presented)
             Trace.shared?.record(t: t.presented, aux: t.presented &- t.received, kind: 0xFE, host: t.presentLocal ?? 0)
             if getenv("GM_DEBUG_FLIP") != nil, let g = vsync.grid() {
                 // Measuring: where in the refresh each frame was flipped.
@@ -396,7 +443,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         if options.fullScreen { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.window.toggleFullScreen(nil) } }
         timers.append(Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.conn?.ping() })
         timers.append(Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.sendGrid() })
-        timers.append(Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.updateTitle() })
+        timers.append(Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateTitle()
+            self?.checkPanelRate()
+        })
         timers.append(Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.updateOverlay()
         })
@@ -404,17 +454,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     }
 
     /// This display's refresh grid, shifted by the phase lock, to the host.
-    /// On a variable-refresh display, none: an empty grid, so gamescope paces
-    /// itself and each frame is shown as it arrives.
+    /// With pacing off (the setting alone decides, on a variable-refresh
+    /// display too), none: an empty grid, so gamescope paces itself and each
+    /// frame is shown as it arrives.
     func sendGrid() {
         if let mock {
-            let g = vrr || !options.phaseLock ? nil : phase.step()
+            let g = !pacing.phaseLock ? nil : phase.step()
             mock.setGrid(anchor: g?.anchor ?? 0, interval: g?.interval ?? 0)
             return
         }
         guard let conn else { return }
         var m = Writer()
-        if vrr || !options.phaseLock || getenv("GM_NO_PHASE") != nil { // gamescope paces itself
+        if !pacing.phaseLock || getenv("GM_NO_PHASE") != nil { // gamescope paces itself
             m.u64(0)
             m.u32(0)
         } else {
@@ -441,7 +492,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         return (Int(view.bounds.width * scale) & ~1, Int(view.bounds.height * scale) & ~1)
     }
     func refreshMhz() -> UInt32 {
-        UInt32((options.refresh ?? Double(window.screen?.maximumFramesPerSecond ?? 60)) * 1000)
+        UInt32(((options.refresh ?? capHz) ?? Double(window.screen?.maximumFramesPerSecond ?? 60)) * 1000)
+    }
+
+    /// Once a second: cap the host just under the panel's real top rate when
+    /// it is below the nominal one (only measurable before the cap is set).
+    func checkPanelRate() {
+        guard capHz == nil, !pacing.phaseLock, options.refresh == nil, let screen = window.screen,
+              let top = panel.top(nominalHz: Double(screen.maximumFramesPerSecond)) else { return }
+        capHz = 1e9 / (1e9 / top + 200_000)
+        // Shorter than the host's spacing on average, or one frame pushed
+        // back would push every later one too (it drains 0.1 ms a frame).
+        renderer.setHoldSpacing(1e9 / top + 100_000)
+        NSLog("gmstream: panel tops out at %.3f Hz; capping the host at %.3f Hz", top, capHz!)
+        sendConfigure()
     }
 
     var mock: MockSource?
@@ -483,6 +547,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         c.start(width: w, height: h, refreshMhz: refreshMhz(), kbps: options.mbps * 1000,
                 codecMask: clientCodecs, preferred: options.codec)
         c.keepAwake(options.keepWiFiAwake)
+        c.send(Msg.vrrPolicy, Data([pacing.steamVRR]))
     }
 
     @objc func reconnect() {
@@ -600,10 +665,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
             if row.name == "pacing" { lines.append(String(repeating: "─", count: 27)) }
             lines.append("\(pad(row.name, 9))\(num(row.p50)) \(num(row.p90)) \(fmt(row.max))")
         }
-        let phaseText = vrr ? "phase: off (variable refresh)" : !options.phaseLock ? "phase: off (setting)" : phase.summary()
+        let phaseText = (options.pacingAuto ? "pacing auto (\(pacing.vrr ? "VRR: hold" : "fixed refresh: phase lock")), " : "") +
+            (!pacing.phaseLock ? "phase: off" : phase.summary())
         lines.append(phaseText + "  compositing \(renderer.compositingStatus)")
+        let hold = renderer.holdStatus(offset: conn?.clockOffsetNs)
         lines += [
-            "rtt \(fmt(conn.map { Double($0.rttNs) / 1e6 })) ms  skipped \(st.skipped)  dropped \(st.dropped)  gaps \(s.gaps)",
+            "rtt \(fmt(conn.map { Double($0.rttNs) / 1e6 })) ms  skipped \(st.skipped)  dropped \(st.dropped)  gaps \(s.gaps)" +
+                (pacing.hold ? "  hold \(fmt(hold.delayNs.map { $0 / 1e6 })) ms, late \(hold.late)" : ""),
             "audio \(player.map { String(format: "%.0f ms buffered", $0.bufferedMs) } ?? (opus == nil ? "no Opus decoder" : "no output"))" +
                 "  pads \(pads.connected)",
         ]
@@ -636,6 +704,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     lazy var settings: SettingsWindow = {
         let s = SettingsWindow()
         s.onChange = { [weak self] change in self?.apply(change) }
+        s.pacingNow = { [weak self] in
+            guard let self else { return (options.phaseLock, options.holdFrames, "") }
+            let p = self.pacing
+            let note = !options.pacingAuto ? "Steam's VRR toggle is left to you."
+                : p.vrr ? "Variable-refresh display in full screen: fixed delay, no phase lock; Steam's VRR is forced on (the game runs free)."
+                : "Fixed refresh (or a window): phase lock, no fixed delay; Steam's VRR is off (its toggle greyed)."
+            return (p.phaseLock, p.hold, note)
+        }
         return s
     }()
 
@@ -652,7 +728,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         case .stats: updateOverlay()
         case .present: applyPresentMode()
         case .keepAwake: conn?.keepAwake(options.keepWiFiAwake)
-        case .phaseLock: if options.phaseLock { phase.restart() } // sweeps for the current phase
+        case .phaseLock: applyPresentMode() // pacing settings: phase lock, hold, auto
         }
     }
 
@@ -676,26 +752,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
             vsync.start(on: s)
             phase.restart(refreshHz: Double(s.maximumFramesPerSecond))
         }
+        capHz = nil
+        renderer.setHoldSpacing(nil)
+        panel.reset()
         applyPresentMode()
         windowDidResize(n)
     }
     func windowDidEnterFullScreen(_ n: Notification) { applyPresentMode() }
     func windowDidExitFullScreen(_ n: Notification) { applyPresentMode() }
 
-    /// Vsync on, except in full screen with "lowest latency" set. In full
-    /// screen on a variable-refresh (Adaptive-Sync) display the panel refreshes
-    /// when a frame arrives, so vsync costs nothing there: frames are shown
-    /// tear-free as they come (measured display stage 3.3 ms, as with vsync
-    /// off), and the phase lock is off.
+    /// Vsync on, except in full screen with "lowest latency" set. The settings
+    /// alone decide, on a variable-refresh (Adaptive-Sync) display too (there,
+    /// with vsync on and pacing off, the panel refreshes when a frame arrives:
+    /// measured display stage 3.3 ms). Entering or leaving full screen changes
+    /// how frames reach the panel (flipped straight to it or composited), so
+    /// the phase lock starts over.
     func applyPresentMode() {
-        let fullScreen = window.styleMask.contains(.fullScreen)
+        let wasFullScreen = fullScreen, was = pacing
+        fullScreen = window.styleMask.contains(.fullScreen)
         let screen = window.screen
-        let wasVRR = vrr
-        vrr = fullScreen && screen.map { $0.maximumRefreshInterval > $0.minimumRefreshInterval * 1.01 } ?? false
-        let immediate = options.immediateFullScreen && fullScreen && !vrr
+        pacing = Pacing(options: options, fullScreen: fullScreen, screen: screen)
+        let immediate = options.immediateFullScreen && fullScreen
         renderer.setVsync(!immediate)
+        renderer.holdFrames = pacing.hold
         phase.setImmediate(immediate)
-        if wasVRR && !vrr { phase.restart() }
+        if (fullScreen != wasFullScreen || pacing.phaseLock != was.phaseLock) && !immediate { phase.restart() }
+        if pacing.steamVRR != was.steamVRR { conn?.send(Msg.vrrPolicy, Data([pacing.steamVRR])) }
+        settings.load()
         // Tagged sRGB, macOS converts to the display; tagged as the display's
         // own color space, the pixels go to the panel unconverted.
         renderer.layer.colorspace = options.vividColors

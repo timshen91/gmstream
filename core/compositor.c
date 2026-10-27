@@ -12,6 +12,7 @@
 // it natively.
 
 #include <assert.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -66,6 +67,7 @@ struct vd_frame {
 	struct wlr_buffer *buffer; // locked
 	int width, height; // surface size (a single-pixel buffer is scaled up)
 	uint64_t present_ns; // CLOCK_MONOTONIC time it is due on the output
+	uint64_t release_ns; // not encoded before this (on a client grid), or 0
 	struct wl_event_source *fence_source; // NULL once the GPU work is done
 	int fence_fd;
 };
@@ -145,6 +147,15 @@ struct vd_server {
 	// its own just-in-time scheduler lines frames up with the client's
 	// refreshes. 0: none.
 	uint64_t grid_anchor_ns, grid_interval_ns, grid_last_vblank_ns;
+	// The client's say over Steam's VRR (gm_set_vrr_policy): 1 reports its
+	// grid as a fixed refresh (gamescope then calls the display VRR-incapable:
+	// Steam greys its VRR toggle, and gamescope paces to the grid whatever the
+	// toggle says). 0, 2: reported as VRR.
+	int vrr_policy;
+	// How long before its vblank gamescope committed each recent frame, in
+	// GRID_LEAD_BIN_NS bins: a ring of the last GRID_LEADS and their counts.
+	uint16_t grid_leads[1024], grid_lead_counts[1024];
+	unsigned grid_lead_next, grid_lead_n;
 
 	struct gm_encoder *encoder;
 	struct gm_audio *audio;
@@ -274,11 +285,12 @@ static void try_present(struct vd_server *server) {
 		return;
 	}
 
-	if (gm_now_ns() < frame->present_ns) {
+	uint64_t due = frame->release_ns > frame->present_ns ? frame->release_ns : frame->present_ns;
+	if (gm_now_ns() < due) {
 		struct itimerspec its = {
 			.it_value = {
-				.tv_sec = frame->present_ns / 1000000000,
-				.tv_nsec = frame->present_ns % 1000000000,
+				.tv_sec = due / 1000000000,
+				.tv_nsec = due % 1000000000,
 			},
 		};
 		timerfd_settime(server->pace_fd, TFD_TIMER_ABSTIME, &its, NULL);
@@ -395,6 +407,68 @@ static void focus_view(struct vd_server *server) {
 		server->cursor_x, server->cursor_y);
 }
 
+// Measuring (GM_DEBUG_GRID=<file>): every grid update ("g now anchor
+// interval"), every commit's feedback on a grid ("c now vblank frame
+// release") and every frame's commit and slot ("s now slot"), host ns.
+static FILE *grid_trace(void) {
+	static FILE *f;
+	static bool opened;
+	if (!opened) {
+		opened = true;
+		const char *path = getenv("GM_DEBUG_GRID");
+		f = path != NULL ? fopen(path, "w") : NULL;
+		if (f != NULL) {
+			setvbuf(f, NULL, _IOLBF, 0);
+		}
+	}
+	return f;
+}
+
+#define GRID_LEADS 1024
+#define GRID_LEAD_BIN_NS 25000
+
+// When a frame committed `lead_ns` before its grid vblank leaves for the
+// encoder: no earlier than the 10th percentile of recent leads before that
+// vblank. gamescope wakes for each vblank early by its own draw-time
+// estimate, which it raises for a while after a slow composite: on
+// steamtab every ~8 s it committed 0.5 ms earlier for ~2 s (3.75 instead of
+// 3.25 ms before the vblank). Passed on, that moved every frame 0.5 ms
+// earlier on the client's screen, past the edge its phase lock had set
+// them a margin from: a burst of dropped frames each time. Holding the
+// early ones to the usual time keeps the stream on one phase; frames
+// committed as late as usual or later are not held (about 0.1 ms median).
+static uint64_t grid_release(struct vd_server *server, uint64_t now,
+		uint64_t vblank) {
+	uint64_t lead = vblank > now ? vblank - now : 0;
+	unsigned bin = lead / GRID_LEAD_BIN_NS;
+	if (bin >= GRID_LEADS) {
+		bin = GRID_LEADS - 1;
+	}
+	if (server->grid_lead_n == GRID_LEADS) {
+		server->grid_lead_counts[server->grid_leads[server->grid_lead_next]]--;
+	} else {
+		server->grid_lead_n++;
+	}
+	server->grid_leads[server->grid_lead_next] = bin;
+	server->grid_lead_counts[bin]++;
+	server->grid_lead_next = (server->grid_lead_next + 1) % GRID_LEADS;
+	if (server->grid_lead_n < 120) {
+		return 0; // not enough to tell the usual lead yet
+	}
+	unsigned seen = 0, p10 = 0;
+	while (p10 < GRID_LEADS - 1 &&
+			(seen += server->grid_lead_counts[p10]) * 10 < server->grid_lead_n) {
+		p10++;
+	}
+	uint64_t hold = (uint64_t)p10 * GRID_LEAD_BIN_NS;
+	return vblank > hold && vblank - hold > now ? vblank - hold : 0;
+}
+
+static void grid_leads_reset(struct vd_server *server) {
+	memset(server->grid_lead_counts, 0, sizeof(server->grid_lead_counts));
+	server->grid_lead_next = server->grid_lead_n = 0;
+}
+
 // The vblank of the client's display grid a new frame flips on: the next
 // grid point, one later than the last one reported. A commit without a new
 // frame gets the last one again, so reported times never run ahead.
@@ -416,29 +490,42 @@ static uint64_t grid_vblank(struct vd_server *server, uint64_t now, bool frame) 
 
 // Answers the commit's presentation feedback, if it asked for any: shown at
 // `when_ns`, or with a client display grid, at that grid's next vblank.
-// Always as a VRR display (refresh 0): gamescope's Wayland backend reports
-// VRR support only then, and Steam hides its VRR toggle otherwise. With
-// Steam's toggle off gamescope still paces to these timestamps (its vblank
-// timer, at the output mode's refresh), so a client grid still sets where
-// frames land; with it on, gamescope presents as soon as frames are ready.
-static void send_feedback(struct vd_server *server, struct wlr_surface *surface,
+// As a VRR display (refresh 0), unless the client asked for a fixed refresh
+// (vrr_policy 1): gamescope's Wayland backend reports VRR support only for
+// refresh 0, and Steam hides its VRR toggle otherwise. With Steam's toggle off
+// gamescope still paces to these timestamps (its vblank timer, at the output
+// mode's refresh), so a client grid still sets where frames land; with it on,
+// gamescope presents as soon as frames are ready. Reported as a fixed refresh,
+// gamescope takes its refresh from the grid's interval and is never VRR.
+// Returns when a frame on a client grid may leave for the encoder (0: now).
+static uint64_t send_feedback(struct vd_server *server, struct wlr_surface *surface,
 		uint64_t when_ns, bool frame) {
 	struct wlr_presentation_feedback *feedback =
 		wlr_presentation_surface_sampled(surface);
 	if (feedback == NULL) {
-		return;
+		return 0;
 	}
+	uint64_t release = 0;
 	if (server->grid_interval_ns != 0) {
-		when_ns = grid_vblank(server, gm_now_ns(), frame);
+		uint64_t now = gm_now_ns();
+		when_ns = grid_vblank(server, now, frame);
+		if (frame) {
+			release = grid_release(server, now, when_ns);
+		}
+		if (grid_trace() != NULL) {
+			fprintf(grid_trace(), "c %" PRIu64 " %" PRIu64 " %d %" PRIu64 "\n",
+				now, when_ns, frame, release);
+		}
 	}
 	struct wlr_presentation_event event = {
 		.output = server->output,
 		.tv_sec = when_ns / 1000000000,
 		.tv_nsec = when_ns % 1000000000,
-		.refresh = 0,
+		.refresh = server->vrr_policy == 1 ? (uint32_t)server->grid_interval_ns : 0,
 	};
 	wlr_presentation_feedback_send_presented(feedback, &event);
 	wlr_presentation_feedback_destroy(feedback);
+	return release;
 }
 
 static void handle_view_commit(struct wl_listener *listener, void *data) {
@@ -487,13 +574,13 @@ static void handle_view_commit(struct wl_listener *listener, void *data) {
 	// Decide when a VRR panel would show this frame: now, or one maximum-
 	// refresh interval after the previous flip; a frame replacing one still
 	// queued takes over its slot.
-	uint64_t slot;
+	uint64_t commit = gm_now_ns(), slot;
 	if (server->waiting != NULL) {
 		server->stats_superseded++;
 		slot = server->waiting->present_ns;
 	} else {
 		uint64_t period = 1000000000000ull / (uint64_t)server->refresh;
-		slot = gm_now_ns();
+		slot = commit;
 		// On a client grid gamescope paces itself; no VRR cap.
 		if (server->grid_interval_ns == 0 && server->last_slot_ns != 0 &&
 				slot < server->last_slot_ns + period) {
@@ -507,7 +594,12 @@ static void handle_view_commit(struct wl_listener *listener, void *data) {
 	// instead), and it composites into a fixed ring of three images without
 	// waiting for releases: a late timestamp would let it composite again
 	// and again into the frame we are holding.
-	send_feedback(server, surface, slot, true);
+	uint64_t release = send_feedback(server, surface, slot, true);
+	if (grid_trace() != NULL) {
+		// Every frame: when gamescope committed it and its slot (on a client
+		// grid, the commit time; else the VRR emulation's, maybe later).
+		fprintf(grid_trace(), "s %" PRIu64 " %" PRIu64 "\n", commit, slot);
+	}
 
 	// gamescope sends the whole composited frame on its root surface when
 	// run with --force-composition; anything on subsurfaces is not shown.
@@ -515,6 +607,16 @@ static void handle_view_commit(struct wl_listener *listener, void *data) {
 	server->waiting = frame_create(server, surface);
 	if (server->waiting != NULL) {
 		server->waiting->present_ns = slot;
+		server->waiting->release_ns = release;
+		// A client that holds frames itself to a fixed delay after this time
+		// (VRR on, vrr_policy 2, no grid) gets each frame at once, stamped
+		// with its commit: gamescope (VRR, refresh = the client's cap) already
+		// keeps to the rate, and holding to the VRR emulation's slot here
+		// added 0–2.7 ms that varied with the game's frame times, the very
+		// spacing the client's display is to keep.
+		if (server->vrr_policy == 2 && server->grid_interval_ns == 0) {
+			server->waiting->present_ns = commit;
+		}
 	}
 	try_present(server);
 }
@@ -945,6 +1047,7 @@ enum cmd_type {
 	CMD_PAD_UPDATE,
 	CMD_PAD_REMOVE,
 	CMD_DISPLAY_GRID,
+	CMD_VRR_POLICY,
 };
 
 struct cmd {
@@ -955,6 +1058,7 @@ struct cmd {
 		struct { uint32_t code; bool pressed; } key;
 		struct { uint8_t pad; struct gm_gamepad_state state; } pad;
 		struct { uint64_t anchor_ns, interval_ns; } grid;
+		int vrr_policy;
 	};
 };
 
@@ -1004,6 +1108,8 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		set_screen_size(server, c->stream.w, c->stream.h, c->stream.refresh);
 		server->grid_anchor_ns = server->grid_interval_ns = 0; // until this client reports one
 		server->grid_last_vblank_ns = 0;
+		server->vrr_policy = 0;
+		grid_leads_reset(server);
 		if (server->encoder != NULL) {
 			encoder_start(server->encoder, c->stream.codec, c->stream.kbps,
 				server->refresh, c->stream.packet);
@@ -1025,6 +1131,7 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		break;
 	case CMD_STREAM_STOP:
 		server->streaming = false;
+		server->vrr_policy = 0;
 		server->grid_anchor_ns = server->grid_interval_ns = 0;
 		server->grid_last_vblank_ns = 0;
 		if (server->encoder != NULL) {
@@ -1041,6 +1148,13 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		}
 		server->grid_anchor_ns = c->grid.anchor_ns;
 		server->grid_interval_ns = c->grid.interval_ns;
+		if (grid_trace() != NULL) {
+			fprintf(grid_trace(), "g %" PRIu64 " %" PRIu64 " %" PRIu64 "\n", gm_now_ns(),
+				c->grid.anchor_ns, c->grid.interval_ns);
+		}
+		break;
+	case CMD_VRR_POLICY:
+		server->vrr_policy = c->vrr_policy;
 		break;
 	case CMD_KEYFRAME:
 		if (server->encoder != NULL) {
@@ -1123,6 +1237,10 @@ void gm_stream_configure(int width, int height, int refresh_mhz) {
 
 void gm_stream_stop(void) {
 	push((struct cmd){ .type = CMD_STREAM_STOP });
+}
+
+void gm_set_vrr_policy(int policy) {
+	push((struct cmd){ .type = CMD_VRR_POLICY, .vrr_policy = policy });
 }
 
 void gm_set_display_grid(uint64_t anchor_ns, uint64_t interval_ns) {

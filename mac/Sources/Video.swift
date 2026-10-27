@@ -17,16 +17,20 @@ enum Codec: UInt8 {
 /// through each stage. Host times are converted with the ping clock offset.
 final class FrameTiming {
     let encodeNs: UInt64          // host: present → bitstream ready
-    let presentLocal: UInt64?     // gamescope presented the frame
+    let presentHost: UInt64       // gamescope presented the frame (host clock)
+    let presentLocal: UInt64?     // the same, in ours
     let encodedLocal: UInt64?     // bitstream ready
     let received: UInt64          // last fragment arrived
     var decodeStart: UInt64 = 0
     var decoded: UInt64 = 0
+    var released: UInt64 = 0      // left the hold (= taken to draw, without one)
+    var due: UInt64?              // to be presented at (with a hold)
     var submitted: UInt64 = 0     // Metal frame committed
     var presented: UInt64 = 0     // on screen
 
     init(slotNs: UInt64, encodedNs: UInt64, received: UInt64, toLocal: (UInt64) -> UInt64?) {
         encodeNs = encodedNs &- slotNs
+        presentHost = slotNs
         presentLocal = toLocal(slotNs)
         encodedLocal = toLocal(encodedNs)
         self.received = received
@@ -40,7 +44,7 @@ final class FrameTiming {
     /// never shown ("dropped"), every time in this Mac's ns.
     static let debug = getenv("GM_DEBUG_FRAMES") != nil
     func log(_ what: String) {
-        FileHandle.standardError.write("frame \(what) \(presentLocal ?? 0) \(encodedLocal ?? 0) \(received) \(decodeStart) \(decoded) \(submitted) \(presented)\n".data(using: .utf8)!)
+        FileHandle.standardError.write("frame \(what) \(presentLocal ?? 0) \(encodedLocal ?? 0) \(received) \(decodeStart) \(decoded) \(submitted) \(presented) \(released) \(presentHost)\n".data(using: .utf8)!)
     }
 }
 
@@ -187,7 +191,9 @@ enum DecodedImage {
 
 /// Shows decoded frames on a CAMetalLayer from its own thread, vsync on.
 /// Newest frame wins: one decoded while the thread waits for a drawable
-/// replaces the one it was about to show (counted as skipped). macOS holds
+/// replaces the one it was about to show (counted as skipped). With a hold
+/// (`holdFrames`), each frame instead waits until a fixed delay after the
+/// host presented it (`Hold`), in order. macOS holds
 /// each frame a fixed number of refreshes, so pacing is steady. (Presenting
 /// with vsync off at scheduled times was tried: lower median, but macOS's
 /// compositor shows such frames one or two refreshes later unpredictably,
@@ -201,14 +207,24 @@ final class MetalRenderer {
     var onDropped: (FrameTiming) -> Void = { _ in }
 
     let device: MTLDevice
-    let queue: MTLCommandQueue // also used by the PyroWave decoder
+    let queue: MTLCommandQueue // the PyroWave decoder's
+    // Drawing has a queue of its own: on the decoder's, a held frame's draw
+    // could sit behind the next frame's decode (~5 ms of GPU work at 4K),
+    // and present → screen varied 3.2–6.6 ms instead of a steady ~3.3.
+    private let drawQueue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState     // BGRA
     private let yuvPipeline: MTLRenderPipelineState  // NV12
     private let planarPipeline: MTLRenderPipelineState // PyroWave: Y, Cb, Cr
     private let overlayPipeline: MTLRenderPipelineState // premultiplied, blended
     private var cache: CVMetalTextureCache?
     private let cond = NSCondition()
-    private var pending: (DecodedImage, FrameTiming)?
+    // Decoded frames not drawn yet: at most one without a hold.
+    private var pending: [(image: DecodedImage, timing: FrameTiming)] = []
+    private let hold = Hold()
+    /// Hold each frame until a fixed delay after the host presented it.
+    var holdFrames = false {
+        didSet { cond.lock(); hold.enabled = holdFrames; cond.unlock() }
+    }
     // The stats overlay, drawn over each frame at `overlayInset` pixels from
     // the top left; with no new frame for a while, the last one is drawn
     // again so the overlay still updates.
@@ -262,6 +278,7 @@ final class MetalRenderer {
     init?(layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:]) {
         self.drawableKeys = drawableKeys
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
+              let drawQueue = device.makeCommandQueue(),
               let library = try? device.makeLibrary(source: Self.shader, options: nil) else { return nil }
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction = library.makeFunction(name: "vs")
@@ -282,6 +299,7 @@ final class MetalRenderer {
         guard let overlayPipeline = try? device.makeRenderPipelineState(descriptor: desc) else { return nil }
         self.device = device
         self.queue = queue
+        self.drawQueue = drawQueue
         self.pipeline = pipeline
         self.yuvPipeline = yuvPipeline
         self.planarPipeline = planarPipeline
@@ -316,10 +334,33 @@ final class MetalRenderer {
 
     func submit(_ image: DecodedImage, _ timing: FrameTiming) {
         cond.lock()
-        if pending != nil { onSkipped() }
-        pending = (image, timing)
+        hold.arrived(timing)
+        timing.due = hold.schedule(timing)
+        // With a hold, frames wait in order (up to 6, 50 ms at 120 Hz:
+        // PyroWave's planes rotate through a ring of 10); without, the newest
+        // replaces the one waiting.
+        while !pending.isEmpty && (!hold.enabled || pending.count >= 6) {
+            pending.removeFirst()
+            onSkipped()
+        }
+        pending.append((image, timing))
         cond.signal()
         cond.unlock()
+    }
+
+    /// Frames are never presented closer together than this (ns): the
+    /// panel's shortest refresh plus a margin (PanelRate), or macOS shows
+    /// the later one on the panel's next tick instead.
+    func setHoldSpacing(_ ns: Double?) {
+        cond.lock(); hold.minSpacing = ns.map { UInt64($0) } ?? 0; cond.unlock()
+    }
+
+    /// The hold's delay after the host's present (nil: off or no clock
+    /// offset yet; `offset`: host minus our clock), and frames that arrived
+    /// after it since the last call.
+    func holdStatus(offset: Int64?) -> (delayNs: Double?, late: Int) {
+        cond.lock(); defer { cond.unlock() }
+        return hold.status(offset: offset)
     }
 
     /// Replaces the overlay (nil: none) with the image in `g`, drawn `inset`
@@ -335,54 +376,84 @@ final class MetalRenderer {
         cond.lock()
         overlay = texture
         overlayInset = inset
-        if pending == nil && nowNs() - lastDrawn > 200_000_000 {
+        if pending.isEmpty && nowNs() - lastDrawn > 200_000_000 {
             repaint = true
             cond.signal()
         }
         cond.unlock()
     }
 
+    /// The frame to draw now: without a hold the one waiting; with one, the
+    /// latest that is due (earlier due ones are skipped).
     private func take() -> (DecodedImage, FrameTiming)? {
         cond.lock()
         defer { cond.unlock() }
-        let p = pending
-        pending = nil
+        guard !pending.isEmpty else { return nil }
+        let now = nowNs()
+        while pending.count > 1, let due = pending[1].timing.due, due <= now {
+            pending.removeFirst()
+            onSkipped()
+        }
+        let p = pending.removeFirst()
+        p.timing.released = nowNs()
         return p
     }
 
     private func renderLoop() {
         while true {
             cond.lock()
-            while pending == nil && !repaint { cond.wait() }
+            while pending.isEmpty && !repaint { cond.wait() }
+            // The counterweight: the oldest frame waits until its due time.
+            let due = pending.first?.timing.due
             cond.unlock()
-            // May wait for a free drawable (display refresh)...
-            guard let drawable = layer.nextDrawable() else { continue }
-            // ...so take the newest frame only now.
-            guard var (image, timing) = take() else {
-                cond.lock()
-                let (image, again) = (last, repaint)
-                repaint = false
-                cond.unlock()
-                if again { draw(image, nil, drawable) }
-                continue
-            }
-            if let newer = take() {
-                onSkipped()
-                (image, timing) = newer
-            }
-            if let at = Self.stallAt, nowNs() > at {
-                // Measuring (GM_DEBUG_STALL=<s>): one 30 ms hiccup, once.
-                Self.stallAt = nil
-                usleep(30_000)
-            }
-            cond.lock()
-            let skipThis = skip
-            skip = false
-            if skipThis { last = image }
-            cond.unlock()
-            if skipThis { onSkipped(); continue } // the drawable goes back unpresented
-            draw(image, timing, drawable)
+            if let due { Self.waitPrecisely(until: due) }
+            // nextDrawable's drawable is autoreleased, and this thread has no
+            // pool of its own: without one per frame, a drawable handed back
+            // unpresented (a skipped frame) is never freed and its buffer
+            // never returns to the layer. After maximumDrawableCount of those
+            // nextDrawable blocks for good and the picture freezes.
+            autoreleasepool { renderOne() }
         }
+    }
+
+    /// Sleeps to 0.2 ms before `t`, then spins: a plain sleep overshot by up
+    /// to ~0.2 ms, and an early or late present moves a frame on a VRR panel.
+    private static func waitPrecisely(until t: UInt64) {
+        if t > nowNs() + 200_000 { waitUntil(t - 200_000) }
+        while nowNs() < t {}
+    }
+
+    private func renderOne() {
+        // May wait for a free drawable (display refresh)...
+        guard let drawable = layer.nextDrawable() else { return }
+        // ...during which a frame may have come in that is not due yet (the
+        // loop only waited for the one waiting when it woke; taking a later
+        // one at once sent frames up to 0.9 ms early).
+        cond.lock()
+        let due = pending.first?.timing.due
+        cond.unlock()
+        if let due { Self.waitPrecisely(until: due) }
+        // ...so take the newest frame only now.
+        guard let (image, timing) = take() else {
+            cond.lock()
+            let (image, again) = (last, repaint)
+            repaint = false
+            cond.unlock()
+            if again { draw(image, nil, drawable) }
+            return
+        }
+        if let at = Self.stallAt, nowNs() > at {
+            // Measuring (GM_DEBUG_STALL=<s>): one 30 ms hiccup, once.
+            Self.stallAt = nil
+            usleep(30_000)
+        }
+        cond.lock()
+        let skipThis = skip
+        skip = false
+        if skipThis { last = image }
+        cond.unlock()
+        if skipThis { onSkipped(); return } // the drawable goes back unpresented
+        draw(image, timing, drawable)
     }
 
     /// Draws `image` (nil: black) and the overlay; `timing` nil for a repaint.
@@ -415,7 +486,7 @@ final class MetalRenderer {
             guard textures.count == planes.count else { return }
             pipeline = yuv ? yuvPipeline : self.pipeline
         }
-        guard let cb = queue.makeCommandBuffer() else { return }
+        guard let cb = drawQueue.makeCommandBuffer() else { return }
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture
         pass.colorAttachments[0].loadAction = .clear
@@ -450,7 +521,7 @@ final class MetalRenderer {
         enc.endEncoding()
         cb.addCompletedHandler { _ in _ = cvTextures } // keep the texture alive until the GPU is done
         guard let timing else {
-            cb.present(drawable)
+            present(cb, drawable)
             cb.commit()
             return
         }
@@ -465,9 +536,23 @@ final class MetalRenderer {
             self?.onPresented(timing)
         }
         for (k, v) in drawableKeys { (drawable as AnyObject).setValue(NSNumber(value: v), forKey: k) }
-        cb.present(drawable)
+        present(cb, drawable)
         timing.submitted = nowNs()
         cb.commit()
+    }
+}
+
+extension MetalRenderer {
+    /// Measuring (GM_PRESENT): how frames are presented. Unset: present();
+    /// "at": present(atTime:) now; "min:<s>": present(afterMinimumDuration:).
+    static let presentMode = getenv("GM_PRESENT").map { String(cString: $0) }
+
+    func present(_ cb: MTLCommandBuffer, _ drawable: CAMetalDrawable) {
+        switch Self.presentMode {
+        case "at"?: cb.present(drawable, atTime: CACurrentMediaTime())
+        case let m? where m.hasPrefix("min:"): cb.present(drawable, afterMinimumDuration: Double(m.dropFirst(4)) ?? 0)
+        default: cb.present(drawable)
+        }
     }
 }
 
@@ -482,4 +567,99 @@ extension MetalRenderer {
 extension MetalRenderer {
     /// Vsync off lets macOS flip frames straight to the panel (full screen).
     func setVsync(_ on: Bool) { layer.displaySyncEnabled = on }
+}
+
+/// The counterweight to the network: each frame is shown a fixed time after
+/// the host presented it, whatever the encode, network and decode took. On a
+/// variable-refresh display in full screen, where macOS flips a frame ~3.3 ms
+/// after it is presented (p90 3.6), that makes the whole path a constant
+/// latency: the screen keeps the host's spacing, as a local VRR display keeps
+/// the game's. No clock sync is needed: a frame's lateness is taken straight
+/// as our time minus the host's (the clocks' offset plus its latency), and
+/// frames are held until the host's time plus a constant, so the offset is
+/// part of the constant. (Ping-based sync on a busy Wi-Fi link, round trip
+/// 2.2 / 8.8 / 14.6 ms min / p50 / p90, moved by 0.5–2.6 ms however the
+/// pings were filtered.)
+///
+/// The constant stays flat and jumps to a new edge when the network's tail
+/// moves: the 99th percentile of the last 4 s of latenesses plus 0.3 ms. Up
+/// when 3 frames within the last second came late and not all in one burst
+/// (100 ms): frames late in one Wi-Fi burst are gone by the time a jump
+/// could help, and jumping for them (2 s windows, 2 lates) moved it 10 ms up
+/// and back within seconds. Down when that edge has been more than 1.5 ms
+/// under the constant for 5 s (checked every 0.5 s; with 1 ms and 2 s, Wi-Fi
+/// noise in the edge moved it ±2.6 ms every 10–30 s). One short step, then
+/// flat again: a constant always creeping toward the edge (a quantile
+/// tracker, slewed) was smooth but never still on the latency chart. That
+/// also follows the clocks' drift (a few ppm). A late frame is shown as soon
+/// as it can be. Guarded by the renderer's condition lock.
+final class Hold {
+    var enabled = false { didSet { if !enabled { constant = nil; recent = []; lates = []; start = nil } } }
+    private var constant: Int64?       // our time minus the host's, ns
+    private var recent: [(at: UInt64, ns: Int64)] = [] // latenesses, last 4 s
+    private var lates: [UInt64] = []   // when frames came late, last 1 s
+    private var lowSince: UInt64?      // the edge has been 1 ms+ under the constant since
+    private var lastCheck: UInt64 = 0
+    private var start: UInt64?         // first frame seen (the constant is set 2 s on)
+    var minSpacing: UInt64 = 0         // between presents (setHoldSpacing)
+    private var lastDue: UInt64 = 0
+    private var late = 0
+
+    /// When a frame should be presented, if held: a constant after the host
+    /// presented it (the host's commit, for a VRR client), but never closer
+    /// to the last one than `minSpacing`. Called once per frame, in order.
+    func schedule(_ t: FrameTiming) -> UInt64? {
+        guard enabled, let c = constant else { return nil }
+        let due = max(UInt64(Int64(t.presentHost) + c), lastDue + minSpacing)
+        lastDue = due
+        return due
+    }
+
+    private var edge: Int64 { recent.map(\.ns).sorted()[recent.count * 99 / 100] + 300_000 }
+
+    func arrived(_ t: FrameTiming) {
+        guard enabled else { return }
+        let now = nowNs()
+        let ns = Int64(now) - Int64(t.presentHost)
+        recent.append((now, ns))
+        recent.removeAll { $0.at &+ 4_000_000_000 < now }
+        guard let c = constant else {
+            if start == nil { start = now }
+            if let start, now - start >= 2_000_000_000 { constant = edge }
+            return
+        }
+        if ns > c {
+            late += 1
+            lates.append(now)
+            lates.removeAll { $0 &+ 1_000_000_000 < now }
+            if lates.count >= 3 && lates.last! - lates.first! > 100_000_000 {
+                constant = max(c, edge)
+                lates = []
+                lowSince = nil
+            }
+            return
+        }
+        guard now - lastCheck >= 500_000_000 else { return }
+        lastCheck = now
+        let e = edge
+        if e < c - 1_500_000 {
+            if let since = lowSince, now - since >= 5_000_000_000 {
+                constant = e
+                lowSince = nil
+            } else if lowSince == nil {
+                lowSince = now
+            }
+        } else {
+            lowSince = nil
+        }
+    }
+
+    /// The hold's constant in our clock if the ping offset is known (only
+    /// for showing; nil: off), and frames that arrived after it since the
+    /// last call.
+    func status(offset: Int64?) -> (delayNs: Double?, late: Int) {
+        defer { late = 0 }
+        guard let c = constant, let offset else { return (nil, late) }
+        return (Double(c + offset), late)
+    }
 }

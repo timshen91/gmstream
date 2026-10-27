@@ -8,7 +8,8 @@ enum Msg {
     // Client → host.
     static let hello: UInt8 = 0x01, configure: UInt8 = 0x02, keyframe: UInt8 = 0x03, bitrate: UInt8 = 0x04,
         key: UInt8 = 0x05, button: UInt8 = 0x06, motion: UInt8 = 0x07, position: UInt8 = 0x08,
-        scroll: UInt8 = 0x09, gamepad: UInt8 = 0x0a, gamepadRemove: UInt8 = 0x0b, ping: UInt8 = 0x0c, displayGrid: UInt8 = 0x0d
+        scroll: UInt8 = 0x09, gamepad: UInt8 = 0x0a, gamepadRemove: UInt8 = 0x0b, ping: UInt8 = 0x0c, displayGrid: UInt8 = 0x0d,
+        vrrPolicy: UInt8 = 0x0e
     // Host → client.
     static let helloAck: UInt8 = 0x81, cursor: UInt8 = 0x82, pointerLock: UInt8 = 0x83,
         rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86
@@ -314,6 +315,12 @@ final class Connection {
         }
     }
 
+    /// Host clock minus ours, if known.
+    var clockOffsetNs: Int64? {
+        clockLock.lock(); defer { clockLock.unlock() }
+        return offsetNs
+    }
+
     /// Our clock in the host's time base, if known.
     func toHost(localNs: UInt64) -> UInt64? {
         clockLock.lock()
@@ -374,31 +381,37 @@ final class Connection {
                 return
             }
             lastHeard = nowNs()
-            let d = Data(buf[0..<n])
-            if let trace = Trace.shared {
-                let t = arrived > 0 ? arrived : lastHeard
-                let kind = d[0]
-                let id = n >= 5 ? d.u32(1) : 0
-                let frag = (kind == datagramVideo || kind == datagramPyroWave) && n >= 9
-                let host: UInt64 = kind == datagramAudio && n >= 13 ? d.u64(5) : kind == datagramPyroWave && n > 29 ? d.u64(21) : 0
-                trace.record(t: t, aux: lastHeard &- t, kind: kind, size: n, id: id,
-                             index: frag ? Int(d.u16(5)) : 0, count: frag ? Int(d.u16(7)) : 0, host: host)
-            }
-            switch d[0] {
-            case datagramVideo where n > 9:
-                videoFragment(id: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)), part: d.subdata(in: 9..<n))
-            case datagramControl where n > 5:
-                controlDatagram(seq: d.u32(1), payload: d.subdata(in: 5..<n))
-            case datagramPyroWave where n > 29:
-                delegate?.pyrowave(PyroWavePacket(
-                    frameId: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)),
-                    width: Int(d.u16(9)), height: Int(d.u16(11)), slotNs: d.u64(13), encodedNs: d.u64(21),
-                    payload: d.subdata(in: 29..<n), receivedNs: arrived > 0 ? arrived : lastHeard, readNs: lastHeard))
-            case datagramAudio where n > 13:
-                delegate?.audio(d.subdata(in: 13..<n))
-            default:
-                break
-            }
+            // A thread of our own has no autorelease pool unless we drain one:
+            // Metal objects autoreleased by the decoders (PyroWave's compute
+            // encoders) would pile up for the whole session.
+            autoreleasepool { datagram(Data(buf[0..<n]), n: n, arrived: arrived) }
+        }
+    }
+
+    private func datagram(_ d: Data, n: Int, arrived: UInt64) {
+        if let trace = Trace.shared {
+            let t = arrived > 0 ? arrived : lastHeard
+            let kind = d[0]
+            let id = n >= 5 ? d.u32(1) : 0
+            let frag = (kind == datagramVideo || kind == datagramPyroWave) && n >= 9
+            let host: UInt64 = kind == datagramAudio && n >= 13 ? d.u64(5) : kind == datagramPyroWave && n > 29 ? d.u64(21) : 0
+            trace.record(t: t, aux: lastHeard &- t, kind: kind, size: n, id: id,
+                         index: frag ? Int(d.u16(5)) : 0, count: frag ? Int(d.u16(7)) : 0, host: host)
+        }
+        switch d[0] {
+        case datagramVideo where n > 9:
+            videoFragment(id: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)), part: d.subdata(in: 9..<n))
+        case datagramControl where n > 5:
+            controlDatagram(seq: d.u32(1), payload: d.subdata(in: 5..<n))
+        case datagramPyroWave where n > 29:
+            delegate?.pyrowave(PyroWavePacket(
+                frameId: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)),
+                width: Int(d.u16(9)), height: Int(d.u16(11)), slotNs: d.u64(13), encodedNs: d.u64(21),
+                payload: d.subdata(in: 29..<n), receivedNs: arrived > 0 ? arrived : lastHeard, readNs: lastHeard))
+        case datagramAudio where n > 13:
+            delegate?.audio(d.subdata(in: 13..<n))
+        default:
+            break
         }
     }
 
@@ -454,15 +467,16 @@ final class Connection {
             let now = nowNs()
             let t0 = body.u64(0) * 1000
             let rtt = now - t0
+            let host = body.u64(8)
             clockLock.lock()
             if offsetNs == nil || rtt <= bestRtt + bestRtt / 5 {
                 bestRtt = min(bestRtt, rtt)
-                offsetNs = Int64(body.u64(8)) - Int64(t0 + rtt / 2)
+                offsetNs = Int64(host) - Int64(t0 + rtt / 2)
             }
             rttNs = rtt
-            let off = offsetNs
             clockLock.unlock()
-            if let off { Trace.shared?.record(t: now, aux: rtt, kind: 0xFF, host: UInt64(bitPattern: off)) }
+            // This ping's own offset (host − our midpoint), not the fitted one.
+            Trace.shared?.record(t: now, aux: rtt, kind: 0xFF, host: UInt64(bitPattern: Int64(host) - Int64(t0 + rtt / 2)))
         case Msg.helloAck where body.count >= 1:
             let codec = body[body.startIndex]
             DispatchQueue.main.async { self.delegate?.helloAck(codec: codec) }

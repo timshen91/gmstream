@@ -84,6 +84,7 @@ unsafe extern "C" {
     fn gm_stream_stop();
     fn gm_request_keyframe();
     fn gm_set_display_grid(anchor_ns: u64, interval_ns: u64);
+    fn gm_set_vrr_policy(policy: c_int);
     fn gm_set_bitrate(kbps: c_int);
     fn gm_supported_codecs() -> u32;
     fn gm_pointer_motion(dx: f64, dy: f64);
@@ -195,6 +196,9 @@ pub fn stream_stop() {
 }
 pub fn set_display_grid(anchor_ns: u64, interval_ns: u64) {
     unsafe { gm_set_display_grid(anchor_ns, interval_ns) }
+}
+pub fn set_vrr_policy(policy: u8) {
+    unsafe { gm_set_vrr_policy(policy as c_int) }
 }
 
 pub fn request_keyframe() {

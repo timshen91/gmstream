@@ -3,6 +3,7 @@
 // standard mapping). State goes out on every change, not on a poll. Rumble
 // from the host plays on the controller's haptics.
 
+import AppKit
 import CoreHaptics
 import GameController
 
@@ -25,7 +26,31 @@ final class Gamepads {
         nc.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] n in
             if let c = n.object as? GCController { self?.detach(c) }
         }
+        // Coming back to the front: claim the buttons again (macOS may have
+        // handed them back while another app was active).
+        nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.slots.forEach { if let c = $0 { Self.claimSystemButtons(c) } }
+        }
         GCController.controllers().forEach(attach)
+    }
+
+    /// macOS keeps the Home (Xbox/PS) button and the View/Options button for
+    /// its own gestures unless the app asks for them; Steam needs Home. Asked
+    /// on the mapped profile's elements and the physical ones (separate
+    /// objects), and again shortly after a connect: with a controller
+    /// plugged in while the app ran, Home went to macOS again (one connected
+    /// at launch was fine), likely because the connect is announced before
+    /// the controller is fully set up.
+    private static func claimSystemButtons(_ c: GCController) {
+        var elements: [GCControllerElement?] = []
+        if let g = c.extendedGamepad { elements += [g.buttonHome, g.buttonOptions, g.buttonMenu] }
+        let buttons = c.physicalInputProfile.buttons
+        elements += [buttons[GCInputButtonHome], buttons[GCInputButtonOptions], buttons[GCInputButtonMenu]]
+        for e in elements { e?.preferredSystemGestureState = .disabled }
+        if getenv("GM_DEBUG_PADS") != nil {
+            let state = { (e: GCControllerElement?) in e.map { "\($0.preferredSystemGestureState.rawValue)" } ?? "-" }
+            FileHandle.standardError.write("pad \(c.vendorName ?? "?"): home \(state(buttons[GCInputButtonHome])) options \(state(buttons[GCInputButtonOptions])) (preferred; 2 disabled)\n".data(using: .utf8)!)
+        }
     }
 
     /// After (re)connecting to the host: send every pad's current state.
@@ -41,11 +66,11 @@ final class Gamepads {
               let i = slots.firstIndex(where: { $0 == nil }) else { return }
         slots[i] = c
         c.playerIndex = GCControllerPlayerIndex(rawValue: i) ?? .indexUnset
-        // macOS keeps the Home (Xbox/PS) button and the View/Options button
-        // for its own gestures unless the app asks for them; Steam needs Home.
-        if let g = c.extendedGamepad {
-            for e in [g.buttonHome, g.buttonOptions, g.buttonMenu] as [GCControllerElement?] {
-                e?.preferredSystemGestureState = .disabled
+        Self.claimSystemButtons(c)
+        for delay in [0.5, 2.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak c] in
+                guard let self, let c, self.slots.contains(where: { $0 === c }) else { return }
+                Self.claimSystemButtons(c)
             }
         }
         c.extendedGamepad?.valueChangedHandler = { [weak self, weak c] _, _ in

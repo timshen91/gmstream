@@ -228,11 +228,13 @@ built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
     the grid's shift through one refresh (the display stage is a sawtooth
     with one cut-off) and locks at the lowest step without drops. Each
     frame is then placed by its lead: submit → the next point in the
-    refresh where flips land. The cut-off is a fixed lead (the display's,
-    not the shift's), learned from the leads of dropped frames; a servo
-    holds the 1st percentile of the leads 0.4 ms above it, which also
-    follows the drift between the two machines' clocks (tens of ppm, which
-    otherwise crosses the cut-off within a minute). If most frames start
+    refresh where flips land (the refresh interval measured, not the
+    screen's nominal one: §8). Which leads get shown is learned per 0.25 ms
+    bin; the lock steers the host present's lead to where the recent
+    latenesses (submit − host present, no wrap) would have been shown most
+    often, which also follows the drift between the two machines' clocks
+    (tens of ppm). gmstream holds frames gamescope committed early to its
+    usual commit time before the vblank (`grid_release`). If most frames start
     showing a refresh late with every lead fine (the window server one
     frame deeper), the renderer skips one frame to drain it.
     Settings → "Pace the host to this display's refreshes" (on by default;
@@ -245,15 +247,59 @@ built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
     panel: display stage ~4 ms instead of ~20. It tears: Metal's presented
     times (the flips) land anywhere in the refresh, while with vsync they all
     land at one phase (GM_DEBUG_FLIP logs each flip's phase).
-  - Full screen on a variable-refresh (Adaptive-Sync) display, detected from
-    `NSScreen.minimumRefreshInterval` / `maximumRefreshInterval`: the panel
-    refreshes when a frame arrives, so vsync costs nothing. The app keeps
-    vsync on, sends an empty grid (interval 0: gamescope paces itself) and
-    shows frames as they come, tear-free. Measured on a Dell U2725QE
+  - Full screen on a variable-refresh (Adaptive-Sync) display: the panel
+    refreshes when a frame arrives, so vsync costs nothing. The settings
+    alone decide what happens there (the app used to turn pacing and
+    "lowest latency" off on such a display by itself): with pacing off and
+    vsync on, it sends an empty grid (interval 0: gamescope paces itself)
+    and shows frames as they come, tear-free. Measured that way on a Dell U2725QE
     (48–120 Hz) from an M4 MacBook Air: total 12.6 / 13.7 ms p50 / p90,
     display stage 3.1 / 3.6 ms, pacing p90 ~2 ms. `present(atTime:)` to
     smooth pacing made both pacing and p90 worse. In a window the desktop is
     composited at a fixed rate (22–25 ms total).
+- Settings → Pacing: **Auto** (the default) or **Manual**. The two models do
+  not mix. Auto, in full screen on an Adaptive-Sync display: the hold on, the
+  phase lock off, Steam's VRR forced on (protocol VrrPolicy 2: the game runs
+  free, gamescope commits each frame when it is ready, gmstream passes it on
+  at once stamped with that commit, and the hold makes commit → present a
+  constant). Auto otherwise (a window, a fixed-refresh display): the phase
+  lock on, no hold, Steam's VRR off and its toggle greyed (VrrPolicy 1: the
+  grid reported as a fixed refresh). Manual: the two settings as they are,
+  Steam's toggle left alone. Settings shows what Auto chose.
+- macOS does VRR on the Dell U2725QE in full screen, the way the panel's
+  ticks allow: it refreshes on its own fastest ticks (8.3443 ms, 119.84 Hz,
+  not the nominal 1/120 s) and only waits for a frame that comes after the
+  next tick. Test frames in full screen: at 100 Hz flips 10.0 ms apart (true
+  VRR); at 119.6 Hz 98% of flips on the ticks, at 118 45%, at 110 9%;
+  present → screen 3.3 ms p50 from 117 Hz down. So the host is capped at the
+  panel's shortest refresh + 0.2 ms (117.0 Hz here; `PanelRate`, measured
+  while saturated) and the hold never presents two frames closer than the
+  shortest refresh + 0.1 ms. Two more things broke it: redraws on the other
+  display (iTerm on the built-in panel: a late flip every ~100 ms while it
+  redrew), and the draw sharing the PyroWave decoder's Metal queue (a held
+  frame's draw waited behind the next frame's 4K decode). Result (Ender
+  Lilies' title, 4K PyroWave 200 Mb/s over Wi-Fi): commit → present within
+  ±0.4 ms inside steady stretches, the hold moving in steps of a few ms when
+  the network's tail moves; 117 fps, 0.04 drops/s.
+- Settings → "Even out network jitter" (`--hold`): each frame is shown a
+  fixed time after the host presented it (`Hold` in `Sources/Video.swift`),
+  so encode + network + decode add a constant instead of their jitter. In full
+  screen on a variable-refresh display, where present → screen is ~3.3 ms
+  and steady, the screen then keeps the host's frame spacing as a local VRR
+  panel keeps the game's. No clock sync is needed: frames are held until
+  host time + C, with C learned from (our time − host time), so the clock
+  offset is part of C. C stays flat and jumps to a new edge (the 99.5th
+  percentile of the last 2 s of latenesses + 0.3 ms) when the network's tail
+  moves: up at once after two late frames within 0.5 s, down after the edge
+  has sat 1 ms+ under C for a second. A short step, then flat: an
+  edge-creeping quantile tracker (0.5 ms then 0.1 ms steps, slewed) was
+  smooth but never still on the latency chart (measured with 0.5 ms steps,
+  window, Wi-Fi: 28.5 → ~21 ms in ~40 s, then following the network to
+  18.7 ms at 200 Mb/s, pacing p90 0.0 ms). Ping-based sync on
+  busy Wi-Fi (round trip 2.2 / 8.8 / 14.6 ms min / p50 / p90) moved by
+  0.5–2.6 ms however the pings were filtered, which a hold cannot absorb.
+  The overlay shows a "hold" stage, the delay and late frames. On 4K at
+  500 Mb/s over Wi-Fi: delay ~22–25 ms, 0–2 late frames per 5 s.
 - The stats overlay is drawn into the video frame (one extra blended quad),
   not as AppKit views over the Metal layer: a view that changes (the chart,
   10 times a second) makes macOS composite the window for that frame
@@ -447,8 +493,12 @@ installed beside Valve's, never over it. Files are in `session/` and
 installed as:
 
 - `~/.config/systemd/user/gmstream.service`: `gmstream -w gmstream-0 -s
-  1920x1080 -r 60`, ordered before `gamescope-session.service`. It outlives
-  gamescope restarts and accepts the next gamescope.
+  1920x1080 -r 120`, ordered before `gamescope-session.service`. It outlives
+  gamescope restarts and accepts the next gamescope. The `-r` is the refresh
+  Steam sees if it starts before a client connects, and Steam sets its frame
+  limit from it once: with `-r 60`, `GAMESCOPE_FPS_LIMIT` stayed 60 after a
+  120 Hz client connected and gamescope gave the game every other vblank
+  (60 fps; Steam's Quick Access menu showed 60 Hz, frame limit "off").
 - `~/.config/systemd/user/gamescope-session.service.d/50-gmstream.conf`:
   `Requires=`/`After=gmstream.service` and `ExecStart=` the fork below.
   **Delete this file to go back to stock Game Mode.**
@@ -784,6 +834,67 @@ per-stage p50/p90 over 30–60 s; lessons that cost time:
   flags in one variable silently ran with defaults (`${=var}` splits).
 - Frames dropped by the compositor do not show in a "presentation interval
   vs capture interval" pacing metric (both double); count them separately.
+- Windowed on the Dell at 120 Hz (2026-10-27), four separate causes of
+  drops, found in this order:
+  - **Freeze after drops** ("0 fps shown", stream stuck for good): the
+    render and receive threads looped with no autorelease pool, so every
+    autoreleased drawable and PyroWave compute encoder lived for the whole
+    session (38k of each after 15 min). A presented drawable's buffer comes
+    back anyway; one handed back unpresented (a skipped frame, a drain)
+    never did, and after maximumDrawableCount of them `nextDrawable` blocked
+    for good. Each loop iteration now drains a pool. Repro: one forced
+    `skipOne()` every 2 s froze the old build at the second.
+  - **Other displays' redraws**: WindowServer misses whole Dell refreshes
+    (every window on it repeats one; ~8/s) when a translucent, blurred
+    window redraws on the built-in display (iTerm at 42% transparency with
+    blur, its contents animating). Hidden, or transparency 0: ~1 drop/s.
+    Nothing in the app can present around a composite that never happens.
+  - **Wrong refresh interval**: in a window the Dell refreshes every
+    8.3427 ms (119.866 Hz; Adaptive-Sync panel, desktop composited at a fixed
+    rate), not 1/120 s. `PhaseLock.interval` counted refreshes over its whole
+    span with the nominal interval, which on a long span always rounds to
+    8.333 ms: the grid sent to the host ran 1100 ppm fast, the host followed
+    it exactly (`GM_DEBUG_GRID` below), and the lock slipped a whole refresh
+    every ~6.5 s with a burst of drops (10–17 drops/s). Counting with the
+    best interval so far: ~1 drop/s. The same mistake in offline analysis
+    (a period fitted by rounding to 8.333) made the host look like it ran at
+    119.85 Hz on its own: fit periods from consecutive flips.
+  - **gamescope's adaptive wake**: it wakes early by its rolling max draw
+    time and raises that after a slow composite; on steamtab every ~8 s it
+    committed 0.5 ms earlier for ~2 s (3.75 instead of 3.25 ms before the
+    vblank we report). Passed on, every frame landed 0.5 ms earlier on the
+    client, past the edge its lock had set them a margin from. gmstream
+    now holds each frame on a client grid until the 10th percentile of
+    recent commit leads before its vblank (`grid_release`): the release
+    lead stays at 2.92–3.00 ms through those spells, for a 0.12 ms median
+    hold (0.76 ms p90). With both fixes, 60 fps content: 0.97 drops/s,
+    total p50 24.3 / p90 25.4 ms (was ~11 drops/s).
+  - **The lock itself, with 120 fps content** (Ender Lilies' title screen;
+    the numbers above were 60 fps content): steering on submit leads
+    unwrapped around their median read every frame more than half a
+    refresh late as early, and over Wi-Fi the late tail is that far behind
+    (lateness, submit − host present, p50 9 / p99 17 ms). The lock went a
+    whole refresh round every few seconds: 12.4 drops/s, total p50 24.1 /
+    p90 25.5 ms. A sharp cut-off doesn't exist either: frames with leads
+    under 1.5 ms dropped about half the time, 3% from 2.25 to 4.75 ms, ~60%
+    from 5 ms up (replaced by a successor that came in before the window
+    server took them). Fixed-edge models (lateness window above a learned
+    cut-off, cut-off from near-misses or from a drop-rate threshold) all
+    placed frames in the wrong band: 16–26 drops/s. Now the lock learns the
+    shown share per lead bin and steers the host present's lead to where
+    the last ~10 s of latenesses would have been shown most often (§3.7,
+    `Phase.swift`): 6.4 drops/s, 113 fps shown, total p50 21.9 / p90
+    22.3 ms, phase held within ~1 ms. The drops left are late arrivals
+    (network 8.0 vs 7.2 ms median; the successor then arrives 6.9 ms later
+    and replaces them): Wi-Fi jitter at 300 Mb/s.
+  - `GM_DEBUG_GRID=<file>` on the host logs every grid update the client
+    sends and every commit's reported vblank and release time.
+- Steam capped the game at 60 fps with its frame limit "off": gmstream's
+  service started at `-r 60`, Steam read that refresh once at startup and
+  set `GAMESCOPE_FPS_LIMIT=60`, and with the client's 120 Hz output gamescope
+  then gives a limited game every other vblank. The service now starts at
+  `-r 120` (§6.1). Steam's Quick Access menu shows no refresh choice here:
+  gamescope's Wayland backend reports no dynamic refresh rates.
 
 ## 9. Risks and open questions
 

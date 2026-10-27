@@ -47,6 +47,7 @@ const C_GAMEPAD: u8 = 0x0a;
 const C_GAMEPAD_REMOVE: u8 = 0x0b;
 const C_PING: u8 = 0x0c;
 const C_DISPLAY_GRID: u8 = 0x0d;
+const C_VRR_POLICY: u8 = 0x0e;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
@@ -453,6 +454,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
             old.conn.close(2, b"replaced");
         });
         core::stream_stop();
+        steam_vrr(0);
     }
     let n = HUB.sessions.fetch_add(1, Ordering::Relaxed) + 1;
     eprintln!(
@@ -571,6 +573,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     monitor.abort();
     if HUB.remove(&client) {
         core::stream_stop();
+        steam_vrr(0);
     }
     eprintln!("gmstream: client {n} from {peer} disconnected");
     result
@@ -608,6 +611,7 @@ async fn control_loop(recv: &mut RecvStream, client: &Client) -> Result<()> {
             C_GAMEPAD_REMOVE => core::gamepad_remove(r.u8()?),
             // u64 anchor_ns (a vblank, host clock), u32 interval_ns.
             C_DISPLAY_GRID => core::set_display_grid(r.u64()?, r.u32()? as u64),
+            C_VRR_POLICY => steam_vrr(r.u8()?),
             C_PING => {
                 let mut p = r.u64()?.to_le_bytes().to_vec();
                 p.extend_from_slice(&core::now_ns().to_le_bytes());
@@ -616,4 +620,39 @@ async fn control_loop(recv: &mut RecvStream, client: &Client) -> Result<()> {
             _ => {} // unknown messages are skipped for forward compatibility
         }
     }
+}
+
+/// The client's say over Steam's VRR (protocol VrrPolicy): 0 leaves Steam's
+/// toggle alone, 1 turns VRR off (the compositor reports the client's grid as
+/// a fixed refresh, so gamescope calls the display VRR-incapable and Steam
+/// greys the toggle), 2 turns it on. Steam's toggle only sets gamescope's
+/// `adaptive_sync` console variable (through the GAMESCOPE_VRR_ENABLED root
+/// property), which gamescopectl sets as well; leaving 2, it goes back to
+/// what that property says, Steam's own preference.
+fn steam_vrr(policy: u8) {
+    static CURRENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let policy = policy.min(2);
+    core::set_vrr_policy(policy);
+    let before = CURRENT.swap(policy, Ordering::Relaxed);
+    let script = match (before, policy) {
+        (b, 2) if b != 2 => "gamescopectl adaptive_sync 1",
+        (2, p) if p != 2 => {
+            "v=$(xprop -root GAMESCOPE_VRR_ENABLED 2>/dev/null | grep -o '[01]$'); gamescopectl adaptive_sync \"${v:-0}\""
+        }
+        _ => return,
+    };
+    let spawned = std::process::Command::new("sh")
+        .args(["-c", script])
+        .env("WAYLAND_DISPLAY", "gamescope-0")
+        .env("DISPLAY", ":0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => eprintln!("gmstream: Steam VRR: {e}"),
+    }
+    eprintln!("gmstream: Steam VRR {}", ["left to Steam", "off (fixed refresh)", "on"][policy as usize]);
 }
