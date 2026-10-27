@@ -27,9 +27,12 @@
 
 #include "core.h"
 
-// PyroWave packet payload; with our datagram header it fits both a
-// WebTransport datagram (~1200 bytes) and a plain UDP one (1400).
-#define PACKET_BOUNDARY 1100
+// PyroWave packet payload by default; with our datagram header it fits both
+// a WebTransport datagram (~1200 bytes) and a plain UDP one (1400). Plain UDP
+// sessions set their own (pyrowave_start): over a Thunderbolt link (MTU ~64 KB)
+// each datagram costs ~40 µs whatever its size, so a frame in 1100-byte
+// packets took ~8 ms to arrive and in ~64 KB packets ~0.2 ms.
+#define DEFAULT_PACKET 1100
 #define MAX_IMPORTS 8
 
 struct dmabuf {
@@ -69,7 +72,7 @@ struct gm_pyrowave {
 	// Protected by `lock`.
 	bool quit, active;
 	struct job pending;
-	int bitrate_kbps, refresh_mhz;
+	int bitrate_kbps, refresh_mhz, packet_bytes;
 	unsigned stats_encoded, stats_dropped;
 	uint64_t stats_encode_ns;
 
@@ -259,7 +262,7 @@ static void *grow(void *p, size_t *cap, size_t need, size_t elem) {
 }
 
 static void encode_one(struct gm_pyrowave *pw, struct job *job, int bitrate_kbps,
-		int refresh_mhz) {
+		int refresh_mhz, size_t packet) {
 	pyrowave_image image = import_dmabuf(pw, &job->buf);
 	if (image == NULL || !ensure_encoder(pw, job->width, job->height)) {
 		return;
@@ -300,7 +303,7 @@ static void encode_one(struct gm_pyrowave *pw, struct job *job, int bitrate_kbps
 	size_t n = 0;
 	if (r == PYROWAVE_SUCCESS) {
 		// Blocks until the GPU is done.
-		r = pyrowave_encoder_compute_num_packets(pw->encoder, PACKET_BOUNDARY, &n);
+		r = pyrowave_encoder_compute_num_packets(pw->encoder, packet, &n);
 	}
 	if (sync != NULL) {
 		pyrowave_sync_object_destroy(sync);
@@ -312,7 +315,7 @@ static void encode_one(struct gm_pyrowave *pw, struct job *job, int bitrate_kbps
 	pw->packets = grow(pw->packets, &pw->packets_cap, n, sizeof(*pw->packets));
 	pw->bitstream = grow(pw->bitstream, &pw->bitstream_cap, budget + n * 64 + 4096, 1);
 	size_t out_packets = 0;
-	if (pyrowave_encoder_packetize(pw->encoder, pw->packets, PACKET_BOUNDARY, &out_packets,
+	if (pyrowave_encoder_packetize(pw->encoder, pw->packets, packet, &out_packets,
 			pw->bitstream, pw->bitstream_cap) != PYROWAVE_SUCCESS) {
 		wlr_log(WLR_ERROR, "PyroWave: packetize failed");
 		return;
@@ -360,8 +363,9 @@ static void *worker(void *data) {
 		struct job job = pw->pending;
 		pw->pending.valid = false;
 		int bitrate = pw->bitrate_kbps, refresh = pw->refresh_mhz;
+		size_t packet = pw->packet_bytes > 0 ? (size_t)pw->packet_bytes : DEFAULT_PACKET;
 		pthread_mutex_unlock(&pw->lock);
-		encode_one(pw, &job, bitrate, refresh);
+		encode_one(pw, &job, bitrate, refresh, packet);
 		job_clear(&job);
 		pthread_mutex_lock(&pw->lock);
 	}
@@ -413,11 +417,13 @@ void pyrowave_destroy(struct gm_pyrowave *pw) {
 	free(pw);
 }
 
-void pyrowave_start(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz) {
+void pyrowave_start(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz,
+		int packet_bytes) {
 	pthread_mutex_lock(&pw->lock);
 	pw->active = true;
 	pw->bitrate_kbps = bitrate_kbps;
 	pw->refresh_mhz = refresh_mhz;
+	pw->packet_bytes = packet_bytes;
 	pthread_mutex_unlock(&pw->lock);
 }
 

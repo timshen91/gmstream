@@ -1,4 +1,4 @@
-# gmstream protocol, version 2
+# gmstream protocol, version 3
 
 Two transports carry the same messages: WebTransport (HTTP/3 over QUIC, for
 browsers) and plain UDP (unencrypted, for native clients; see the last
@@ -36,7 +36,7 @@ Unknown types are skipped.
 
 | type | name | payload |
 |---|---|---|
-| 0x01 | Hello | `u16 version, u16 width, u16 height, u32 refresh_mHz, u32 bitrate_kbps, u8 codec_mask, u8 preferred_codec, u8 flags (version 2+)` |
+| 0x01 | Hello | `u16 version, u16 width, u16 height, u32 refresh_mHz, u32 bitrate_kbps, u8 codec_mask, u8 preferred_codec, u8 flags (version 2+), u16 max_datagram (version 3+)` |
 | 0x02 | Configure | `u16 width, u16 height, u32 refresh_mHz` (window resize, fullscreen, monitor change) |
 | 0x03 | KeyframeRequest | — |
 | 0x04 | Bitrate | `u32 kbps` |
@@ -52,7 +52,7 @@ Unknown types are skipped.
 
 `Hello` must be first. Hello flags: bit 0 = one video stream, bit 1 = video
 datagrams (see Video; if both are set, datagrams win).
-Version 1 clients (no flags byte) are still accepted. Codec ids: 0 = H.264, 1 = HEVC, 2 = AV1, 3 = PyroWave (see below); the mask has
+`max_datagram`: the largest UDP payload the client's link carries unfragmented (its interface MTU minus the IP and UDP headers); 0 = unknown. Version 1 clients (no flags byte) and version 2 clients (no `max_datagram`) are still accepted. Codec ids: 0 = H.264, 1 = HEVC, 2 = AV1, 3 = PyroWave (see below); the mask has
 bit `1 << id` set for each codec the client can decode. Gamepad buttons follow
 the W3C standard mapping (bit i = `buttons[i]`, 0..16); stick y is positive
 down; triggers are 0..255. Keys are not repeated by the client: gamescope does
@@ -126,7 +126,11 @@ Codec 3 is [PyroWave](https://github.com/Themaister/pyrowave): an intra-only GPU
 wavelet codec whose rate control caps every frame at bitrate / refresh rate
 bytes, so each frame's transmit time is bounded. YCbCr 4:2:0, BT.709 full
 range. Its frames always go as datagrams, whatever the Hello flags, one
-PyroWave packet (at most 1100 bytes) per datagram:
+PyroWave packet per datagram. A packet is at most 1100 bytes, except over
+plain UDP from a version 3 client: then up to `max_datagram` (clamped to the
+host's own route MTU) minus the 29-byte header. Each datagram costs about
+the same whatever its size on some links (~40 µs over a Mac's Thunderbolt
+bridge), so with a ~64 KB MTU a frame arrives in ~0.5 ms instead of ~8.
 
 ```
 u8  type = 4
@@ -177,7 +181,8 @@ Every datagram starts with a type byte:
 The control stream (the same messages as over WebTransport, both
 directions) is cut into type-3 datagrams numbered from 0 in each direction;
 the receiver puts them back in order and reads messages from the bytes. A
-datagram never carries more than 1400 bytes, so nothing is fragmented by IP.
+control datagram never carries more than 1400 bytes, so nothing is fragmented
+by IP; PyroWave datagrams follow `max_datagram` (above).
 
 A client is identified by its address and port. Its control datagram 0
 (which starts with `Hello`) begins a session; a later session from another

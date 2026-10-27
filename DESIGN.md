@@ -226,11 +226,19 @@ built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
     only then, and Steam hides its VRR toggle otherwise; with the toggle off
     gamescope paces to the timestamps all the same. The client sweeps
     the grid's shift through one refresh (the display stage is a sawtooth
-    with one cut-off), locks just before the cut-off, and a servo then
+    with one cut-off) and locks at the lowest step without drops. Each
+    frame is then placed by its lead: submit → the next point in the
+    refresh where flips land. The cut-off is a fixed lead (the display's,
+    not the shift's), learned from the leads of dropped frames; a servo
+    holds the 1st percentile of the leads 0.4 ms above it, which also
     follows the drift between the two machines' clocks (tens of ppm, which
-    otherwise crosses the cut-off within a minute). The margin from the
-    cut-off comes from the measured arrival jitter (median − 0.5th
-    percentile of the display stage, + 0.5 ms, + 0.5 ms per dropped frame).
+    otherwise crosses the cut-off within a minute). If most frames start
+    showing a refresh late with every lead fine (the window server one
+    frame deeper), the renderer skips one frame to drain it.
+    Settings → "Pace the host to this display's refreshes" (on by default;
+    `--no-phase` for one launch) turns it off: the client then sends an
+    empty grid, as on a VRR display, gamescope paces itself and frames are
+    shown as they arrive. Separate from vsync ("lowest latency").
   - Full screen with "lowest latency" (Settings; vsync off only while in
     full screen): the window server stops compositing (private
     `displayCompositingInternalStatus` 0) and frames flip straight to the
@@ -281,7 +289,10 @@ built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
 - Measuring switches: `--stats-log`, `--hide-stats`, `--fullscreen`,
   `--no-vsync`, `--layer key=v,…` / `--drawable key=v,…` (private
   CAMetalLayer / CAMetalDrawable properties by key), `--bgra`, `--probe N`;
-  env `GM_DEBUG_PHASE`, `GM_DEBUG_DECODE`, `GM_DEBUG_NET`, `GM_NET_SERVICE`.
+  env `GM_DEBUG_PHASE`, `GM_DEBUG_DECODE`, `GM_DEBUG_NET`, `GM_NET_SERVICE`,
+  `GM_DEBUG_FRAMES` (one line per frame shown or dropped, every timestamp
+  from gamescope's present to the flip), `GM_DEBUG_STALL=<s>` (one 30 ms
+  render hiccup).
 
 ## 4. gamescope facts this design depends on
 
@@ -750,6 +761,23 @@ per-stage p50/p90 over 30–60 s; lessons that cost time:
   reorder counters, per-access-category TX), scans and who asked for them
   (e.g. locationd), and the "realtime session" state (RT = 0x0: not active;
   scans check AWDL realtime / AirPlay / Sidecar before running).
+- Stutter with pacing on, VRR off (2026-10-27, Thunderbolt, 1080p60 window):
+  ~0.75 dropped frames/s, max ~40 ms. GM_DEBUG_FRAMES showed macOS's
+  cut-off at a submit lead of ~1.7 ms (frames submitted later are not shown
+  a refresh late but replaced by the next: a repeated frame), while the
+  lock held the median lead ~0.6 ms above it; the submit time's own spread
+  is p99 +0.9, p99.9 +1.2 ms (gamescope's present phase 0.58, encode 0.40,
+  decode 0.36, network 0.24 at p99). The old lock took the cut-off from the
+  sweep's lowest median display stage, but at that step half the frames
+  were dropped and dropped frames give no display stage: ~1.5 ms too
+  optimistic. Learning it from the drops' leads and holding the tail:
+  p50 24.5, p99 ~25, max 25.5 ms, ~0.05 drops/s (+1 ms p50 for ~15x fewer
+  stutters). Steering on frames shown a refresh late as if they were
+  misses ran away (the window server had gone one frame deeper; every lead
+  was fine): those now drain instead. The drops left are decodes whose GPU
+  time jumps from 1.3 to 3–4 ms every 5.00 s, in step with CrossOver's
+  Steam "Menu Helper" (its 5 s activity makes the window server redraw);
+  not the stats overlay (same with it hidden).
 - Anything in the window that changes (views over the Metal layer) costs
   the direct flip for that frame; screenshots do too.
 - zsh does not split `$var` into words: test loops that passed several

@@ -79,7 +79,7 @@ unsafe extern "C" {
     fn gm_run(config: *const GmConfig, cb: *const GmCallbacks) -> c_int;
     fn gm_now_ns() -> u64;
     fn gm_heartbeat_ns() -> u64;
-    fn gm_stream_start(codec: c_int, width: c_int, height: c_int, refresh: c_int, kbps: c_int);
+    fn gm_stream_start(codec: c_int, width: c_int, height: c_int, refresh: c_int, kbps: c_int, packet: c_int);
     fn gm_stream_configure(width: c_int, height: c_int, refresh: c_int);
     fn gm_stream_stop();
     fn gm_request_keyframe();
@@ -174,9 +174,17 @@ pub fn now_ns() -> u64 {
 pub fn heartbeat_ns() -> u64 {
     unsafe { gm_heartbeat_ns() }
 }
-pub fn stream_start(codec: u8, width: u16, height: u16, refresh_mhz: u32, kbps: u32) {
+/// `packet`: the most PyroWave payload per datagram (0: the default).
+pub fn stream_start(codec: u8, width: u16, height: u16, refresh_mhz: u32, kbps: u32, packet: usize) {
     unsafe {
-        gm_stream_start(codec as c_int, width as c_int, height as c_int, refresh_mhz as c_int, kbps as c_int)
+        gm_stream_start(
+            codec as c_int,
+            width as c_int,
+            height as c_int,
+            refresh_mhz as c_int,
+            kbps as c_int,
+            packet as c_int,
+        )
     }
 }
 pub fn stream_configure(width: u16, height: u16, refresh_mhz: u32) {

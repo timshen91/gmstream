@@ -686,10 +686,10 @@ uint32_t encoder_supported_codecs(struct gm_encoder *enc) {
 }
 
 void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
-		int bitrate_kbps, int refresh_mhz) {
+		int bitrate_kbps, int refresh_mhz, int packet_bytes) {
 	enc->pw_active = codec == GM_CODEC_PYROWAVE && enc->pw != NULL;
 	if (enc->pw_active) {
-		pyrowave_start(enc->pw, bitrate_kbps, refresh_mhz);
+		pyrowave_start(enc->pw, bitrate_kbps, refresh_mhz, packet_bytes);
 		pthread_mutex_lock(&enc->lock);
 		enc->active = false; // the VA-API worker closes its session
 		av_frame_free(&enc->pending.frame);
