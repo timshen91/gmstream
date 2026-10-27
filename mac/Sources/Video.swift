@@ -35,6 +35,13 @@ final class FrameTiming {
     convenience init(frame f: Frame, toLocal: (UInt64) -> UInt64?) {
         self.init(slotNs: f.slotNs, encodedNs: f.encodedNs, received: f.receivedNs, toLocal: toLocal)
     }
+
+    /// Measuring (GM_DEBUG_FRAMES): one line per frame shown ("shown") or
+    /// never shown ("dropped"), every time in this Mac's ns.
+    static let debug = getenv("GM_DEBUG_FRAMES") != nil
+    func log(_ what: String) {
+        FileHandle.standardError.write("frame \(what) \(presentLocal ?? 0) \(encodedLocal ?? 0) \(received) \(decodeStart) \(decoded) \(submitted) \(presented)\n".data(using: .utf8)!)
+    }
 }
 
 /// Splits Annex B into NAL units (without start codes).
@@ -191,7 +198,7 @@ final class MetalRenderer {
     var onPresented: (FrameTiming) -> Void = { _ in }
     var onSkipped: () -> Void = {}
     /// A submitted frame macOS never showed (replaced in its queue).
-    var onDropped: () -> Void = {}
+    var onDropped: (FrameTiming) -> Void = { _ in }
 
     let device: MTLDevice
     let queue: MTLCommandQueue // also used by the PyroWave decoder
@@ -210,6 +217,8 @@ final class MetalRenderer {
     private var last: DecodedImage?
     private var lastDrawn: UInt64 = 0
     private var repaint = false
+    private var skip = false // the next frame is not shown
+    private static var stallAt: UInt64? = getenv("GM_DEBUG_STALL").flatMap { Double(String(cString: $0)) }.map { nowNs() + UInt64($0 * 1e9) }
 
     private static let shader = """
         #include <metal_stdlib>
@@ -299,6 +308,12 @@ final class MetalRenderer {
         thread.start()
     }
 
+    /// Shows one frame fewer: the next one is decoded but not presented, so a
+    /// window server running a refresh behind catches up.
+    func skipOne() {
+        cond.lock(); skip = true; cond.unlock()
+    }
+
     func submit(_ image: DecodedImage, _ timing: FrameTiming) {
         cond.lock()
         if pending != nil { onSkipped() }
@@ -355,6 +370,17 @@ final class MetalRenderer {
                 onSkipped()
                 (image, timing) = newer
             }
+            if let at = Self.stallAt, nowNs() > at {
+                // Measuring (GM_DEBUG_STALL=<s>): one 30 ms hiccup, once.
+                Self.stallAt = nil
+                usleep(30_000)
+            }
+            cond.lock()
+            let skipThis = skip
+            skip = false
+            if skipThis { last = image }
+            cond.unlock()
+            if skipThis { onSkipped(); continue } // the drawable goes back unpresented
             draw(image, timing, drawable)
         }
     }
@@ -429,8 +455,13 @@ final class MetalRenderer {
             return
         }
         drawable.addPresentedHandler { [weak self] d in
-            guard d.presentedTime > 0 else { self?.onDropped(); return } // never shown
+            guard d.presentedTime > 0 else { // never shown
+                if FrameTiming.debug { timing.log("dropped") }
+                self?.onDropped(timing)
+                return
+            }
             timing.presented = UInt64(d.presentedTime * 1e9)
+            if FrameTiming.debug { timing.log("shown") }
             self?.onPresented(timing)
         }
         for (k, v) in drawableKeys { (drawable as AnyObject).setValue(NSNumber(value: v), forKey: k) }

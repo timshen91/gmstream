@@ -13,7 +13,7 @@ struct gm_encoder *encoder_create(int drm_fd, const struct gm_callbacks *cb);
 void encoder_destroy(struct gm_encoder *enc);
 uint32_t encoder_supported_codecs(struct gm_encoder *enc);
 void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
-	int bitrate_kbps, int refresh_mhz);
+	int bitrate_kbps, int refresh_mhz, int packet_bytes);
 void encoder_stop(struct gm_encoder *enc);
 void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps);
 void encoder_set_refresh(struct gm_encoder *enc, int refresh_mhz);
@@ -32,7 +32,8 @@ void encoder_take_stats(struct gm_encoder *enc, unsigned *encoded,
 struct gm_pyrowave;
 struct gm_pyrowave *pyrowave_create(const struct gm_callbacks *cb);
 void pyrowave_destroy(struct gm_pyrowave *pw);
-void pyrowave_start(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz);
+void pyrowave_start(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz,
+	int packet_bytes);
 void pyrowave_stop(struct gm_pyrowave *pw);
 void pyrowave_set_rate(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz);
 // Compositor thread. False if the buffer cannot be encoded (not a dma-buf).

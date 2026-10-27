@@ -67,9 +67,10 @@ uint64_t gm_now_ns(void);
 uint64_t gm_heartbeat_ns(void);
 
 // Streaming. Start resizes the screen to the client's mode and encodes every
-// frame from then on until stop.
+// frame from then on until stop. `packet_bytes`: the most PyroWave payload
+// per datagram (0: the default, which fits a WebTransport datagram).
 void gm_stream_start(enum gm_codec codec, int width, int height,
-	int refresh_mhz, int bitrate_kbps);
+	int refresh_mhz, int bitrate_kbps, int packet_bytes);
 void gm_stream_configure(int width, int height, int refresh_mhz);
 void gm_stream_stop(void);
 // The client's display refresh grid in host CLOCK_MONOTONIC ns: a vblank and

@@ -950,7 +950,7 @@ enum cmd_type {
 struct cmd {
 	enum cmd_type type;
 	union {
-		struct { enum gm_codec codec; int w, h, refresh, kbps; } stream;
+		struct { enum gm_codec codec; int w, h, refresh, kbps, packet; } stream;
 		struct { double x, y; int32_t v120_x, v120_y; } motion;
 		struct { uint32_t code; bool pressed; } key;
 		struct { uint8_t pad; struct gm_gamepad_state state; } pad;
@@ -1006,7 +1006,7 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		server->grid_last_vblank_ns = 0;
 		if (server->encoder != NULL) {
 			encoder_start(server->encoder, c->stream.codec, c->stream.kbps,
-				server->refresh);
+				server->refresh, c->stream.packet);
 		}
 		audio_start(server->audio);
 		server->streaming = true;
@@ -1111,9 +1111,9 @@ void gm_quit(void) {
 }
 
 void gm_stream_start(enum gm_codec codec, int width, int height,
-		int refresh_mhz, int bitrate_kbps) {
+		int refresh_mhz, int bitrate_kbps, int packet_bytes) {
 	push((struct cmd){ .type = CMD_STREAM_START, .stream = { codec, width,
-		height, refresh_mhz, bitrate_kbps } });
+		height, refresh_mhz, bitrate_kbps, packet_bytes } });
 }
 
 void gm_stream_configure(int width, int height, int refresh_mhz) {

@@ -22,8 +22,12 @@ use crate::core;
 use crate::transport::{Conn, RecvStream, SendStream};
 use crate::udp;
 
-// Version 2 added the Hello flags byte; version 1 clients are still served.
-pub const PROTOCOL_VERSION: u16 = 2;
+// Version 2 added the Hello flags byte, version 3 the client's largest
+// datagram; version 1 and 2 clients are still served.
+pub const PROTOCOL_VERSION: u16 = 3;
+
+// A PyroWave datagram's header (send_pyrowave).
+const PYROWAVE_HEADER: usize = 29;
 
 // Hello flags.
 const HELLO_ONE_VIDEO_STREAM: u8 = 1;
@@ -351,7 +355,7 @@ async fn send_pyrowave(conn: &Conn, buf: &[u8]) -> bool {
     let count = packets.len() as u16;
     let mut ds = Vec::with_capacity(packets.len());
     for (i, p) in packets.into_iter().enumerate() {
-        let mut d = Vec::with_capacity(29 + p.len());
+        let mut d = Vec::with_capacity(PYROWAVE_HEADER + p.len());
         d.push(DATAGRAM_PYROWAVE);
         d.extend_from_slice(&head[0..4]); // frame id
         d.extend_from_slice(&(i as u16).to_le_bytes());
@@ -408,6 +412,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     let (width, height, refresh, kbps) = (r.u16()?, r.u16()?, r.u32()?, r.u32()?);
     let (mask, pref) = (r.u8()?, r.u8()?);
     let flags = if version >= 2 { r.u8()? } else { 0 };
+    let client_max_datagram = if version >= 3 { r.u16()? as usize } else { 0 };
     let datagrams = conn.is_udp() || flags & HELLO_VIDEO_DATAGRAMS != 0;
     let one_stream = !datagrams && flags & HELLO_ONE_VIDEO_STREAM != 0;
     if !(1..=PROTOCOL_VERSION).contains(&version) {
@@ -424,6 +429,14 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         bail!("{peer}: no common codec (client {mask:#x}, host {:#x})", core::supported_codecs());
     };
     let kbps = kbps.clamp(1000, 500_000);
+    // Plain UDP: PyroWave packets as large as both ends' links carry (each
+    // datagram has a fixed cost; see core/pyrowave.c). 0: the core's default.
+    let packet = match (conn.is_udp(), udp::route_max_datagram(peer)) {
+        (true, Some(host_max)) if client_max_datagram > 0 && codec == CODEC_PYROWAVE => {
+            client_max_datagram.min(host_max).saturating_sub(PYROWAVE_HEADER)
+        }
+        _ => 0,
+    };
 
     let (vtx, mut vrx) = mpsc::channel::<(u32, Vec<u8>)>(4);
     let (ctx, mut crx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -445,17 +458,19 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     eprintln!(
         "gmstream: client {n} from {peer}: {width}x{height}@{:.3}Hz, codec {codec}, {kbps} kbps{}",
         refresh as f64 / 1000.0,
-        if conn.is_udp() {
-            ", plain UDP"
+        if conn.is_udp() && packet > 0 {
+            format!(", plain UDP, {packet}-byte packets")
+        } else if conn.is_udp() {
+            ", plain UDP".to_string()
         } else if datagrams {
-            ", video datagrams"
+            ", video datagrams".to_string()
         } else if one_stream {
-            ", one video stream"
+            ", one video stream".to_string()
         } else {
-            ""
+            String::new()
         }
     );
-    core::stream_start(codec, width, height, refresh, kbps);
+    core::stream_start(codec, width, height, refresh, kbps, packet);
 
     let writer = tokio::spawn(async move {
         while let Some(m) = crx.recv().await {

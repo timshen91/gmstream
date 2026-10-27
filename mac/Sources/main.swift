@@ -47,6 +47,10 @@ struct Options {
     // A tiny datagram to the host 60 times a second, so this Mac's Wi-Fi
     // doesn't doze while only receiving (Connection.keepAwake).
     var keepWiFiAwake = true
+    // Phase lock (Phase.swift): gamescope produces frames on this display's
+    // refresh grid. Off: an empty grid, so gamescope paces itself and frames
+    // are shown as they arrive (as on a variable-refresh display).
+    var phaseLock = true
     var layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:] // measuring
     var bgra = false // decoder output BGRA instead of NV12 (measuring)
     var probe: Double?
@@ -63,6 +67,7 @@ struct Options {
         immediateFullScreen = d.bool(forKey: "immediateFullScreen")
         vividColors = d.bool(forKey: "vividColors")
         if d.object(forKey: "keepWiFiAwake") != nil { keepWiFiAwake = d.bool(forKey: "keepWiFiAwake") }
+        if d.object(forKey: "phaseLock") != nil { phaseLock = d.bool(forKey: "phaseLock") }
 
         var it = args.makeIterator()
         while let a = it.next() {
@@ -83,6 +88,7 @@ struct Options {
             case "--no-vsync": immediateFullScreen = true
             case "--vivid": vividColors = true
             case "--no-keep-awake": keepWiFiAwake = false
+            case "--no-phase": phaseLock = false
             case "--layer": layerKeys = Options.parseKeys(it.next() ?? "")
             case "--drawable": drawableKeys = Options.parseKeys(it.next() ?? "")
             case let s where s.hasPrefix("-"): _ = it.next() // e.g. -NSDocumentRevisionsDebugMode YES
@@ -120,6 +126,7 @@ struct Options {
         d.set(immediateFullScreen, forKey: "immediateFullScreen")
         d.set(vividColors, forKey: "vividColors")
         d.set(keepWiFiAwake, forKey: "keepWiFiAwake")
+        d.set(phaseLock, forKey: "phaseLock")
     }
 }
 
@@ -379,7 +386,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         }
         _ = Trace.shared // its flush timer on the main run loop
         renderer.onSkipped = { [stages] in stages.skip() }
-        renderer.onDropped = { [stages, phase] in stages.drop(); phase.dropped() }
+        renderer.onDropped = { [stages, phase] t in stages.drop(); phase.dropped(t) }
         pads.send = { [weak self] type, data in self?.conn?.send(type, data) }
         do { player = try AudioPlayer() } catch { NSLog("gmstream: audio output: \(error)") }
         NSApp.activate(ignoringOtherApps: true)
@@ -401,17 +408,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     /// itself and each frame is shown as it arrives.
     func sendGrid() {
         if let mock {
-            let g = vrr ? nil : phase.step()
+            let g = vrr || !options.phaseLock ? nil : phase.step()
             mock.setGrid(anchor: g?.anchor ?? 0, interval: g?.interval ?? 0)
             return
         }
         guard let conn else { return }
         var m = Writer()
-        if vrr || getenv("GM_NO_PHASE") != nil { // measuring: the host's own pacing
+        if vrr || !options.phaseLock || getenv("GM_NO_PHASE") != nil { // gamescope paces itself
             m.u64(0)
             m.u32(0)
         } else {
             guard let g = phase.step(), let anchor = conn.toHost(localNs: g.anchor) else { return }
+            if phase.takeDrain() { renderer.skipOne() }
             m.u64(anchor)
             m.u32(UInt32(g.interval))
         }
@@ -448,19 +456,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
             DispatchQueue.main.async { self.view.streamSize = CGSize(width: w, height: h) }
             return
         }
-        do {
-            let c = try Connection(host: options.host, port: options.port)
-            c.delegate = self
-            conn = c
-            let (w, h) = wantedSize()
-            // Until the first frame says otherwise (the cursor's scale needs it).
-            view.streamSize = CGSize(width: w, height: h)
-            c.start(width: w, height: h, refreshMhz: refreshMhz(), kbps: options.mbps * 1000,
-                    codecMask: clientCodecs, preferred: options.codec)
-            c.keepAwake(options.keepWiFiAwake)
-        } catch {
-            closed(reason: error.localizedDescription)
+        // Resolving the host can take seconds: not on the main thread. A
+        // newer attempt (Reconnect, a settings change) supersedes this one.
+        connectAttempt += 1
+        let attempt = connectAttempt, host = options.host, port = options.port
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try Connection(host: host, port: port) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, attempt == self.connectAttempt else { return }
+                switch result {
+                case .success(let c): self.start(c)
+                case .failure(let e): self.closed(reason: e.localizedDescription)
+                }
+            }
         }
+    }
+
+    var connectAttempt = 0
+
+    func start(_ c: Connection) {
+        c.delegate = self
+        conn = c
+        let (w, h) = wantedSize()
+        // Until the first frame says otherwise (the cursor's scale needs it).
+        view.streamSize = CGSize(width: w, height: h)
+        c.start(width: w, height: h, refreshMhz: refreshMhz(), kbps: options.mbps * 1000,
+                codecMask: clientCodecs, preferred: options.codec)
+        c.keepAwake(options.keepWiFiAwake)
     }
 
     @objc func reconnect() {
@@ -541,6 +563,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     func closed(reason: String) {
         guard closedReason == nil else { return }
         closedReason = reason
+        NSLog("gmstream: closed: %@", reason)
         releaseAll()
         setLock(false)
         conn?.stop()
@@ -577,7 +600,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
             if row.name == "pacing" { lines.append(String(repeating: "─", count: 27)) }
             lines.append("\(pad(row.name, 9))\(num(row.p50)) \(num(row.p90)) \(fmt(row.max))")
         }
-        lines.append((vrr ? "phase: off (variable refresh)" : phase.summary()) + "  compositing \(renderer.compositingStatus)")
+        let phaseText = vrr ? "phase: off (variable refresh)" : !options.phaseLock ? "phase: off (setting)" : phase.summary()
+        lines.append(phaseText + "  compositing \(renderer.compositingStatus)")
         lines += [
             "rtt \(fmt(conn.map { Double($0.rttNs) / 1e6 })) ms  skipped \(st.skipped)  dropped \(st.dropped)  gaps \(s.gaps)",
             "audio \(player.map { String(format: "%.0f ms buffered", $0.bufferedMs) } ?? (opus == nil ? "no Opus decoder" : "no output"))" +
@@ -628,6 +652,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         case .stats: updateOverlay()
         case .present: applyPresentMode()
         case .keepAwake: conn?.keepAwake(options.keepWiFiAwake)
+        case .phaseLock: if options.phaseLock { phase.restart() } // sweeps for the current phase
         }
     }
 

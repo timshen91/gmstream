@@ -14,7 +14,7 @@ enum Msg {
         rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86
 }
 
-let protocolVersion: UInt16 = 2
+let protocolVersion: UInt16 = 3
 let datagramAudio: UInt8 = 1, datagramVideo: UInt8 = 2, datagramControl: UInt8 = 3, datagramPyroWave: UInt8 = 4,
     datagramAwake: UInt8 = 5
 let maxDatagram = 1400
@@ -72,6 +72,7 @@ final class Connection {
     private let sendLock = NSLock()
     private var sendSeq: UInt32 = 0
     private var running = true
+    private var started = false
     private var awakeTimer: DispatchSourceTimer? // under sendLock
 
     // Host → client control stream reassembly (network thread only).
@@ -89,17 +90,16 @@ final class Connection {
     private(set) var rttNs: UInt64 = 0
     private var lastHeard = nowNs()
 
+    /// Blocks while the name resolves (see resolve), so not on the main thread.
     init(host: String, port: UInt16) throws {
-        var hints = addrinfo(ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_DGRAM, ai_protocol: IPPROTO_UDP,
-                             ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
-        var res: UnsafeMutablePointer<addrinfo>?
-        let rc = getaddrinfo(host, String(port), &hints, &res)
-        guard rc == 0, let ai = res else {
-            throw NSError(domain: "gmstream", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "cannot resolve \(host): \(String(cString: gai_strerror(rc)))"])
-        }
-        defer { freeaddrinfo(res) }
-        fd = socket(ai.pointee.ai_family, SOCK_DGRAM, IPPROTO_UDP)
+        var addr = try Self.resolve(host: host, port: port)
+        let family = addr.withUnsafeBytes { Int32($0.load(as: sockaddr.self).sa_family) }
+        fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw NSError(domain: "gmstream", code: Int(errno)) }
+        // A refused send (e.g. EPIPE when macOS denies local network access)
+        // is an error to report, not a signal that kills the app.
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         // A keyframe arrives as a burst of hundreds of datagrams.
         var size: Int32 = 8 << 20
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
@@ -113,11 +113,117 @@ final class Connection {
         // network did, apart from when this app got to read it.
         var on: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &on, socklen_t(MemoryLayout<Int32>.size))
-        guard connect(fd, ai.pointee.ai_addr, ai.pointee.ai_addrlen) == 0 else {
+        let rc = addr.withUnsafeMutableBytes { connect(fd, $0.baseAddress!.assumingMemoryBound(to: sockaddr.self), socklen_t($0.count)) }
+        guard rc == 0 else {
             let e = errno
             close(fd)
             throw NSError(domain: "gmstream", code: Int(e), userInfo: [NSLocalizedDescriptionKey: "connect: \(String(cString: strerror(e)))"])
         }
+        lastHeard = nowNs() // the host's silence counts from here, not from before resolving
+        linkMaxDatagram = Self.linkMaxDatagram(fd: fd)
+    }
+
+    /// The largest datagram the link to the host carries unfragmented: the
+    /// outgoing interface's MTU minus the IP and UDP headers (~64 KB over a
+    /// Thunderbolt bridge set to MTU 65518, 1472 on Wi-Fi). The host sends
+    /// PyroWave packets up to this size.
+    private var linkMaxDatagram = maxDatagram
+
+    private static func linkMaxDatagram(fd: Int32) -> Int {
+        var local = sockaddr_storage()
+        var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let fallback = maxDatagram
+        guard withUnsafeMutablePointer(to: &local, {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }) == 0 else { return fallback }
+        let family = Int32(local.ss_family)
+        var ifs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifs) == 0 else { return fallback }
+        defer { freeifaddrs(ifs) }
+        // The interface holding our local address, then its link entry's MTU.
+        var name: String?
+        var mtus: [String: Int] = [:]
+        for p in sequence(first: ifs, next: { $0?.pointee.ifa_next }) {
+            guard let a = p?.pointee, let sa = a.ifa_addr else { continue }
+            let ifname = String(cString: a.ifa_name)
+            if Int32(sa.pointee.sa_family) == AF_LINK, let data = a.ifa_data {
+                mtus[ifname] = Int(data.assumingMemoryBound(to: if_data.self).pointee.ifi_mtu)
+            } else if Int32(sa.pointee.sa_family) == family, sameAddress(sa, &local) {
+                name = ifname
+            }
+        }
+        guard let name, let mtu = mtus[name] else { return fallback }
+        let headers = family == AF_INET6 ? 48 : 28
+        return max(fallback, min(mtu - headers, 65507))
+    }
+
+    private static func sameAddress(_ a: UnsafePointer<sockaddr>, _ b: inout sockaddr_storage) -> Bool {
+        withUnsafePointer(to: &b) { bp in
+            bp.withMemoryRebound(to: sockaddr.self, capacity: 1) { b in
+                switch Int32(a.pointee.sa_family) {
+                case AF_INET:
+                    return a.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { x in
+                        b.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { y in
+                            x.pointee.sin_addr.s_addr == y.pointee.sin_addr.s_addr
+                        }
+                    }
+                case AF_INET6:
+                    return a.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { x in
+                        b.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { y in
+                            withUnsafeBytes(of: x.pointee.sin6_addr) { xa in
+                                withUnsafeBytes(of: y.pointee.sin6_addr) { ya in xa.elementsEqual(ya) }
+                            }
+                        }
+                    }
+                default:
+                    return false
+                }
+            }
+        }
+    }
+
+    /// Never started (a newer connection attempt won): the receive loop that
+    /// would close the socket never ran.
+    deinit {
+        if !started { close(fd) }
+    }
+
+    /// The host's address: IPv6 and IPv4 asked for at once, the first answer
+    /// wins. getaddrinfo with AF_UNSPEC waits for both, and for a .local name
+    /// whose host has no IPv6 on that link (steamtab over a Thunderbolt
+    /// bridge) macOS gives up on the AAAA query only after 5 s.
+    static func resolve(host: String, port: UInt16) throws -> Data {
+        final class Race {
+            let lock = NSLock(), done = DispatchSemaphore(value: 0)
+            var found: Data?, failed = 0, error: Int32 = 0
+        }
+        let race = Race()
+        for family in [AF_INET6, AF_INET] {
+            DispatchQueue.global(qos: .userInitiated).async {
+                var hints = addrinfo(ai_flags: 0, ai_family: family, ai_socktype: SOCK_DGRAM, ai_protocol: IPPROTO_UDP,
+                                     ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+                var res: UnsafeMutablePointer<addrinfo>?
+                let rc = getaddrinfo(host, String(port), &hints, &res)
+                let addr = rc == 0 ? res.map { Data(bytes: $0.pointee.ai_addr, count: Int($0.pointee.ai_addrlen)) } : nil
+                if res != nil { freeaddrinfo(res) }
+                race.lock.lock()
+                defer { race.lock.unlock() }
+                if let addr {
+                    if race.found == nil { race.found = addr; race.done.signal() }
+                } else {
+                    race.failed += 1
+                    race.error = rc
+                    if race.failed == 2 { race.done.signal() }
+                }
+            }
+        }
+        race.done.wait()
+        race.lock.lock()
+        defer { race.lock.unlock() }
+        guard let found = race.found else {
+            throw NSError(domain: "gmstream", code: Int(race.error), userInfo: [NSLocalizedDescriptionKey: "cannot resolve \(host): \(String(cString: gai_strerror(race.error)))"])
+        }
+        return found
     }
 
     func start(width: Int, height: Int, refreshMhz: UInt32, kbps: UInt32, codecMask: UInt8, preferred: UInt8) {
@@ -127,6 +233,8 @@ final class Connection {
         w.u32(refreshMhz); w.u32(kbps)
         w.u8(codecMask); w.u8(preferred)
         w.u8(0) // flags: plain UDP always sends video as datagrams
+        w.u16(UInt16(linkMaxDatagram))
+        started = true
         send(Msg.hello, w.data)
         let thread = Thread { [weak self] in self?.receiveLoop() }
         thread.qualityOfService = .userInteractive

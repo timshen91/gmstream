@@ -215,6 +215,28 @@ where
     }
 }
 
+/// The largest UDP payload the route to `addr` carries without IP
+/// fragmentation: the outgoing interface's MTU (as the kernel's route has it)
+/// minus the IP and UDP headers. ~64 KB over a Thunderbolt link.
+pub fn route_max_datagram(addr: SocketAddr) -> Option<usize> {
+    let (ip, v6) = match addr {
+        SocketAddr::V4(a) => (SocketAddr::V4(a), false),
+        SocketAddr::V6(a) => match a.ip().to_ipv4_mapped() {
+            Some(v4) => (SocketAddr::new(v4.into(), a.port()), false),
+            None => (SocketAddr::V6(a), true),
+        },
+    };
+    let bind: SocketAddr = if v6 { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(ip).ok()?; // no packet: only picks the route
+    let (level, name) = if v6 { (libc::IPPROTO_IPV6, libc::IPV6_MTU) } else { (libc::IPPROTO_IP, libc::IP_MTU) };
+    let mut mtu: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let r = unsafe { libc::getsockopt(socket.as_raw_fd(), level, name, &mut mtu as *mut _ as *mut libc::c_void, &mut len) };
+    let headers = if v6 { 48 } else { 28 };
+    (r == 0 && mtu as usize > headers).then(|| (mtu as usize - headers).min(65507))
+}
+
 /// A socket address in the form sendmmsg takes (the socket is IPv6, so IPv4
 /// peers are IPv4-mapped).
 fn sockaddr(addr: SocketAddr) -> (libc::sockaddr_in6, libc::socklen_t) {
