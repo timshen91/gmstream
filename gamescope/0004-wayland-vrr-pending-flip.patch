@@ -1,0 +1,38 @@
+Wayland backend, VRR: count a committed flip as pending until the host answers
+it, as a pending flip does on DRM, so a FIFO client's queued frame is not sent
+right behind it.
+
+diff -ru a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
+--- a/src/Backends/WaylandBackend.cpp	2026-10-28 11:01:37
++++ b/src/Backends/WaylandBackend.cpp	2026-10-28 11:01:46
+@@ -1167,6 +1167,19 @@
+ 
+         wl_display_flush( m_pBackend->GetDisplay() );
+ 
++        // Under VRR the flip just committed is pending until the host answers
++        // its presentation feedback (~0.4 ms on gmstream). On DRM a pending
++        // flip holds back the next one; here nothing did, and the next paint
++        // was judged from the previous vblank: a FIFO client whose next frame
++        // was already queued got it sent right behind this one (frames in
++        // pairs, 0.04 / 17 ms apart). Count this flip now, at the earliest the
++        // host can show it; its feedback reports the same time.
++        if ( m_bVisible && IsVRRActive() )
++        {
++            const uint64_t ulInterval = gamescope::mHzToRefreshCycle( GetVBlankTimer().GetRefresh() );
++            GetVBlankTimer().MarkVBlank( std::max( get_time_in_nanos(), GetVBlankTimer().GetLastVBlank() + ulInterval ), true );
++        }
++
+         GetVBlankTimer().UpdateWasCompositing( bNeedsFullComposite );
+         GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
+ 
+@@ -1820,6 +1833,10 @@
+             UpdateVRRRefreshRate();
+         }
+ 
++        // A feedback answered late must not move the vblank back before the
++        // flip Present() already counted (see there).
++        if ( m_pConnector->IsVRRActive() )
++            ulTime = std::max( ulTime, GetVBlankTimer().GetLastVBlank() );
+         GetVBlankTimer().MarkVBlank( ulTime, true );
+         wp_presentation_feedback_destroy( pFeedback );
+ 

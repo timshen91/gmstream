@@ -379,12 +379,25 @@ struct gm_pyrowave *pyrowave_create(const struct gm_callbacks *cb) {
 	struct gm_pyrowave *pw = calloc(1, sizeof(*pw));
 	pw->cb = cb;
 	pw->pending.sync_fd = -1;
-	pyrowave_result r = pyrowave_create_default_device(&pw->device);
+	// A high-priority async compute queue: at normal priority the encode
+	// waited behind everything else on the GPU (with Steam's overlay up over
+	// a 117 fps game, 14–15 ms per frame instead of ~2, so only ~60 frames a
+	// second got encoded). Above MEDIUM needs CAP_SYS_NICE (setcap on the
+	// binary, as SteamOS does for gamescope); without it the driver gives
+	// MEDIUM.
+	pyrowave_result r = pyrowave_create_device_by_compat(0, 0, NULL, NULL, NULL,
+		VK_QUEUE_GLOBAL_PRIORITY_REALTIME, &pw->device);
+	if (r != PYROWAVE_SUCCESS) {
+		r = pyrowave_create_default_device(&pw->device);
+	}
 	if (r != PYROWAVE_SUCCESS) {
 		wlr_log(WLR_INFO, "PyroWave unavailable (Vulkan device: %d)", r);
 		free(pw);
 		return NULL;
 	}
+	wlr_log(WLR_INFO, "PyroWave compute queue priority: %d (MEDIUM %d, HIGH %d, REALTIME %d)",
+		pyrowave_device_get_global_priority(pw->device), VK_QUEUE_GLOBAL_PRIORITY_MEDIUM,
+		VK_QUEUE_GLOBAL_PRIORITY_HIGH, VK_QUEUE_GLOBAL_PRIORITY_REALTIME);
 	pthread_mutex_init(&pw->lock, NULL);
 	pthread_cond_init(&pw->cond, NULL);
 	pthread_create(&pw->thread, NULL, worker, pw);

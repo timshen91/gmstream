@@ -8,9 +8,11 @@ import AppKit
 /// one second is too few frames for a stable p90). The target to optimize
 /// is the total's p90.
 final class StageStats {
-    // "pacing": per frame, |interval between presentations − interval between
-    // gamescope presents|; 0 is perfect pacing.
-    static let stages = ["encode", "network", "queue", "decode", "hold", "render", "display", "total", "pacing"]
+    // "to macOS": gamescope present → handed to macOS (total − display).
+    // "spacing": per frame, |interval between presentations − interval
+    // between gamescope presents|; 0 keeps the host's frame spacing exactly.
+    // It measures the result whatever the pacing mode, phase lock or not.
+    static let stages = ["encode", "network", "decode", "hold", "render", "to macOS", "display", "total", "spacing"]
     static let window: UInt64 = 5_000_000_000
 
     struct Row {
@@ -30,17 +32,17 @@ final class StageStats {
         var values: [Double?] = [
             Double(t.encodeNs) / 1e6,
             ms(t.encodedLocal, t.received),
-            ms(t.received, t.decodeStart),
-            ms(t.decodeStart, t.decoded),
+            ms(t.received, t.decoded),
             ms(t.decoded, t.released),
             ms(t.released, t.submitted),
+            ms(t.presentLocal, t.submitted),
             ms(t.submitted, t.presented),
             ms(t.presentLocal, t.presented),
             nil,
         ]
         lock.lock(); defer { lock.unlock() }
         if let lp = lastPresented, let lc = lastPresent, let c = t.presentLocal, c > lc, c - lc < 100_000_000 {
-            values[8] = abs(Double(Int64(t.presented) - Int64(lp)) - Double(c - lc)) / 1e6
+            values[Self.stages.count - 1] = abs(Double(Int64(t.presented) - Int64(lp)) - Double(c - lc)) / 1e6
         }
         lastPresented = t.presented
         lastPresent = t.presentLocal
@@ -68,18 +70,20 @@ final class StageStats {
     }
 }
 
-/// Total latency (gamescope present → on screen) per frame, last 10 s. The
+/// Latency per frame, last 10 s: gamescope present → handed to macOS as a
+/// line, with macOS's display stage stacked above it up to the total. The
 /// scale grows in steps to fit spikes (never below 20 ms); pauses in the
 /// stream (a static screen sends nothing) break the line.
 final class LatencyChart {
     private let window_: Double = 10, gap: Double = 0.25
     private let lock = NSLock()
-    private var points: [(t: Double, ms: Double)] = []
+    private var points: [(t: Double, base: Double, ms: Double)] = []
 
-    func push(ms: Double) {
+    /// `base`: to macOS; `ms`: total (base + display).
+    func push(base: Double, ms: Double) {
         let t = CACurrentMediaTime()
         lock.lock()
-        points.append((t, ms))
+        points.append((t, base, ms))
         while let first = points.first, first.t < t - window_ { points.removeFirst() }
         lock.unlock()
     }
@@ -114,14 +118,29 @@ final class LatencyChart {
             label.draw(at: CGPoint(x: W - label.size(withAttributes: attrs).width - 2, y: -1), withAttributes: attrs)
         }
 
+        // Unbroken runs of points; each is drawn as the display band (base to
+        // total, filled) under the to-macOS line.
+        var runs: [[(t: Double, base: Double, ms: Double)]] = []
+        var last = -Double.infinity
+        for p in pts {
+            if p.t - last > gap { runs.append([]) }
+            runs[runs.count - 1].append(p)
+            last = p.t
+        }
+        g.setFillColor(NSColor(red: 0xe8 / 255.0, green: 0xa3 / 255.0, blue: 0x3d / 255.0, alpha: 0.55).cgColor)
+        for run in runs where run.count > 1 {
+            g.move(to: CGPoint(x: x(run[0].t), y: y(run[0].base)))
+            for p in run.dropFirst() { g.addLine(to: CGPoint(x: x(p.t), y: y(p.base))) }
+            for p in run.reversed() { g.addLine(to: CGPoint(x: x(p.t), y: y(p.ms))) }
+            g.closePath()
+        }
+        g.fillPath()
         g.setStrokeColor(NSColor(red: 0x39 / 255.0, green: 0x87 / 255.0, blue: 0xe5 / 255.0, alpha: 1).cgColor)
         g.setLineWidth(1.5)
         g.setLineJoin(.round)
-        var last = -Double.infinity
-        for p in pts {
-            let pt = CGPoint(x: x(p.t), y: y(p.ms))
-            if p.t - last > gap { g.move(to: pt) } else { g.addLine(to: pt) }
-            last = p.t
+        for run in runs {
+            g.move(to: CGPoint(x: x(run[0].t), y: y(run[0].base)))
+            for p in run.dropFirst() { g.addLine(to: CGPoint(x: x(p.t), y: y(p.base))) }
         }
         g.strokePath()
     }

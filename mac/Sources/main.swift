@@ -429,7 +429,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
                 FileHandle.standardError.write(String(format: "flip %.3f %.3f\n", (ph < 0 ? ph + g.interval : ph) / 1e6,
                     Double(Int64(t.presented) - Int64(t.submitted)) / 1e6).data(using: .utf8)!)
             }
-            if let p = t.presentLocal { chart.push(ms: Double(Int64(t.presented) - Int64(p)) / 1e6) }
+            if let p = t.presentLocal {
+                chart.push(base: Double(Int64(t.submitted) - Int64(p)) / 1e6, ms: Double(Int64(t.presented) - Int64(p)) / 1e6)
+            }
         }
         _ = Trace.shared // its flush timer on the main run loop
         renderer.onSkipped = { [stages] in stages.skip() }
@@ -654,15 +656,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         let st = stages.take()
         let pad = { (s: String, n: Int) in s.padding(toLength: n, withPad: " ", startingAt: 0) }
         let num = { (v: Double?) in pad(fmt(v), 6) }
-        let total = st.rows.last!
+        let total = st.rows.first { $0.name == "total" }!
         var lines = [
             "\(Int(view.streamSize.width))x\(Int(view.streamSize.height)) \(codecName) \(st.shown) fps shown " +
                 "\(String(format: "%.0f", s.mbps)) Mbps",
             "\(pad("ms, 5 s", 9))\(pad("p50", 7))\(pad("p90", 7))max",
         ]
         for row in st.rows {
-            if row.name == "total" { lines.append(String(repeating: "─", count: 27)) }
-            if row.name == "pacing" { lines.append(String(repeating: "─", count: 27)) }
+            if ["to macOS", "total", "spacing"].contains(row.name) { lines.append(String(repeating: "─", count: 27)) }
             lines.append("\(pad(row.name, 9))\(num(row.p50)) \(num(row.p90)) \(fmt(row.max))")
         }
         let phaseText = (options.pacingAuto ? "pacing auto (\(pacing.vrr ? "VRR: hold" : "fixed refresh: phase lock")), " : "") +
