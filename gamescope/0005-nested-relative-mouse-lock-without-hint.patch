@@ -1,0 +1,29 @@
+Nested relative mouse: count a pointer lock without a cursor position hint
+as a constraint, so a game that locks the pointer without warping it
+(Witcher 3 under Proton) gets relative mouse input.
+
+--- a/src/steamcompmgr.cpp	2026-10-28 15:09:37
++++ b/src/steamcompmgr.cpp	2026-10-28 15:09:38
+@@ -2023,17 +2023,18 @@
+ {
+ 	wlserver_lock();
+ 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
++	// A lock without a position hint is still a lock: in Witcher 3 (Proton)
++	// Xwayland locks the pointer for mouse look and sets no hint, and the
++	// nested backend then never asked its host for relative input.
++	m_bConstrained = pConstraint && ( pConstraint->current.cursor_hint.enabled ||
++		pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED );
+ 	if ( pConstraint && pConstraint->current.cursor_hint.enabled )
+ 	{
+-		m_bConstrained = true;
+-
+ 		m_x = pConstraint->current.cursor_hint.x;
+ 		m_y = pConstraint->current.cursor_hint.y;
+ 	}
+ 	else
+ 	{
+-		m_bConstrained = false;
+-
+ 		m_x = wlserver.mouse_surface_cursorx;
+ 		m_y = wlserver.mouse_surface_cursory;
+ 	}

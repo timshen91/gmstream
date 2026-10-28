@@ -572,6 +572,15 @@ exists):
    (passthrough), so mouse motion became touchscreen motion and the cursor
    never moved (clicks landed at its old spot). Host pointer motion now always
    moves the cursor.
+3. **`0004-wayland-vrr-pending-flip`.** Under VRR a committed flip counts as
+   pending until the host answers it, as a pending flip does on DRM, so a
+   FIFO client's queued frame is not sent right behind it.
+4. **`0005-nested-relative-mouse-lock-without-hint`.** Nested relative mouse
+   mode needs an empty cursor and a pointer constraint, and gamescope counted
+   a constraint only when it carried a cursor position hint. Witcher 3
+   (Proton) has Xwayland lock the pointer with no hint, so gamescope never
+   locked the host pointer: the game got absolute positions (wild camera
+   turns, no menu cursor). A lock now counts without a hint.
 
 Not a patch: Steam writes the root property `GAMESCOPE_COMPOSITE_FORCE` from
 its Settings → Developer → **Force Composite** toggle at startup, and the
@@ -921,8 +930,9 @@ per-stage p50/p90 over 30–60 s; lessons that cost time:
   request): anyone who can reach port 8443 can watch the stream and send
   input. LAN only; add access control before exposing it further.
 - **Steam Deck-style pointer lock** in games that hide the cursor (gamescope
-  relative mode → client Pointer Lock) is implemented but not yet exercised
-  with a real game.
+  relative mode → client Pointer Lock) works in Witcher 3 with patch 0005
+  (camera and menu cursor); mouse sensitivity is not tuned (deltas are
+  macOS-accelerated motion in stream pixels).
 
 ## 10. Current state of things on disk
 
