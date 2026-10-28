@@ -234,6 +234,16 @@ final class MetalRenderer {
     private var lastDrawn: UInt64 = 0
     private var repaint = false
     private var skip = false // the next frame is not shown
+    // The cursor drawn into each frame at the mouse's position as the frame is
+    // drawn (Controller.updateCursor): its hot spot in drawable pixels, and
+    // the drawable's top left in global display coordinates (points) with its
+    // pixels per point.
+    private var cursor: (texture: MTLTexture, hotSpot: CGPoint, origin: CGPoint, scale: Double)?
+    private var refreshNs: UInt64 = 8_333_333 // the panel's shortest refresh
+    private var cursorMovedAt: UInt64 = 0
+    private var cursorDue: UInt64?            // when to check whether to draw the last frame again
+    private var lastVideo: UInt64 = 0         // last frame from the host drawn
+    private var videoInterval: UInt64 = 0     // between them, averaged (0: not coming steadily)
     private static var stallAt: UInt64? = getenv("GM_DEBUG_STALL").flatMap { Double(String(cString: $0)) }.map { nowNs() + UInt64($0 * 1e9) }
 
     private static let shader = """
@@ -383,6 +393,47 @@ final class MetalRenderer {
         cond.unlock()
     }
 
+    /// Draws `texture` (nil: no cursor) into each frame; see `cursor`.
+    func setCursor(_ texture: MTLTexture?, hotSpot: CGPoint = .zero, origin: CGPoint = .zero, scale: Double = 1,
+                   refresh: Double = 1.0 / 120) {
+        cond.lock()
+        let had = cursor != nil
+        cursor = texture.map { ($0, hotSpot, origin, scale) }
+        refreshNs = UInt64(refresh * 1e9)
+        if had || cursor != nil { cursorMovedAt = nowNs(); scheduleCursor() } // show it, or take it off
+        cond.unlock()
+    }
+
+    /// The mouse moved: the cursor needs drawing where it is now.
+    func cursorMoved() {
+        cond.lock()
+        if cursor != nil { cursorMovedAt = nowNs(); scheduleCursor() }
+        cond.unlock()
+    }
+
+    /// With `cond` held. Never closer to the last present than the panel's
+    /// shortest refresh, or macOS shows it a refresh later.
+    private func scheduleCursor() {
+        guard cursorDue == nil else { return }
+        cursorDue = max(nowNs(), lastDrawn + max(hold.minSpacing, refreshNs + 100_000))
+        cond.signal()
+    }
+
+    /// With `cond` held, at `cursorDue`: whether to draw the last frame again
+    /// for the cursor. Not if a frame was drawn since the mouse moved, nor if
+    /// one is expected sooner than the panel's shortest refresh: it carries
+    /// the cursor, and a redraw just before would hold it back a refresh
+    /// (checked again 2 ms after it was expected, in case it does not come).
+    private func cursorRepaint(_ now: UInt64) -> Bool {
+        guard lastDrawn < cursorMovedAt else { return false }
+        let next = lastVideo + videoInterval
+        if videoInterval > 0, next + 2_000_000 > now, next < now + max(hold.minSpacing, refreshNs + 100_000) {
+            cursorDue = next + 2_000_000
+            return false
+        }
+        return true
+    }
+
     /// The frame to draw now: without a hold the one waiting; with one, the
     /// latest that is due (earlier due ones are skipped).
     private func take() -> (DecodedImage, FrameTiming)? {
@@ -402,7 +453,13 @@ final class MetalRenderer {
     private func renderLoop() {
         while true {
             cond.lock()
-            while pending.isEmpty && !repaint { cond.wait() }
+            while pending.isEmpty && !repaint {
+                guard let due = cursorDue else { cond.wait(); continue }
+                let now = nowNs()
+                if now < due { _ = cond.wait(until: Date(timeIntervalSinceNow: Double(due - now) / 1e9)); continue }
+                cursorDue = nil
+                repaint = cursorRepaint(now)
+            }
             // The counterweight: the oldest frame waits until its due time.
             let due = pending.first?.timing.due
             cond.unlock()
@@ -504,10 +561,29 @@ final class MetalRenderer {
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         }
         cond.lock()
-        let (overlay, inset) = (self.overlay, overlayInset)
+        let (overlay, inset, cursor) = (self.overlay, overlayInset, self.cursor)
         if image != nil { last = image }
-        lastDrawn = nowNs()
+        let now = nowNs()
+        if timing != nil {
+            let gap = now - lastVideo
+            videoInterval = gap > 50_000_000 ? 0 : videoInterval == 0 ? gap : (videoInterval * 7 + gap) / 8
+            lastVideo = now
+        }
+        lastDrawn = now
         cond.unlock()
+        if let cursor, let p = CGEvent(source: nil)?.location {
+            let x = ((p.x - cursor.origin.x) * cursor.scale - cursor.hotSpot.x).rounded()
+            let y = ((p.y - cursor.origin.y) * cursor.scale - cursor.hotSpot.y).rounded()
+            let cw = Double(cursor.texture.width), ch = Double(cursor.texture.height)
+            let x0 = max(0, x), y0 = max(0, y), x1 = min(dw, x + cw), y1 = min(dh, y + ch)
+            if x1 > x0 && y1 > y0 {
+                enc.setViewport(MTLViewport(originX: x, originY: y, width: cw, height: ch, znear: 0, zfar: 1))
+                enc.setScissorRect(MTLScissorRect(x: Int(x0), y: Int(y0), width: Int(x1 - x0), height: Int(y1 - y0)))
+                enc.setRenderPipelineState(overlayPipeline)
+                enc.setFragmentTexture(cursor.texture, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            }
+        }
         if let overlay {
             let ow = min(Double(overlay.width), dw - inset), oh = min(Double(overlay.height), dh - inset)
             if ow > 0 && oh > 0 {

@@ -301,9 +301,12 @@ final class StreamView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect, .cursorUpdate],
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow,
+                                                              .inVisibleRect, .cursorUpdate],
                                        owner: self, userInfo: nil))
     }
+    override func mouseEntered(with e: NSEvent) { controller?.pointerInView = true; controller?.updateCursor() }
+    override func mouseExited(with e: NSEvent) { controller?.pointerInView = false; controller?.updateCursor() }
     override func resetCursorRects() { addCursorRect(bounds, cursor: cursor) }
     override func cursorUpdate(with event: NSEvent) { cursor.set() }
 
@@ -375,6 +378,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     let opus = OpusDecoder()
     var player: AudioPlayer?
     var locked = false, lockActive = false
+    var pointerInView = false, cursorHidden = false
     var keyMonitor: Any?
     var fullScreen = false // as the present mode was last applied
     var pacing = Pacing(options: options, fullScreen: false, screen: nil)
@@ -519,7 +523,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
             let m = MockSource(device: renderer.device, width: w, height: h, refreshHz: options.refresh ?? 60)
             m.start { [renderer] image, timing in renderer.submit(image, timing) }
             mock = m
-            DispatchQueue.main.async { self.view.streamSize = CGSize(width: w, height: h) }
+            DispatchQueue.main.async {
+                self.view.streamSize = CGSize(width: w, height: h)
+                // As if the host showed a cursor with no usable image: macOS's arrow.
+                self.cursor(width: 1, height: 1, hotX: 0, hotY: 0, rgba: Data())
+            }
             return
         }
         // Resolving the host can take seconds: not on the main thread. A
@@ -668,7 +676,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         }
         let phaseText = (options.pacingAuto ? "pacing auto (\(pacing.vrr ? "VRR: hold" : "fixed refresh: phase lock")), " : "") +
             (!pacing.phaseLock ? "phase: off" : phase.summary())
-        lines.append(phaseText + "  compositing \(renderer.compositingStatus)")
+        lines.append(phaseText + "  compositing \(renderer.compositingStatus)  cursor \(cursorMode)")
         let hold = renderer.holdStatus(offset: conn?.clockOffsetNs)
         lines += [
             "rtt \(fmt(conn.map { Double($0.rttNs) / 1e6 })) ms  skipped \(st.skipped)  dropped \(st.dropped)  gaps \(s.gaps)" +
@@ -748,6 +756,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         }
         rescaleCursor()
     }
+    func windowDidMove(_ n: Notification) { updateCursor() }
     func windowDidChangeScreen(_ n: Notification) {
         if let s = window.screen {
             vsync.start(on: s)
@@ -776,6 +785,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         let immediate = options.immediateFullScreen && fullScreen
         renderer.setVsync(!immediate)
         renderer.holdFrames = pacing.hold
+        updateCursor()
         phase.setImmediate(immediate)
         if (fullScreen != wasFullScreen || pacing.phaseLock != was.phaseLock) && !immediate { phase.restart() }
         if pacing.steamVRR != was.steamVRR { conn?.send(Msg.vrrPolicy, Data([pacing.steamVRR])) }
@@ -789,10 +799,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     func windowDidResignKey(_ n: Notification) {
         releaseAll()
         setLock(false)
+        updateCursor()
         setSystemHotKeys(enabled: true)
     }
     func windowDidBecomeKey(_ n: Notification) {
         if locked { setLock(true) }
+        pointerInView = view.bounds.contains(view.convert(window.mouseLocationOutsideOfEventStream, from: nil))
+        updateCursor()
         setSystemHotKeys(enabled: false)
     }
 
@@ -855,6 +868,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
             conn?.send(Msg.motion, m.data)
             return
         }
+        renderer.cursorMoved()
         let p = view.convert(e.locationInWindow, from: nil)
         let x = min(1, max(0, (p.x - r.minX) / r.width))
         let y = min(1, max(0, (r.maxY - p.y) / r.height)) // AppKit's y points up
@@ -885,49 +899,100 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
     }
 
     // MARK: Cursor and pointer lock
+    //
+    // In absolute mode, when the host shows a cursor, it is drawn here at the
+    // local mouse position, with no network delay. Otherwise the host handles
+    // it: hidden, drawn by the game into the picture, or a locked pointer. In
+    // full screen on a variable-refresh display it is drawn into the frame:
+    // any cursor sprite the window server moves there (a transparent one too)
+    // makes the panel refresh at its fixed top rate while the mouse moves, and
+    // frames wait for that grid (display stage 3.2 -> 7.3 ms p50 in --mock).
+    // Elsewhere the display refreshes at a fixed rate anyway: the macOS cursor.
 
-    /// The host's cursor image, kept to rebuild at a new scale.
+    /// The host's cursor image (nil: it shows none), kept to rebuild at a new scale.
     var hostCursor: (width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data)?
+    /// The cursor to show, at the current scale, and its image as a texture.
+    private var localCursor: (cursor: NSCursor, texture: MTLTexture?)?
+    /// Who draws it, for the stats: "host", "frame" (into ours) or "macOS".
+    private var cursorMode = "host"
 
     func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data) {
-        hostCursor = (width, height, hotX, hotY, rgba)
+        hostCursor = width > 0 && height > 0 ? (width, height, hotX, hotY, rgba) : nil
         makeCursor()
     }
 
     /// The stream or window size changed: the cursor's scale with it.
-    func rescaleCursor() {
-        if hostCursor != nil { makeCursor() } else { window.invalidateCursorRects(for: view) }
-    }
+    func rescaleCursor() { makeCursor() }
 
     private func makeCursor() {
-        guard let (width, height, hotX, hotY, rgba) = hostCursor else { return }
-        guard width > 0, height > 0, rgba.count >= width * height * 4,
-              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8,
-                                         samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
-                                         bitmapFormat: [.alphaNonpremultiplied], bytesPerRow: width * 4, bitsPerPixel: 32),
-              let dst = rep.bitmapData else {
-            view.cursor = Self.hiddenCursor
-            applyCursor()
+        defer { updateCursor() }
+        guard let (width, height, hotX, hotY, rgba) = hostCursor else {
+            localCursor = nil
             return
         }
-        rgba.withUnsafeBytes { dst.update(from: $0.bindMemory(to: UInt8.self).baseAddress!, count: width * height * 4) }
-        // Same size as in the stream: stream pixels → view points.
-        let s = view.videoRect.width / max(view.streamSize.width, 1)
-        let image = NSImage(size: NSSize(width: CGFloat(width) * s, height: CGFloat(height) * s))
-        image.addRepresentation(rep)
-        view.cursor = NSCursor(image: image, hotSpot: NSPoint(x: CGFloat(hotX) * s, y: CGFloat(hotY) * s))
-        applyCursor()
+        var cursor = NSCursor.arrow // shown, but no image we can use
+        if rgba.count >= width * height * 4,
+           let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8,
+                                      samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                      bitmapFormat: [.alphaNonpremultiplied], bytesPerRow: width * 4, bitsPerPixel: 32),
+           let dst = rep.bitmapData {
+            rgba.withUnsafeBytes { dst.update(from: $0.bindMemory(to: UInt8.self).baseAddress!, count: width * height * 4) }
+            // Same size as in the stream: stream pixels → view points.
+            let s = view.videoRect.width / max(view.streamSize.width, 1)
+            let image = NSImage(size: NSSize(width: CGFloat(width) * s, height: CGFloat(height) * s))
+            image.addRepresentation(rep)
+            cursor = NSCursor(image: image, hotSpot: NSPoint(x: CGFloat(hotX) * s, y: CGFloat(hotY) * s))
+        }
+        localCursor = (cursor, texture(for: cursor))
     }
 
-    static let hiddenCursor: NSCursor = {
-        let image = NSImage(size: NSSize(width: 1, height: 1))
-        return NSCursor(image: image, hotSpot: .zero)
-    }()
+    /// `cursor`'s image in device pixels, premultiplied, top row first.
+    private func texture(for cursor: NSCursor) -> MTLTexture? {
+        let scale = window.backingScaleFactor
+        let w = Int((cursor.image.size.width * scale).rounded(.up)), h = Int((cursor.image.size.height * scale).rounded(.up))
+        guard w > 0, h > 0,
+              let g = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let data = g.data else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: g, flipped: false)
+        cursor.image.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+        NSGraphicsContext.restoreGraphicsState()
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
+        desc.usage = .shaderRead
+        let t = renderer.device.makeTexture(descriptor: desc)
+        t?.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data, bytesPerRow: w * 4)
+        return t
+    }
 
-    func applyCursor() {
+    /// Applies who draws the cursor (above) after any change to the host's
+    /// cursor, the pointer lock, focus, where the pointer is, the window's
+    /// place, or the present mode. NSCursor.hide() nests, so one flag owns it.
+    func updateCursor() {
+        let over = pointerInView && window.isKeyWindow
+        let show = localCursor != nil && !lockActive
+        let hide = lockActive || (over && (!show || pacing.vrr))
+        cursorMode = !show ? "host" : pacing.vrr ? "frame" : "macOS"
+        if hide != cursorHidden {
+            cursorHidden = hide
+            if hide { NSCursor.hide() } else { NSCursor.unhide() }
+        }
+        view.cursor = localCursor?.cursor ?? .arrow
         window.invalidateCursorRects(for: view)
-        let p = view.convert(window.mouseLocationOutsideOfEventStream, from: nil)
-        if view.bounds.contains(p) { view.cursor.set() }
+        if over && show && !pacing.vrr { view.cursor.set() }
+        guard over && show && pacing.vrr, let texture = localCursor?.texture else {
+            renderer.setCursor(nil)
+            return
+        }
+        // The drawable's top left in global display coordinates (points, y
+        // down from the top of the main display), as CGEvent reports the mouse.
+        let scale = window.backingScaleFactor
+        let r = window.convertToScreen(view.convert(view.bounds, to: nil))
+        let top = (NSScreen.screens.first?.frame.maxY ?? 0) - r.maxY
+        let hot = localCursor!.cursor.hotSpot
+        renderer.setCursor(texture, hotSpot: CGPoint(x: hot.x * scale, y: hot.y * scale),
+                           origin: CGPoint(x: r.minX, y: top), scale: scale,
+                           refresh: window.screen?.minimumRefreshInterval ?? 1.0 / 120)
     }
 
     /// The game wants relative mouse input: capture the pointer.
@@ -940,7 +1005,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         guard on != lockActive else { return }
         lockActive = on
         CGAssociateMouseAndMouseCursorPosition(on ? 0 : 1)
-        if on { NSCursor.hide() } else { NSCursor.unhide() }
+        updateCursor()
     }
 }
 
