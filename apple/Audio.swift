@@ -87,11 +87,20 @@ final class AudioPlayer {
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
         // Small device buffer for low output latency (best effort).
+        #if os(macOS)
         if let unit = engine.outputNode.audioUnit {
             var frames: UInt32 = 256
             AudioUnitSetProperty(unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0,
                                  &frames, UInt32(MemoryLayout<UInt32>.size))
         }
+        #else
+        // Plays with the silent switch on and over other apps' audio stopped,
+        // as a game does; 256 frames per I/O cycle.
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default)
+        try? session.setPreferredIOBufferDuration(256 / audioRate)
+        try session.setActive(true)
+        #endif
         try engine.start()
     }
 

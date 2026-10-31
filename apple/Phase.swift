@@ -34,10 +34,18 @@
 // does: the lock asks the renderer to skip one (`takeDrain`). One repeated
 // frame instead of a refresh more latency from then on.
 //
+// Leads are binned unwrapped around the median lateness (a frame later than
+// usual counts as short of its flip, not as early), and a lead qualifies when
+// the recent latenesses would show 99.9% of frames under it (`enough`); of
+// those the lock takes the lowest, so it sits as close to the cut-off as the
+// network's tail allows, and creeps toward unseen leads 1 ms at a time. On
+// the iPad (cut-off ~0.8 ms before the flip): --mock display 12.8 → 9.3 ms;
+// Wi-Fi with lateness p99 +5.4 ms over its median: 16.3 / 16.9 → 14.3 / 15.2
+// ms p50 / p90 at ~0.12 drops/s, the late spikes.
+//
 // To find a starting point, sweep `shift` through one whole refresh,
 // recording the median display stage at each step, and start at the lowest
-// step without drops, moved `margin` earlier; the sweep also fills the lead
-// bins. Steering every step follows the drift between the two machines'
+// step without drops, moved `margin` earlier. Steering every step follows the drift between the two machines'
 // clocks (tens of ppm), which would otherwise carry frames off within a
 // minute.
 
@@ -51,7 +59,7 @@ final class PhaseLock {
     private var previous: UInt64?          // the flip before `last`
     private var gaps: [Double] = []        // recent flip-to-flip gaps, per refresh
     private var samples: [Double] = []     // display stage, ns, since the last step
-    // Since the last step; ok: not dropped; late: submit − the host's present
+    // Since the last step; ok: shown on time; late: submit − the host's present
     // (this Mac's clock), once the clock offset is known.
     private var leads: [(a: Double, ok: Bool, late: Double?)] = []
     private var lateShown = 0, shown = 0   // since the last step: shown a refresh late, all shown
@@ -72,17 +80,31 @@ final class PhaseLock {
     private var drops = 0
 
     static let sweepStep = 1e6, settleSteps = 3
+    /// The share of frames a lead must show to be chosen: one drop in
+    /// 1000 frames (8 s at 120 Hz).
+    static let enough = 0.999
 
-    // Vsync off (full screen): macOS flips frames straight to the panel, so
-    // there is no refresh cut-off to steer around (a sweep is flat, and where
-    // flips land does not depend on the phase). The lock then only keeps
-    // gamescope on the panel's grid, from `vsync`, with the shift held.
-    private let vsync: VsyncClock
+    // Vsync off (full screen): macOS flips each frame straight to the panel
+    // ~3 ms after it is submitted, wherever the scan is, so there is no
+    // refresh cut-off to steer around; the frame tears where the flip lands.
+    // The lock then steers the flips to `flipLead` before the panel's vblank
+    // (where a tear shows least) on the grid measured while vsync was on:
+    // immediate flips say nothing about the refreshes, and neither does
+    // CVDisplayLink then (it follows our flips: ±8 ms off a line on the
+    // built-in panel). The panel's grid is a
+    // steady clock: vsync-on flips on the built-in panel lay on one line,
+    // 16666.605 µs apart in every run, and a line fitted to one run placed
+    // another's flips 149 s later within 5 µs.
     private var immediate = false
+    private var flips: [Double] = []       // since the last step: flip − its target, ns
+    private var flipError: Double?         // the last step's median
+    static let flipLead = (getenv("GM_FLIP_LEAD").flatMap { Double(String(cString: $0)) } ?? 0.3) * 1e6
+    /// Measuring (GM_HOST_LEAD=<ms>): steer to this host present lead
+    /// instead of the learned best (finds where frames stop being shown).
+    static let pinnedLead = getenv("GM_HOST_LEAD").flatMap { Double(String(cString: $0)) }.map { $0 * 1e6 }
 
-    init(refreshHz: Double, vsync: VsyncClock) {
+    init(refreshHz: Double) {
         nominal = 1e9 / refreshHz
-        self.vsync = vsync
     }
 
     /// Switches between the two modes; back to vsync, it sweeps again.
@@ -90,7 +112,17 @@ final class PhaseLock {
         lock.lock(); defer { lock.unlock() }
         guard on != immediate else { return }
         immediate = on
+        flips.removeAll()
+        flipError = nil
         if !on { startSweep() }
+    }
+
+    /// The panel's refresh grid (a vblank and the interval) once measured
+    /// from vsync-on flips, which vsync off needs.
+    func grid() -> (vblank: UInt64, interval: Double)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let period, let last else { return nil }
+        return (last, period)
     }
 
     /// Starts over with a sweep (e.g. after a stretch without a grid, or on
@@ -134,21 +166,37 @@ final class PhaseLock {
     func dropped(_ t: FrameTiming) {
         lock.lock(); defer { lock.unlock() }
         drops += 1
-        if t.submitted > since, let a = lead(t.submitted) { leads.append((a, false, Self.late(t))) }
+        // Every frame's lead counts, settling or not: it is measured on the
+        // panel's grid, which a step does not move (drops right after a
+        // step, when gamescope moves to the new grid, were missed).
+        if t.submitted > 0, let a = lead(t.submitted) { leads.append((a, false, Self.late(t))) }
     }
 
     /// A frame reached the screen (any thread).
     func presented(_ t: FrameTiming) {
         lock.lock(); defer { lock.unlock() }
+        if immediate {
+            // A flip, not a refresh: how far from its target it landed.
+            if t.submitted > since, let last {
+                var e = (Double(Int64(t.presented) - Int64(last)) + Self.flipLead).truncatingRemainder(dividingBy: interval)
+                if e > interval / 2 { e -= interval } else if e <= -interval / 2 { e += interval }
+                flips.append(e)
+            }
+            return
+        }
         if first == nil { first = t.presented }
         if t.presented != last { previous = last; last = t.presented; measure() }
-        guard t.submitted > since, t.submitted > 0 else { return }
+        guard t.submitted > 0, let a = lead(t.submitted) else { return }
+        // On time, a frame is on screen a refresh after the flip point it
+        // led; one that missed it and was shown a refresh later (nothing
+        // newer replaced it) missed as a dropped one did.
         let display = Double(Int64(t.presented) - Int64(t.submitted))
+        let onTime = display <= a + interval * 1.5
+        leads.append((a, onTime, Self.late(t)))
+        guard t.submitted > since else { return }
         samples.append(display)
-        guard let a = lead(t.submitted) else { return }
-        leads.append((a, true, Self.late(t)))
         shown += 1
-        if display > a + interval * 1.5 { lateShown += 1 }
+        if !onTime { lateShown += 1 }
     }
 
     private static func late(_ t: FrameTiming) -> Double? {
@@ -184,10 +232,22 @@ final class PhaseLock {
     func step() -> (anchor: UInt64, interval: UInt64)? {
         lock.lock(); defer { lock.unlock() }
         guard let last else { return nil }
-        if immediate, let g = vsync.grid() {
-            return (UInt64(Int64(g.vsync) - Int64(shift)), UInt64(g.interval))
-        }
         let t = interval
+        if immediate {
+            // The vblank nearest now on the measured grid (the anchor sent
+            // stays recent; the interval goes out rounded to the ns), and the
+            // flips' median error halved into the shift: a later flip, an
+            // earlier grid.
+            let refresh = (Double(Int64(nowNs()) - Int64(last)) / t).rounded()
+            let e = flips.sorted()
+            flips.removeAll()
+            if e.count >= 10 {
+                flipError = e[e.count / 2]
+                shift += flipError! / 2
+            }
+            since = nowNs() + 100_000_000
+            return (UInt64(Int64(last) + Int64(refresh * t) - Int64(shift)), UInt64(t.rounded()))
+        }
         let d = samples.sorted()
         let step = leads
         let (late, all) = (lateShown, shown)
@@ -232,8 +292,21 @@ final class PhaseLock {
             let host = step.compactMap { s in s.late.map { (s.a + $0).truncatingRemainder(dividingBy: t) } }
             let a = step.map(\.a).sorted()
             let mid = a[a.count / 2]
-            // Per lead bin, the share of frames shown (decayed: ~25 s).
-            let bins = Int((t / Self.binNs).rounded(.up))
+            recent += step.compactMap(\.late)
+            if recent.count > 1200 { recent.removeFirst(recent.count - 1200) }
+            // Leads unwrapped around the median lateness `med`: a frame's
+            // lead is what a frame of median lateness had in its step (its
+            // host lead minus `med`, within a refresh) minus how much later
+            // than the median it was. A frame 5 ms later than usual then
+            // counts as 5 ms short of its flip, not (wrapped) as almost a
+            // refresh early; wrapped, Wi-Fi spikes that missed their flip
+            // and were replaced marked the early bins, and the lock steered
+            // to 1 ms over the cut-off and dropped 0.85 frames/s.
+            let med = recent.isEmpty ? 0 : recent.sorted()[recent.count / 2]
+            let wrap = { (x: Double) -> Double in let y = x.truncatingRemainder(dividingBy: t); return y < 0 ? y + t : y }
+            // Per lead bin from -t to 2t, the share of frames shown (decayed: ~25 s).
+            let bins = Int((3 * t / Self.binNs).rounded(.up))
+            let bin = { (u: Double) in max(0, min(bins - 1, Int((u + t) / Self.binNs))) }
             if binAll.count != bins {
                 binAll = Array(repeating: 0, count: bins)
                 binDropped = binAll
@@ -241,33 +314,44 @@ final class PhaseLock {
             for i in 0..<bins { binAll[i] *= 0.98; binDropped[i] *= 0.98 }
             var missed = 0
             for f in step {
-                let i = min(bins - 1, Int(f.a / Self.binNs))
+                guard let l = f.late else { continue }
+                let i = bin(wrap(f.a + l - med) - (l - med))
                 binAll[i] += 1
                 if !f.ok { binDropped[i] += 1; missed += 1 }
             }
-            // Unseen leads count as even odds.
+            // Each bin's share starts from `Self.enough`, worth two frames,
+            // if a bin within 1 ms has frames: a bin with few frames, all
+            // shown, qualifies as well as one with many (with even odds as
+            // the prior, the bin the lock sat on always outscored the lower
+            // ones it had seen clean, and the lock never moved down: on the
+            // iPad it held a 4.5 ms lead where 1.0 drops nothing), and the
+            // lock creeps into unseen leads 1 ms at a time; one drop there
+            // rules a bin out until it decays. Leads far from any seen are
+            // even odds.
+            let reach = Int((1e6 / Self.binNs).rounded())
             let shownShare: [Double] = (0..<bins).map { i in
-                let shown: Double = binAll[i] - binDropped[i] + 1
-                return shown / (binAll[i] + 2)
+                let near = (max(0, i - reach)...min(bins - 1, i + reach)).contains { binAll[$0] >= 1 }
+                let prior = near ? Self.enough : 0.5
+                return (binAll[i] - binDropped[i] + 2 * prior) / (binAll[i] + 2)
             }
-            recent += step.compactMap(\.late)
-            if recent.count > 1200 { recent.removeFirst(recent.count - 1200) }
             if host.count * 2 > step.count && recent.count >= 60 {
                 var h = host.map { around($0, host[0]) }.sorted()[host.count / 2]
                 h -= (h / t).rounded(.down) * t
-                // The host present's lead, one bin apart round the refresh, under
-                // which the recent latenesses would have been shown most often.
-                var best = h, bestShown = -1.0
-                for c in 0..<bins {
+                // The lead of a frame of median lateness, one bin apart over
+                // a refresh: the lowest (the least latency) under which the
+                // recent latenesses would show `enough` frames; none: the
+                // one that would show the most. The host present's lead is
+                // that plus the median lateness.
+                let deviations = recent.map { $0 - med }
+                let scores: [Double] = (0..<Int((t / Self.binNs).rounded(.up))).map { c in
                     let lead = Double(c) * Self.binNs
-                    var sum = 0.0
-                    for l in recent {
-                        var a = (lead - l).truncatingRemainder(dividingBy: t)
-                        if a < 0 { a += t }
-                        sum += shownShare[min(bins - 1, Int(a / Self.binNs))]
-                    }
-                    if sum > bestShown { bestShown = sum; best = lead }
+                    return deviations.reduce(0) { $0 + shownShare[bin(lead - $1)] }
                 }
+                let c = scores.firstIndex { $0 >= Self.enough * Double(recent.count) }
+                    ?? scores.indices.max { scores[$0] < scores[$1] }!
+                var best = wrap(Double(c) * Self.binNs + med)
+                let bestShown = scores[c]
+                if let pin = Self.pinnedLead { best = pin }
                 target = best
                 expected = bestShown / Double(recent.count)
                 // The phase is circular: the smaller way round.
@@ -275,8 +359,8 @@ final class PhaseLock {
                 move -= (move / t).rounded() * t
                 shift += move / 2 // earlier raises every lead
                 if getenv("GM_DEBUG_PHASE") != nil {
-                    FileHandle.standardError.write(String(format: "locked shift %+.1f host lead %.2f target %.2f (%.0f%% shown expected) lead p50 %.2f dropped %d\n",
-                        shift / 1e6, h / 1e6, best / 1e6, expected * 100, mid / 1e6, missed).data(using: .utf8)!)
+                    FileHandle.standardError.write(String(format: "locked shift %+.1f host lead %.2f target %.2f (%.2f%% shown expected) lead p50 %.2f dropped %d med %.2f\n",
+                        shift / 1e6, h / 1e6, best / 1e6, expected * 100, mid / 1e6, missed, med / 1e6).data(using: .utf8)!)
                 }
             }
         }
@@ -295,7 +379,8 @@ final class PhaseLock {
         lock.lock(); defer { lock.unlock() }
         guard last != nil else { return "phase: waiting for the display" }
         if immediate {
-            return String(format: "phase: immediate flips (vsync off), refresh %.3f ms", (vsync.grid()?.interval ?? 0) / 1e6)
+            return String(format: "phase: vsync off, flips %@ from %.1f ms before the vblank, shift %+.1f ms, refresh %.3f ms",
+                          flipError.map { String(format: "%+.2f ms", $0 / 1e6) } ?? "-", Self.flipLead / 1e6, shift / 1e6, interval / 1e6)
         }
         let state = sweeping ? "sweeping \(sweep.count)/\(Int((interval / Self.sweepStep).rounded(.up)))" : "locked"
         return String(format: "phase: %@, shift %+.1f ms, refresh %.3f ms", state, shift / 1e6, interval / 1e6)

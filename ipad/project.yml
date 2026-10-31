@@ -1,0 +1,28 @@
+# XcodeGen spec for the iPad app (build.sh generates GMStream.xcodeproj).
+name: GMStream
+options:
+  deploymentTarget: { iOS: "17.0" }
+targets:
+  GMStream:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: ../apple
+        includes: ["*.swift"]
+      # PyroWave's Metal decoder (build.sh checks it out).
+      - path: build/pyrowave/metal
+        includes: ["*.mm", "*.cpp"]
+    settings:
+      base:
+        PRODUCT_NAME: GMStream
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.timshen91.gmstream
+        INFOPLIST_FILE: Info.plist
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "2"
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: ../apple/Bridge.h
+        HEADER_SEARCH_PATHS: ["$(SRCROOT)/build/pyrowave/metal", "$(SRCROOT)/build/pyrowave/metal/shaders"]
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        CLANG_ENABLE_OBJC_ARC: YES
+        OTHER_LDFLAGS: ["-lc++"]

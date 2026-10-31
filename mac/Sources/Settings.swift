@@ -5,7 +5,7 @@
 import AppKit
 
 final class SettingsWindow: NSObject {
-    enum Change { case connection, bitrate, display, stats, present, keepAwake, phaseLock }
+    typealias Change = SettingsChange
 
     let window: NSWindow
     /// Called after `options` has been updated and saved.
@@ -24,12 +24,14 @@ final class SettingsWindow: NSObject {
     private let immediate = NSButton(checkboxWithTitle: "Lowest latency in full screen (vsync off, may tear)", target: nil, action: nil)
     private let vivid = NSButton(checkboxWithTitle: "Vivid colors (display's full gamut, as on Windows)", target: nil, action: nil)
     private let awake = NSButton(checkboxWithTitle: "Keep Wi-Fi awake (60 tiny packets/s to the host)", target: nil, action: nil)
+    private let clientCursor = NSButton(checkboxWithTitle: "Force client cursor (also where the host hides it)", target: nil, action: nil)
     private let pacing = NSButton(checkboxWithTitle: "Pace the host to this display's refreshes (phase lock)", target: nil, action: nil)
     private let hold = NSButton(checkboxWithTitle: "Even out network jitter (fixed delay after the host)", target: nil, action: nil)
     private let pacingMode = NSPopUpButton()
     private let pacingNote = NSTextField(wrappingLabelWithString: "")
     private static let refreshRates = [30, 60, 90, 120, 144, 165, 240]
-    private static let codecs: [(name: String, id: UInt8)] = [("H.264", 0), ("HEVC", 1), ("PyroWave", 3)]
+    private static let codecs: [(name: String, id: UInt8)] =
+        [("H.264", 0), ("HEVC", 1)] + (Decoder.hasAV1 ? [("AV1", 2)] : []) + [("PyroWave", 3)]
 
     override init() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
@@ -50,7 +52,7 @@ final class SettingsWindow: NSObject {
             field.target = self
             field.action = #selector(changed(_:))
         }
-        for control in [codec, refresh, stats, immediate, pacingMode, pacing, hold, vivid, awake] as [NSControl] {
+        for control in [codec, refresh, stats, immediate, pacingMode, pacing, hold, vivid, awake, clientCursor] as [NSControl] {
             control.target = self
             control.action = #selector(changed(_:))
         }
@@ -82,6 +84,7 @@ final class SettingsWindow: NSObject {
             [NSGridCell.emptyContentView, hold],
             [NSGridCell.emptyContentView, vivid],
             [NSGridCell.emptyContentView, awake],
+            [NSGridCell.emptyContentView, clientCursor],
         ])
         grid.rowSpacing = 10
         grid.columnSpacing = 8
@@ -123,6 +126,7 @@ final class SettingsWindow: NSObject {
         immediate.state = options.immediateFullScreen ? .on : .off
         vivid.state = options.vividColors ? .on : .off
         awake.state = options.keepWiFiAwake ? .on : .off
+        clientCursor.state = options.forceClientCursor ? .on : .off
         let now = pacingNow()
         pacingMode.selectItem(at: options.pacingAuto ? 0 : 1)
         pacing.state = now.phaseLock ? .on : .off
@@ -177,6 +181,9 @@ final class SettingsWindow: NSObject {
         case awake:
             options.keepWiFiAwake = awake.state == .on
             change = .keepAwake
+        case clientCursor:
+            options.forceClientCursor = clientCursor.state == .on
+            change = .cursor
         default:
             options.showStats = stats.state == .on
             change = .stats

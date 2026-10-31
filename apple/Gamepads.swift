@@ -3,7 +3,11 @@
 // standard mapping). State goes out on every change, not on a poll. Rumble
 // from the host plays on the controller's haptics.
 
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import CoreHaptics
 import GameController
 
@@ -26,9 +30,14 @@ final class Gamepads {
         nc.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] n in
             if let c = n.object as? GCController { self?.detach(c) }
         }
-        // Coming back to the front: claim the buttons again (macOS may have
-        // handed them back while another app was active).
-        nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+        // Coming back to the front: claim the buttons again (the system may
+        // have handed them back while another app was active).
+        #if os(macOS)
+        let active = NSApplication.didBecomeActiveNotification
+        #else
+        let active = UIApplication.didBecomeActiveNotification
+        #endif
+        nc.addObserver(forName: active, object: nil, queue: .main) { [weak self] _ in
             self?.slots.forEach { if let c = $0 { Self.claimSystemButtons(c) } }
         }
         GCController.controllers().forEach(attach)

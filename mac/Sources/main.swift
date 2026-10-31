@@ -19,186 +19,6 @@
 
 import AppKit
 
-
-/// Settings: saved ones (Settings window, Cmd+,), then command-line options
-/// on top for this launch.
-struct Options {
-    var host = "steamdeck.local"
-    var port: UInt16 = 8444
-    var codec: UInt8 = 0 // preferred: 0 H.264, 1 HEVC, 3 PyroWave
-    var mbps: UInt32 = 40
-    var refresh: Double? // nil: the display's rate
-    var size: (Int, Int)? // nil: the window's pixel size
-    var showStats = true
-    var statsLog = false // print the stats every second (measuring)
-    var fullScreen = false
-    var screen: String? // start on the screen whose name contains this
-    var mock = false // measuring: local test frames, no host (Mock.swift)
-    // Full screen with vsync off: macOS flips frames straight to the panel
-    // (measured total 13.7 / 17 ms p50 / p90 against ~29 with vsync), but
-    // late frames may tear. Only in full screen: in a window vsync off is
-    // erratic.
-    var immediateFullScreen = false
-    // The stream's sRGB pixels shown as the display's own colors, without
-    // macOS's color management: on a wide-gamut display (P3), more saturated
-    // than the game intends, as on Windows (no color management) or the
-    // Steam Deck's screen (Steam's color vibrance).
-    var vividColors = false
-    // A tiny datagram to the host 60 times a second, so this Mac's Wi-Fi
-    // doesn't doze while only receiving (Connection.keepAwake).
-    var keepWiFiAwake = true
-    // Phase lock (Phase.swift): gamescope produces frames on this display's
-    // refresh grid. Off: an empty grid, so gamescope paces itself and frames
-    // are shown as they arrive (as on a variable-refresh display).
-    var phaseLock = true
-    // Hold each frame until a fixed delay after the host presented it
-    // (Video.swift, Hold): the network's jitter traded for a constant delay.
-    var holdFrames = false
-    // Pacing chosen from the display (Controller.pacing) instead of the two
-    // settings above, Steam's VRR toggle included.
-    var pacingAuto = true
-    var layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:] // measuring
-    var bgra = false // decoder output BGRA instead of NV12 (measuring)
-    var probe: Double?
-
-    init(_ args: [String]) {
-        let d = UserDefaults.standard
-        if let v = d.string(forKey: "host"), !v.isEmpty { host = v }
-        if d.integer(forKey: "port") > 0 { port = UInt16(clamping: d.integer(forKey: "port")) }
-        if let c = d.object(forKey: "codec") as? Int { codec = UInt8(c) } else if d.bool(forKey: "hevc") { codec = 1 }
-        if d.integer(forKey: "mbps") > 0 { mbps = UInt32(d.integer(forKey: "mbps")) }
-        if d.double(forKey: "refresh") > 0 { refresh = d.double(forKey: "refresh") }
-        size = Options.parseSize(d.string(forKey: "size") ?? "")
-        if d.object(forKey: "showStats") != nil { showStats = d.bool(forKey: "showStats") }
-        immediateFullScreen = d.bool(forKey: "immediateFullScreen")
-        vividColors = d.bool(forKey: "vividColors")
-        if d.object(forKey: "keepWiFiAwake") != nil { keepWiFiAwake = d.bool(forKey: "keepWiFiAwake") }
-        if d.object(forKey: "phaseLock") != nil { phaseLock = d.bool(forKey: "phaseLock") }
-        holdFrames = d.bool(forKey: "holdFrames")
-        if d.object(forKey: "pacingAuto") != nil { pacingAuto = d.bool(forKey: "pacingAuto") }
-
-        var it = args.makeIterator()
-        while let a = it.next() {
-            switch a {
-            case "--port": port = UInt16(it.next() ?? "") ?? port
-            case "--hevc": codec = 1
-            case "--pyrowave": codec = 3
-            case "--bitrate": mbps = UInt32(it.next() ?? "") ?? mbps
-            case "--refresh": refresh = Double(it.next() ?? "")
-            case "--size": size = Options.parseSize(it.next() ?? "")
-            case "--probe": probe = Double(it.next() ?? "")
-            case "--bgra": bgra = true
-            case "--stats-log": statsLog = true
-            case "--hide-stats": showStats = false
-            case "--fullscreen": fullScreen = true
-            case "--screen": screen = it.next()
-            case "--mock": mock = true
-            case "--no-vsync": immediateFullScreen = true
-            case "--vivid": vividColors = true
-            case "--no-keep-awake": keepWiFiAwake = false
-            case "--no-phase": phaseLock = false
-            case "--hold": holdFrames = true; pacingAuto = false
-            case "--no-hold": holdFrames = false; pacingAuto = false
-            case "--auto-pacing": pacingAuto = true
-            case "--manual-pacing": pacingAuto = false
-            case "--layer": layerKeys = Options.parseKeys(it.next() ?? "")
-            case "--drawable": drawableKeys = Options.parseKeys(it.next() ?? "")
-            case let s where s.hasPrefix("-"): _ = it.next() // e.g. -NSDocumentRevisionsDebugMode YES
-            default: host = a
-            }
-        }
-    }
-
-    static func parseSize(_ s: String) -> (Int, Int)? {
-        let p = s.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-        return p.count == 2 && p[0] > 0 && p[1] > 0 ? (p[0] & ~1, p[1] & ~1) : nil
-    }
-
-    /// "a=1,b=0" → ["a": 1, "b": 0]
-    static func parseKeys(_ s: String) -> [String: Double] {
-        var r: [String: Double] = [:]
-        for kv in s.split(separator: ",") {
-            let p = kv.split(separator: "=")
-            if p.count == 2, let v = Double(p[1]) { r[String(p[0])] = v }
-        }
-        return r
-    }
-
-    var sizeText: String { size.map { "\($0.0)x\($0.1)" } ?? "" }
-
-    func save() {
-        let d = UserDefaults.standard
-        d.set(host, forKey: "host")
-        d.set(Int(port), forKey: "port")
-        d.set(Int(codec), forKey: "codec")
-        d.set(Int(mbps), forKey: "mbps")
-        d.set(refresh ?? 0, forKey: "refresh")
-        d.set(sizeText, forKey: "size")
-        d.set(showStats, forKey: "showStats")
-        d.set(immediateFullScreen, forKey: "immediateFullScreen")
-        d.set(vividColors, forKey: "vividColors")
-        d.set(keepWiFiAwake, forKey: "keepWiFiAwake")
-        d.set(phaseLock, forKey: "phaseLock")
-        d.set(holdFrames, forKey: "holdFrames")
-        d.set(pacingAuto, forKey: "pacingAuto")
-    }
-}
-
-var options = Options(Array(CommandLine.arguments.dropFirst()))
-let codecMask: UInt8 = 0b011 // H.264, HEVC (the probe also takes PyroWave, 1 << 3)
-
-/// Per-second statistics, filled on the network thread.
-final class Stats {
-    private let lock = NSLock()
-    private var frames = 0, bytes = 0, gaps = 0
-    private var net: [Double] = [], total: [Double] = []
-
-    func add(bytes n: Int, netMs: Double?, totalMs: Double?) {
-        lock.lock(); defer { lock.unlock() }
-        frames += 1; bytes += n
-        if let netMs { net.append(netMs) }
-        if let totalMs { total.append(totalMs) }
-    }
-    func gap() { lock.lock(); gaps += 1; lock.unlock() }
-    func addBytes(_ n: Int) { lock.lock(); bytes += n; lock.unlock() }
-
-    /// Returns a summary and resets.
-    func take() -> (frames: Int, mbps: Double, gaps: Int, net: Double?, total: Double?, totalMax: Double?) {
-        lock.lock(); defer { lock.unlock() }
-        let avg: ([Double]) -> Double? = { $0.isEmpty ? nil : $0.reduce(0, +) / Double($0.count) }
-        let r = (frames, Double(bytes) * 8 / 1e6, gaps, avg(net), avg(total), total.max())
-        frames = 0; bytes = 0; net = []; total = []
-        return r
-    }
-}
-
-/// Decides which frames to show: in order, from a keyframe.
-final class FrameGate {
-    private var expect: UInt32?
-    private var lastKeyRequest: UInt64 = 0
-
-    /// Whether to decode this frame; asks for a keyframe after a gap.
-    func admit(_ f: Frame, requestKeyframe: () -> Void, stats: Stats) -> Bool {
-        if let e = expect, f.id == e {
-            expect = e &+ 1
-            return true
-        }
-        if f.key {
-            expect = f.id &+ 1
-            return true
-        }
-        if let e = expect, Int32(bitPattern: f.id &- e) < 0 { return false } // stale
-        if expect != nil { stats.gap() }
-        expect = nil
-        let now = nowNs()
-        if now - lastKeyRequest > 200_000_000 {
-            lastKeyRequest = now
-            requestKeyframe()
-        }
-        return false
-    }
-}
-
 // MARK: - Probe mode
 
 final class Probe: ConnectionDelegate {
@@ -232,8 +52,6 @@ final class Probe: ConnectionDelegate {
     func closed(reason: String) { print("closed: \(reason)"); exit(1) }
 }
 
-func fmt(_ v: Double?) -> String { v.map { String(format: "%.1f", $0) } ?? "-" }
-
 if let seconds = options.probe {
     do {
         let conn = try Connection(host: options.host, port: options.port)
@@ -265,9 +83,6 @@ if let seconds = options.probe {
 
 final class StreamView: NSView {
     let metalLayer: CAMetalLayer
-    var streamSize = CGSize(width: 16, height: 9) {
-        didSet { if streamSize != oldValue { controller?.rescaleCursor() } }
-    }
     var cursor = NSCursor.arrow
     weak var controller: Controller?
 
@@ -291,13 +106,6 @@ final class StreamView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    /// Where the video is drawn, in view points.
-    var videoRect: CGRect {
-        let s = min(bounds.width / streamSize.width, bounds.height / streamSize.height)
-        let w = streamSize.width * s, h = streamSize.height * s
-        return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2, width: w, height: h)
-    }
-
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
@@ -317,75 +125,25 @@ final class StreamView: NSView {
     override func mouseDragged(with e: NSEvent) { controller?.moved(e) }
     override func rightMouseDragged(with e: NSEvent) { controller?.moved(e) }
     override func otherMouseDragged(with e: NSEvent) { controller?.moved(e) }
-    override func mouseDown(with e: NSEvent) { controller?.button(0x110, down: true) }
-    override func mouseUp(with e: NSEvent) { controller?.button(0x110, down: false) }
-    override func rightMouseDown(with e: NSEvent) { controller?.button(0x111, down: true) }
-    override func rightMouseUp(with e: NSEvent) { controller?.button(0x111, down: false) }
+    override func mouseDown(with e: NSEvent) { controller?.session.button(Session.leftButton, down: true) }
+    override func mouseUp(with e: NSEvent) { controller?.session.button(Session.leftButton, down: false) }
+    override func rightMouseDown(with e: NSEvent) { controller?.session.button(Session.rightButton, down: true) }
+    override func rightMouseUp(with e: NSEvent) { controller?.session.button(Session.rightButton, down: false) }
     override func otherMouseDown(with e: NSEvent) { controller?.otherButton(e.buttonNumber, down: true) }
     override func otherMouseUp(with e: NSEvent) { controller?.otherButton(e.buttonNumber, down: false) }
     override func scrollWheel(with e: NSEvent) { controller?.scroll(e) }
 }
 
-/// How frames are paced, from the settings or (Pacing: Auto) from the display.
-/// The two models do not mix. A variable-refresh display (Adaptive-Sync, in
-/// full screen: in a window macOS composites the desktop at a fixed rate)
-/// shows a frame when it comes, so the game runs free on Steam's VRR and the
-/// hold turns everything after the host into a constant delay. A
-/// fixed-refresh one has its own clock: Steam's VRR off, so the game steps at
-/// a fixed rate on gamescope's vblanks, and the phase lock makes those this
-/// display's refreshes. The Dell U2725QE in full screen does VRR (test frames
-/// at 100 Hz flipped 10.0 ms apart) as long as nothing redraws on another
-/// display and the host stays under its top rate (PanelRate).
-struct Pacing {
-    let vrr: Bool       // Auto: this display does VRR here
-    let phaseLock: Bool
-    let hold: Bool
-    let steamVRR: UInt8 // protocol VrrPolicy: 0 Steam's own, 1 off, 2 on
-
-    init(options: Options, fullScreen: Bool, screen: NSScreen?) {
-        vrr = fullScreen && screen.map { $0.maximumRefreshInterval > $0.minimumRefreshInterval * 1.01 } ?? false
-        if options.pacingAuto {
-            (phaseLock, hold, steamVRR) = vrr ? (false, true, 2) : (true, false, 1)
-        } else {
-            (phaseLock, hold, steamVRR) = (options.phaseLock, options.holdFrames, 0)
-        }
-    }
-}
-
-final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, ConnectionDelegate {
+/// The app: its menu, the stream window, keyboard capture and the cursor,
+/// around one Session.
+final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, SessionShell {
     var window: NSWindow!
     var view: StreamView!
-    var conn: Connection?
-    let decoder = Decoder()
-    let renderer = MetalRenderer(layerKeys: options.layerKeys, drawableKeys: options.drawableKeys)!
-    let stages = StageStats()
-    var netFirst: (id: UInt32, first: UInt64, last: UInt64, maxGap: UInt64, gapAt: Int, readLag: UInt64)? // measuring (GM_DEBUG_NET)
-    lazy var pyro = PyroWaveDecoder(device: renderer.device, queue: renderer.queue)
-    /// H.264, HEVC, and PyroWave where its Metal decoder runs.
-    var clientCodecs: UInt8 { codecMask | (pyro != nil ? 1 << 3 : 0) }
-    let chart = LatencyChart()
-    let vsync = VsyncClock()
-    let panel = PanelRate()
-    // The host's frame-rate cap when the panel's real top rate is below its
-    // nominal one (PanelRate): its shortest refresh plus 0.2 ms, so every
-    // frame comes after the panel could refresh again (PanelRate).
-    var capHz: Double?
-    lazy var phase = PhaseLock(refreshHz: Double(window.screen?.maximumFramesPerSecond ?? 60), vsync: vsync)
-    let stats = Stats()
-    let gate = FrameGate()
-    var held = Set<UInt16>()
-    let pads = Gamepads()
-    let opus = OpusDecoder()
-    var player: AudioPlayer?
-    var locked = false, lockActive = false
+    lazy var session = Session(shell: self)
+    var renderer: MetalRenderer { session.renderer }
     var pointerInView = false, cursorHidden = false
     var keyMonitor: Any?
-    var fullScreen = false // as the present mode was last applied
-    var pacing = Pacing(options: options, fullScreen: false, screen: nil)
-    var codecName = "-"
-    var timers: [Timer] = []
     var configureTimer: Timer?
-    var closedReason: String?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let menu = NSMenu()
@@ -418,392 +176,94 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(view)
         captureKeyboard()
-        decoder.yuv = !options.bgra
-        decoder.onDecoded = { [renderer] image, timing in renderer.submit(.buffer(image), timing) }
-        pyro?.onDecoded = { [renderer] planes, timing in renderer.submit(.planes(planes), timing) }
-        pyro?.onIncomplete = { [stats] in stats.gap() }
-        renderer.onPresented = { [stages, chart, phase, vsync, panel] t in
-            stages.add(t)
-            phase.presented(t)
-            panel.presented(t.presented)
-            Trace.shared?.record(t: t.presented, aux: t.presented &- t.received, kind: 0xFE, host: t.presentLocal ?? 0)
-            if getenv("GM_DEBUG_FLIP") != nil, let g = vsync.grid() {
-                // Measuring: where in the refresh each frame was flipped.
-                let ph = Double(Int64(t.presented) - Int64(g.vsync)).truncatingRemainder(dividingBy: g.interval)
-                FileHandle.standardError.write(String(format: "flip %.3f %.3f\n", (ph < 0 ? ph + g.interval : ph) / 1e6,
-                    Double(Int64(t.presented) - Int64(t.submitted)) / 1e6).data(using: .utf8)!)
-            }
-            if let p = t.presentLocal {
-                chart.push(base: Double(Int64(t.submitted) - Int64(p)) / 1e6, ms: Double(Int64(t.presented) - Int64(p)) / 1e6)
-            }
-        }
-        _ = Trace.shared // its flush timer on the main run loop
-        renderer.onSkipped = { [stages] in stages.skip() }
-        renderer.onDropped = { [stages, phase] t in stages.drop(); phase.dropped(t) }
-        pads.send = { [weak self] type, data in self?.conn?.send(type, data) }
-        do { player = try AudioPlayer() } catch { NSLog("gmstream: audio output: \(error)") }
         NSApp.activate(ignoringOtherApps: true)
 
-        if let screen = window.screen ?? NSScreen.main { vsync.start(on: screen) }
-        applyPresentMode()
+        // A panel that slept or was reconfigured may refresh on a new grid.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.session.screenChanged()
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.session.screenChanged()
+        }
         if options.fullScreen { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.window.toggleFullScreen(nil) } }
-        timers.append(Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.conn?.ping() })
-        timers.append(Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.sendGrid() })
-        timers.append(Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            self?.updateTitle()
-            self?.checkPanelRate()
-        })
-        timers.append(Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            self?.updateOverlay()
-        })
-        connect()
-    }
-
-    /// This display's refresh grid, shifted by the phase lock, to the host.
-    /// With pacing off (the setting alone decides, on a variable-refresh
-    /// display too), none: an empty grid, so gamescope paces itself and each
-    /// frame is shown as it arrives.
-    func sendGrid() {
-        if let mock {
-            let g = !pacing.phaseLock ? nil : phase.step()
-            mock.setGrid(anchor: g?.anchor ?? 0, interval: g?.interval ?? 0)
-            return
-        }
-        guard let conn else { return }
-        var m = Writer()
-        if !pacing.phaseLock || getenv("GM_NO_PHASE") != nil { // gamescope paces itself
-            m.u64(0)
-            m.u32(0)
-        } else {
-            guard let g = phase.step(), let anchor = conn.toHost(localNs: g.anchor) else { return }
-            if phase.takeDrain() { renderer.skipOne() }
-            m.u64(anchor)
-            m.u32(UInt32(g.interval))
-        }
-        conn.send(Msg.displayGrid, m.data)
+        session.start()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
     func applicationWillTerminate(_ n: Notification) {
-        releaseAll()
+        session.stop()
         setSystemHotKeys(enabled: true)
-        conn?.stop()
     }
 
-    // MARK: Session
+    // MARK: SessionShell
 
-    func wantedSize() -> (Int, Int) {
-        if let s = options.size { return s }
+    var pixelSize: CGSize {
         let scale = window.backingScaleFactor
-        return (Int(view.bounds.width * scale) & ~1, Int(view.bounds.height * scale) & ~1)
+        return CGSize(width: view.bounds.width * scale, height: view.bounds.height * scale)
     }
-    func refreshMhz() -> UInt32 {
-        UInt32(((options.refresh ?? capHz) ?? Double(window.screen?.maximumFramesPerSecond ?? 60)) * 1000)
-    }
+    var scale: Double { window.backingScaleFactor }
+    var maxFPS: Double { Double(window.screen?.maximumFramesPerSecond ?? 60) }
+    var shortestRefresh: Double { window.screen?.minimumRefreshInterval ?? 1.0 / 120 }
+    var fullScreen: Bool { window.styleMask.contains(.fullScreen) }
+    var vrr: Bool { fullScreen && window.screen?.variableRefresh == true }
+    var displayColorSpace: CGColorSpace? { window.screen?.colorSpace?.cgColorSpace }
+    var focused: Bool { window.isKeyWindow }
+    func status(_ line: String) { window.title = "GMStream — \(line)" }
+    func cursorChanged() { makeCursor() }
+    func pacingChanged() { settings.load() }
 
-    /// Once a second: cap the host just under the panel's real top rate when
-    /// it is below the nominal one (only measurable before the cap is set).
-    func checkPanelRate() {
-        guard capHz == nil, !pacing.phaseLock, options.refresh == nil, let screen = window.screen,
-              let top = panel.top(nominalHz: Double(screen.maximumFramesPerSecond)) else { return }
-        capHz = 1e9 / (1e9 / top + 200_000)
-        // Shorter than the host's spacing on average, or one frame pushed
-        // back would push every later one too (it drains 0.1 ms a frame).
-        renderer.setHoldSpacing(1e9 / top + 100_000)
-        NSLog("gmstream: panel tops out at %.3f Hz; capping the host at %.3f Hz", top, capHz!)
-        sendConfigure()
-    }
-
-    var mock: MockSource?
-
-    func connect() {
-        closedReason = nil
-        if options.mock {
-            let (w, h) = options.size ?? (1920, 1080)
-            let m = MockSource(device: renderer.device, width: w, height: h, refreshHz: options.refresh ?? 60)
-            m.start { [renderer] image, timing in renderer.submit(image, timing) }
-            mock = m
-            DispatchQueue.main.async {
-                self.view.streamSize = CGSize(width: w, height: h)
-                // As if the host showed a cursor with no usable image: macOS's arrow.
-                self.cursor(width: 1, height: 1, hotX: 0, hotY: 0, rgba: Data())
-            }
-            return
-        }
-        // Resolving the host can take seconds: not on the main thread. A
-        // newer attempt (Reconnect, a settings change) supersedes this one.
-        connectAttempt += 1
-        let attempt = connectAttempt, host = options.host, port = options.port
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result { try Connection(host: host, port: port) }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, attempt == self.connectAttempt else { return }
-                switch result {
-                case .success(let c): self.start(c)
-                case .failure(let e): self.closed(reason: e.localizedDescription)
-                }
-            }
-        }
+    func setPointerLock(_ on: Bool) {
+        guard on != session.lockActive else { return }
+        session.lockActive = on
+        CGAssociateMouseAndMouseCursorPosition(on ? 0 : 1)
+        updateCursor()
     }
 
-    var connectAttempt = 0
+    // MARK: Menu and settings
 
-    func start(_ c: Connection) {
-        c.delegate = self
-        conn = c
-        let (w, h) = wantedSize()
-        // Until the first frame says otherwise (the cursor's scale needs it).
-        view.streamSize = CGSize(width: w, height: h)
-        c.start(width: w, height: h, refreshMhz: refreshMhz(), kbps: options.mbps * 1000,
-                codecMask: clientCodecs, preferred: options.codec)
-        c.keepAwake(options.keepWiFiAwake)
-        c.send(Msg.vrrPolicy, Data([pacing.steamVRR]))
-    }
-
-    @objc func reconnect() {
-        conn?.stop()
-        conn = nil
-        connect()
-    }
-
-    func received(frame f: Frame) {
-        guard let conn, gate.admit(f, requestKeyframe: { conn.send(Msg.keyframe) }, stats: stats) else { return }
-        let timing = FrameTiming(frame: f) { conn.toLocal(hostNs: $0) }
-        if !decoder.decode(f, timing: timing) {
-            conn.send(Msg.keyframe)
-            return
-        }
-        stats.add(bytes: f.bitstream.count, netMs: nil, totalMs: nil)
-        if CGFloat(f.width) != view.streamSize.width || CGFloat(f.height) != view.streamSize.height {
-            DispatchQueue.main.async { self.view.streamSize = CGSize(width: f.width, height: f.height) }
-        }
-    }
-
-    func pyrowave(_ p: PyroWavePacket) {
-        guard let conn, let pyro else { return }
-        if getenv("GM_DEBUG_NET") != nil, let enc = conn.toLocal(hostNs: p.encodedNs) {
-            // Measuring: per frame, when its first packet arrived (after the
-            // host finished encoding), how long the rest took, and the
-            // largest gap between two of its packets.
-            if p.index == 0 { netFirst = (p.frameId, p.receivedNs, p.receivedNs, 0, 0, 0) }
-            if var n = netFirst, n.id == p.frameId {
-                // How long after arriving the app read a packet (app stalls).
-                n.readLag = max(n.readLag, p.readNs &- p.receivedNs)
-                if p.index > 0 {
-                    let gap = p.receivedNs &- n.last
-                    if gap > n.maxGap { n.maxGap = gap; n.gapAt = Int(p.index) }
-                    n.last = p.receivedNs
-                }
-                netFirst = n
-                if p.index == p.count - 1 {
-                    FileHandle.standardError.write(String(format: "net t %.3f first %.2f burst %.2f maxgap %.2f at %d/%d readlag %.2f\n",
-                        Double(n.first) / 1e6, Double(Int64(n.first) - Int64(enc)) / 1e6, Double(p.receivedNs - n.first) / 1e6,
-                        Double(n.maxGap) / 1e6, n.gapAt, p.count, Double(n.readLag) / 1e6).data(using: .utf8)!)
-                }
-            }
-        }
-        stats.addBytes(p.payload.count)
-        pyro.packet(p) {
-            FrameTiming(slotNs: p.slotNs, encodedNs: p.encodedNs, received: nowNs()) { conn.toLocal(hostNs: $0) }
-        }
-        if CGFloat(p.width) != view.streamSize.width || CGFloat(p.height) != view.streamSize.height {
-            DispatchQueue.main.async { self.view.streamSize = CGSize(width: p.width, height: p.height) }
-        }
-    }
-
-    func audio(_ packet: Data) {
-        guard let player, let samples = opus?.decode(packet), !samples.isEmpty else { return }
-        player.push(samples)
-    }
-
-    func helloAck(codec: UInt8) {
-        if let seq = getenv("GM_TEST_KEYS").map({ String(cString: $0) }) {
-            // Measuring: after 4 s, sends evdev key events "29+,42+,15+,15-,42-,29-".
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                for ev in seq.split(separator: ",") {
-                    guard let k = UInt16(ev.dropLast()) else { continue }
-                    self.sendKey(k, ev.hasSuffix("+"))
-                    usleep(30_000)
-                }
-            }
-        }
-        codecName = ["H.264", "HEVC", "AV1", "PyroWave"][Int(Swift.min(codec, 3))]
-        pads.resend()
-    }
-
-    func rumble(index: Int, strong: UInt16, weak: UInt16, ms: Int) {
-        pads.rumble(index: index, strong: strong, weak: weak, ms: ms)
-    }
-
-    func closed(reason: String) {
-        guard closedReason == nil else { return }
-        closedReason = reason
-        NSLog("gmstream: closed: %@", reason)
-        releaseAll()
-        setLock(false)
-        conn?.stop()
-        conn = nil
-        updateTitle()
-        if reason != "Another client connected" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                if self?.conn == nil { self?.connect() }
-            }
-        }
-    }
-
-    /// Stats once a second: in the title bar and, unless hidden (Cmd+I), in
-    /// an overlay that stays visible in full screen.
-    func updateTitle() {
-        if let r = closedReason {
-            window.title = "GMStream — \(options.host) — \(r)"
-            hudText = r
-            updateOverlay()
-            return
-        }
-        let s = stats.take()
-        let st = stages.take()
-        let pad = { (s: String, n: Int) in s.padding(toLength: n, withPad: " ", startingAt: 0) }
-        let num = { (v: Double?) in pad(fmt(v), 6) }
-        let total = st.rows.first { $0.name == "total" }!
-        var lines = [
-            "\(Int(view.streamSize.width))x\(Int(view.streamSize.height)) \(codecName) \(st.shown) fps shown " +
-                "\(String(format: "%.0f", s.mbps)) Mbps",
-            "\(pad("ms, 5 s", 9))\(pad("p50", 7))\(pad("p90", 7))max",
-        ]
-        for row in st.rows {
-            if ["to macOS", "total", "spacing"].contains(row.name) { lines.append(String(repeating: "─", count: 27)) }
-            lines.append("\(pad(row.name, 9))\(num(row.p50)) \(num(row.p90)) \(fmt(row.max))")
-        }
-        let phaseText = (options.pacingAuto ? "pacing auto (\(pacing.vrr ? "VRR: hold" : "fixed refresh: phase lock")), " : "") +
-            (!pacing.phaseLock ? "phase: off" : phase.summary())
-        lines.append(phaseText + "  compositing \(renderer.compositingStatus)  cursor \(cursorMode)")
-        let hold = renderer.holdStatus(offset: conn?.clockOffsetNs)
-        lines += [
-            "rtt \(fmt(conn.map { Double($0.rttNs) / 1e6 })) ms  skipped \(st.skipped)  dropped \(st.dropped)  gaps \(s.gaps)" +
-                (pacing.hold ? "  hold \(fmt(hold.delayNs.map { $0 / 1e6 })) ms, late \(hold.late)" : ""),
-            "audio \(player.map { String(format: "%.0f ms buffered", $0.bufferedMs) } ?? (opus == nil ? "no Opus decoder" : "no output"))" +
-                "  pads \(pads.connected)",
-        ]
-        window.title = "GMStream — \(lines[0]) · present→screen p90 \(fmt(total.p90)) ms (p50 \(fmt(total.p50)))"
-        hudText = lines.joined(separator: "\n")
-        if options.statsLog {
-            print(lines.joined(separator: " | ").replacingOccurrences(of: "─", with: ""))
-            fflush(stdout)
-        }
-        updateOverlay()
-    }
-
-    /// The stats overlay's text (updated once a second).
-    var hudText = ""
-
-    /// Redraws the stats overlay into the video (Latency.swift, renderOverlay).
-    func updateOverlay() {
-        guard options.showStats, !hudText.isEmpty else { return renderer.setOverlay(nil, inset: 0) }
-        let scale = window.backingScaleFactor
-        renderer.setOverlay(renderOverlay(text: hudText, chart: chart, scale: scale), inset: 8 * scale)
-    }
+    @objc func reconnect() { session.reconnect() }
 
     @objc func toggleStats() {
         options.showStats.toggle()
         options.save()
-        updateOverlay()
+        session.updateOverlay()
         settings.load()
     }
 
     lazy var settings: SettingsWindow = {
         let s = SettingsWindow()
-        s.onChange = { [weak self] change in self?.apply(change) }
-        s.pacingNow = { [weak self] in
-            guard let self else { return (options.phaseLock, options.holdFrames, "") }
-            let p = self.pacing
-            let note = !options.pacingAuto ? "Steam's VRR toggle is left to you."
-                : p.vrr ? "Variable-refresh display in full screen: fixed delay, no phase lock; Steam's VRR is forced on (the game runs free)."
-                : "Fixed refresh (or a window): phase lock, no fixed delay; Steam's VRR is off (its toggle greyed)."
-            return (p.phaseLock, p.hold, note)
-        }
+        s.onChange = { [weak self] change in self?.session.apply(change) }
+        s.pacingNow = { [weak self] in self?.session.pacingNow() ?? (options.phaseLock, options.holdFrames, "") }
         return s
     }()
 
     @objc func openSettings() { settings.show() }
 
-    func apply(_ change: SettingsWindow.Change) {
-        switch change {
-        case .connection: reconnect()
-        case .bitrate:
-            var m = Writer()
-            m.u32(options.mbps * 1000)
-            conn?.send(Msg.bitrate, m.data)
-        case .display: sendConfigure()
-        case .stats: updateOverlay()
-        case .present: applyPresentMode()
-        case .keepAwake: conn?.keepAwake(options.keepWiFiAwake)
-        case .phaseLock: applyPresentMode() // pacing settings: phase lock, hold, auto
-        }
-    }
-
-    func sendConfigure() {
-        guard let conn else { return }
-        let (w, h) = wantedSize()
-        var m = Writer()
-        m.u16(UInt16(w)); m.u16(UInt16(h)); m.u32(refreshMhz())
-        conn.send(Msg.configure, m.data)
-    }
+    // MARK: Window
 
     func windowDidResize(_ n: Notification) {
         configureTimer?.invalidate()
         configureTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: false) { [weak self] _ in
-            self?.sendConfigure()
+            self?.session.sendConfigure()
         }
-        rescaleCursor()
+        makeCursor()
     }
     func windowDidMove(_ n: Notification) { updateCursor() }
     func windowDidChangeScreen(_ n: Notification) {
-        if let s = window.screen {
-            vsync.start(on: s)
-            phase.restart(refreshHz: Double(s.maximumFramesPerSecond))
-        }
-        capHz = nil
-        renderer.setHoldSpacing(nil)
-        panel.reset()
-        applyPresentMode()
+        session.screenChanged()
         windowDidResize(n)
     }
-    func windowDidEnterFullScreen(_ n: Notification) { applyPresentMode() }
-    func windowDidExitFullScreen(_ n: Notification) { applyPresentMode() }
-
-    /// Vsync on, except in full screen with "lowest latency" set. The settings
-    /// alone decide, on a variable-refresh (Adaptive-Sync) display too (there,
-    /// with vsync on and pacing off, the panel refreshes when a frame arrives:
-    /// measured display stage 3.3 ms). Entering or leaving full screen changes
-    /// how frames reach the panel (flipped straight to it or composited), so
-    /// the phase lock starts over.
-    func applyPresentMode() {
-        let wasFullScreen = fullScreen, was = pacing
-        fullScreen = window.styleMask.contains(.fullScreen)
-        let screen = window.screen
-        pacing = Pacing(options: options, fullScreen: fullScreen, screen: screen)
-        let immediate = options.immediateFullScreen && fullScreen
-        renderer.setVsync(!immediate)
-        renderer.holdFrames = pacing.hold
-        updateCursor()
-        phase.setImmediate(immediate)
-        if (fullScreen != wasFullScreen || pacing.phaseLock != was.phaseLock) && !immediate { phase.restart() }
-        if pacing.steamVRR != was.steamVRR { conn?.send(Msg.vrrPolicy, Data([pacing.steamVRR])) }
-        settings.load()
-        // Tagged sRGB, macOS converts to the display; tagged as the display's
-        // own color space, the pixels go to the panel unconverted.
-        renderer.layer.colorspace = options.vividColors
-            ? screen?.colorSpace?.cgColorSpace : CGColorSpace(name: CGColorSpace.sRGB)
-    }
+    func windowDidEnterFullScreen(_ n: Notification) { session.applyPresentMode() }
+    func windowDidExitFullScreen(_ n: Notification) { session.applyPresentMode() }
 
     func windowDidResignKey(_ n: Notification) {
-        releaseAll()
-        setLock(false)
+        session.releaseAll()
+        setPointerLock(false)
         updateCursor()
         setSystemHotKeys(enabled: true)
     }
     func windowDidBecomeKey(_ n: Notification) {
-        if locked { setLock(true) }
+        if session.locked { setPointerLock(true) }
         pointerInView = view.bounds.contains(view.convert(window.mouseLocationOutsideOfEventStream, from: nil))
         updateCursor()
         setSystemHotKeys(enabled: false)
@@ -840,172 +300,101 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Conne
 
     func key(_ code: UInt16, down: Bool, repeat: Bool) {
         guard let k = evdevKeys[code], !`repeat` else { return } // gamescope repeats keys itself
-        if down ? held.insert(k).inserted : held.remove(k) != nil { sendKey(k, down) }
+        session.key(k, down: down)
     }
     func modifier(_ code: UInt16) {
         guard modifierKeys.contains(code), let k = evdevKeys[code] else { return }
-        let down = !held.contains(k)
-        if down { held.insert(k) } else { held.remove(k) }
-        sendKey(k, down)
-    }
-    func sendKey(_ k: UInt16, _ down: Bool) {
-        var m = Writer()
-        m.u16(k); m.u8(down ? 1 : 0)
-        conn?.send(Msg.key, m.data)
-    }
-    func releaseAll() {
-        for k in held { sendKey(k, false) }
-        held.removeAll()
+        session.key(k, down: !session.held.contains(k))
     }
 
     func moved(_ e: NSEvent) {
-        let r = view.videoRect
-        if lockActive {
+        let r = session.videoRect(in: view.bounds.size)
+        if session.lockActive {
             // Relative motion in stream pixels.
-            let s = view.streamSize.width / max(r.width, 1)
-            var m = Writer()
-            m.f32(Float(e.deltaX * s)); m.f32(Float(e.deltaY * s))
-            conn?.send(Msg.motion, m.data)
+            let s = session.streamSize.width / max(r.width, 1)
+            session.motion(dx: e.deltaX * s, dy: e.deltaY * s)
             return
         }
-        renderer.cursorMoved()
         let p = view.convert(e.locationInWindow, from: nil)
-        let x = min(1, max(0, (p.x - r.minX) / r.width))
-        let y = min(1, max(0, (r.maxY - p.y) / r.height)) // AppKit's y points up
-        var m = Writer()
-        m.f32(Float(x)); m.f32(Float(y))
-        conn?.send(Msg.position, m.data)
+        session.position(x: (p.x - r.minX) / r.width, y: (r.maxY - p.y) / r.height) // AppKit's y points up
     }
 
-    func button(_ code: UInt16, down: Bool) {
-        if down && locked && !lockActive { setLock(true); return }
-        var m = Writer()
-        m.u16(code); m.u8(down ? 1 : 0)
-        conn?.send(Msg.button, m.data)
-    }
     func otherButton(_ n: Int, down: Bool) {
         let codes: [Int: UInt16] = [2: 0x112, 3: 0x113, 4: 0x114] // middle, back, forward
-        if let c = codes[n] { button(c, down: down) }
+        if let c = codes[n] { session.button(c, down: down) }
     }
 
     func scroll(_ e: NSEvent) {
-        // In browser wheel pixels (100 per notch), then as the web client does:
-        // Wayland axis units 15 per notch, v120 120 per notch.
+        // In browser wheel pixels (100 per notch).
         let px = e.hasPreciseScrollingDeltas ? (-e.scrollingDeltaX, -e.scrollingDeltaY) : (-e.deltaX * 100, -e.deltaY * 100)
-        var m = Writer()
-        m.f32(Float(px.0 * 0.15)); m.f32(Float(px.1 * 0.15))
-        m.i16(Int16(clamping: Int((px.0 * 1.2).rounded()))); m.i16(Int16(clamping: Int((px.1 * 1.2).rounded())))
-        conn?.send(Msg.scroll, m.data)
+        session.scroll(dx: px.0, dy: px.1)
     }
 
-    // MARK: Cursor and pointer lock
+    // MARK: Cursor
     //
-    // In absolute mode, when the host shows a cursor, it is drawn here at the
-    // local mouse position, with no network delay. Otherwise the host handles
-    // it: hidden, drawn by the game into the picture, or a locked pointer. In
-    // full screen on a variable-refresh display it is drawn into the frame:
-    // any cursor sprite the window server moves there (a transparent one too)
-    // makes the panel refresh at its fixed top rate while the mouse moves, and
-    // frames wait for that grid (display stage 3.2 -> 7.3 ms p50 in --mock).
-    // Elsewhere the display refreshes at a fixed rate anyway: the macOS cursor.
+    // In full screen on a variable-refresh display the host's cursor is drawn
+    // into the frame: any cursor sprite the window server moves there (a
+    // transparent one too) makes the panel refresh at its fixed top rate
+    // while the mouse moves, and frames wait for that grid (display stage
+    // 3.2 -> 7.3 ms p50 in --mock). Elsewhere the display refreshes at a
+    // fixed rate anyway: the macOS cursor.
 
-    /// The host's cursor image (nil: it shows none), kept to rebuild at a new scale.
-    var hostCursor: (width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data)?
     /// The cursor to show, at the current scale, and its image as a texture.
     private var localCursor: (cursor: NSCursor, texture: MTLTexture?)?
-    /// Who draws it, for the stats: "host", "frame" (into ours) or "macOS".
-    private var cursorMode = "host"
 
-    func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data) {
-        hostCursor = width > 0 && height > 0 ? (width, height, hotX, hotY, rgba) : nil
-        makeCursor()
-    }
-
-    /// The stream or window size changed: the cursor's scale with it.
-    func rescaleCursor() { makeCursor() }
-
+    /// The cursor to show at the current scale (after it, the stream or the
+    /// window size changed).
     private func makeCursor() {
         defer { updateCursor() }
-        guard let (width, height, hotX, hotY, rgba) = hostCursor else {
+        guard let host = session.clientCursor else {
             localCursor = nil
             return
         }
         var cursor = NSCursor.arrow // shown, but no image we can use
-        if rgba.count >= width * height * 4,
-           let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8,
-                                      samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
-                                      bitmapFormat: [.alphaNonpremultiplied], bytesPerRow: width * 4, bitsPerPixel: 32),
-           let dst = rep.bitmapData {
-            rgba.withUnsafeBytes { dst.update(from: $0.bindMemory(to: UInt8.self).baseAddress!, count: width * height * 4) }
+        if let image = host.image {
             // Same size as in the stream: stream pixels → view points.
-            let s = view.videoRect.width / max(view.streamSize.width, 1)
-            let image = NSImage(size: NSSize(width: CGFloat(width) * s, height: CGFloat(height) * s))
-            image.addRepresentation(rep)
-            cursor = NSCursor(image: image, hotSpot: NSPoint(x: CGFloat(hotX) * s, y: CGFloat(hotY) * s))
+            let s = session.videoRect(in: view.bounds.size).width / max(session.streamSize.width, 1)
+            cursor = NSCursor(image: NSImage(cgImage: image, size: NSSize(width: CGFloat(host.width) * s, height: CGFloat(host.height) * s)),
+                              hotSpot: NSPoint(x: CGFloat(host.hotX) * s, y: CGFloat(host.hotY) * s))
         }
-        localCursor = (cursor, texture(for: cursor))
-    }
-
-    /// `cursor`'s image in device pixels, premultiplied, top row first.
-    private func texture(for cursor: NSCursor) -> MTLTexture? {
         let scale = window.backingScaleFactor
-        let w = Int((cursor.image.size.width * scale).rounded(.up)), h = Int((cursor.image.size.height * scale).rounded(.up))
-        guard w > 0, h > 0,
-              let g = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
-              let data = g.data else { return nil }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: g, flipped: false)
-        cursor.image.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
-        NSGraphicsContext.restoreGraphicsState()
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
-        desc.usage = .shaderRead
-        let t = renderer.device.makeTexture(descriptor: desc)
-        t?.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data, bytesPerRow: w * 4)
-        return t
+        let texture = cursor.image.cgImage(forProposedRect: nil, context: nil, hints: nil).flatMap {
+            renderer.texture(from: $0, width: Int((cursor.image.size.width * scale).rounded(.up)),
+                             height: Int((cursor.image.size.height * scale).rounded(.up)))
+        }
+        localCursor = (cursor, texture)
     }
 
     /// Applies who draws the cursor (above) after any change to the host's
     /// cursor, the pointer lock, focus, where the pointer is, the window's
     /// place, or the present mode. NSCursor.hide() nests, so one flag owns it.
     func updateCursor() {
+        let vrr = session.pacing.vrr, lockActive = session.lockActive
         let over = pointerInView && window.isKeyWindow
         let show = localCursor != nil && !lockActive
-        let hide = lockActive || (over && (!show || pacing.vrr))
-        cursorMode = !show ? "host" : pacing.vrr ? "frame" : "macOS"
+        let hide = lockActive || (over && (!show || vrr))
+        session.cursorMode = !show ? "host" : vrr ? "frame" : "macOS"
         if hide != cursorHidden {
             cursorHidden = hide
             if hide { NSCursor.hide() } else { NSCursor.unhide() }
         }
         view.cursor = localCursor?.cursor ?? .arrow
         window.invalidateCursorRects(for: view)
-        if over && show && !pacing.vrr { view.cursor.set() }
-        guard over && show && pacing.vrr, let texture = localCursor?.texture else {
+        if over && show && !vrr { view.cursor.set() }
+        guard over && show && vrr, let texture = localCursor?.texture else {
             renderer.setCursor(nil)
             return
         }
         // The drawable's top left in global display coordinates (points, y
-        // down from the top of the main display), as CGEvent reports the mouse.
+        // down from the top of the main display), as CGEvent reports the
+        // mouse; read on the render thread as each frame is drawn.
         let scale = window.backingScaleFactor
         let r = window.convertToScreen(view.convert(view.bounds, to: nil))
-        let top = (NSScreen.screens.first?.frame.maxY ?? 0) - r.maxY
+        let origin = CGPoint(x: r.minX, y: (NSScreen.screens.first?.frame.maxY ?? 0) - r.maxY)
         let hot = localCursor!.cursor.hotSpot
-        renderer.setCursor(texture, hotSpot: CGPoint(x: hot.x * scale, y: hot.y * scale),
-                           origin: CGPoint(x: r.minX, y: top), scale: scale,
-                           refresh: window.screen?.minimumRefreshInterval ?? 1.0 / 120)
-    }
-
-    /// The game wants relative mouse input: capture the pointer.
-    func pointerLock(_ on: Bool) {
-        locked = on
-        setLock(on && window.isKeyWindow)
-    }
-
-    func setLock(_ on: Bool) {
-        guard on != lockActive else { return }
-        lockActive = on
-        CGAssociateMouseAndMouseCursorPosition(on ? 0 : 1)
-        updateCursor()
+        renderer.setCursor(texture, hotSpot: CGPoint(x: hot.x * scale, y: hot.y * scale), refresh: shortestRefresh) {
+            CGEvent(source: nil).map { CGPoint(x: ($0.location.x - origin.x) * scale, y: ($0.location.y - origin.y) * scale) }
+        }
     }
 }
 

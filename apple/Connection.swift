@@ -9,7 +9,7 @@ enum Msg {
     static let hello: UInt8 = 0x01, configure: UInt8 = 0x02, keyframe: UInt8 = 0x03, bitrate: UInt8 = 0x04,
         key: UInt8 = 0x05, button: UInt8 = 0x06, motion: UInt8 = 0x07, position: UInt8 = 0x08,
         scroll: UInt8 = 0x09, gamepad: UInt8 = 0x0a, gamepadRemove: UInt8 = 0x0b, ping: UInt8 = 0x0c, displayGrid: UInt8 = 0x0d,
-        vrrPolicy: UInt8 = 0x0e
+        vrrPolicy: UInt8 = 0x0e, touch: UInt8 = 0x0f
     // Host → client.
     static let helloAck: UInt8 = 0x81, cursor: UInt8 = 0x82, pointerLock: UInt8 = 0x83,
         rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86

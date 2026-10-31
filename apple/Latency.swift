@@ -2,22 +2,54 @@
 // chart of the last 10 s (the same chart as the web client's, but ending on
 // the screen rather than at the canvas draw).
 
+#if os(macOS)
 import AppKit
+typealias PlatformColor = NSColor
+typealias PlatformFont = NSFont
+#else
+import UIKit
+typealias PlatformColor = UIColor
+typealias PlatformFont = UIFont
+#endif
 
-/// p50, p90 and max per stage over the last 5 s (~300 frames at 60 fps;
-/// one second is too few frames for a stable p90). The target to optimize
-/// is the total's p90.
+/// Runs `body` with `g` as the current context for AppKit's or UIKit's text
+/// drawing; `g` is already flipped (y down).
+func withTextContext(_ g: CGContext, _ body: () -> Void) {
+    #if os(macOS)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: g, flipped: true)
+    body()
+    NSGraphicsContext.restoreGraphicsState()
+    #else
+    UIGraphicsPushContext(g)
+    body()
+    UIGraphicsPopContext()
+    #endif
+}
+
+/// The OS that shows the frames, for the stats.
+let systemName: String = {
+    #if os(macOS)
+    return "macOS"
+    #else
+    return "iPadOS"
+    #endif
+}()
+
+/// p50, p99 and max per stage over the last 5 s (300 frames at 60 fps, 600
+/// at 120: p99 is the 3rd or 6th worst). The target to optimize is the
+/// total's p99: one frame in ten is too many to leave out.
 final class StageStats {
-    // "to macOS": gamescope present → handed to macOS (total − display).
+    // "to macOS" (or iPadOS): gamescope present → handed to the system (total − display).
     // "spacing": per frame, |interval between presentations − interval
     // between gamescope presents|; 0 keeps the host's frame spacing exactly.
     // It measures the result whatever the pacing mode, phase lock or not.
-    static let stages = ["encode", "network", "decode", "hold", "render", "to macOS", "display", "total", "spacing"]
+    static let stages = ["encode", "network", "decode", "hold", "render", "to \(systemName)", "display", "total", "spacing"]
     static let window: UInt64 = 5_000_000_000
 
     struct Row {
         let name: String
-        let p50: Double?, p90: Double?, max: Double?
+        let p50: Double?, p99: Double?, max: Double?
     }
 
     private let lock = NSLock()
@@ -62,7 +94,7 @@ final class StageStats {
         let rows = Self.stages.enumerated().map { i, name -> Row in
             let s = frames.compactMap { $0.values[i] }.sorted()
             let pct = { (p: Double) in s.isEmpty ? nil : s[min(s.count - 1, Int(Double(s.count) * p))] }
-            return Row(name: name, p50: pct(0.5), p90: pct(0.9), max: s.last)
+            return Row(name: name, p50: pct(0.5), p99: pct(0.99), max: s.last)
         }
         let r = (rows, shown, skipped, dropped)
         shown = 0; skipped = 0; dropped = 0
@@ -88,7 +120,7 @@ final class LatencyChart {
         lock.unlock()
     }
 
-    /// Draws into `g` (y down, the current NSGraphicsContext) at the origin.
+    /// Draws into `g` (y down, the current text context) at the origin.
     func draw(in g: CGContext, width W: Double, height H: Double) {
         let now = CACurrentMediaTime()
         lock.lock()
@@ -100,7 +132,7 @@ final class LatencyChart {
         let x = { (t: Double) in (t - (now - self.window_)) / self.window_ * W }
 
         // Recessive grid: the top of the scale and its midpoint, labelled.
-        g.setStrokeColor(NSColor(white: 1, alpha: 0.13).cgColor)
+        g.setStrokeColor(PlatformColor(white: 1, alpha: 0.13).cgColor)
         g.setLineWidth(1)
         for v in [top, top / 2] {
             g.move(to: CGPoint(x: 0, y: y(v).rounded() + 0.5))
@@ -108,8 +140,8 @@ final class LatencyChart {
         }
         g.strokePath()
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
-            .foregroundColor: NSColor(red: 0xc3 / 255.0, green: 0xc2 / 255.0, blue: 0xb7 / 255.0, alpha: 1),
+            .font: PlatformFont.monospacedSystemFont(ofSize: 10, weight: .regular),
+            .foregroundColor: PlatformColor(red: 0xc3 / 255.0, green: 0xc2 / 255.0, blue: 0xb7 / 255.0, alpha: 1),
         ]
         ("\(Int(top)) ms" as NSString).draw(at: CGPoint(x: 2, y: -1), withAttributes: attrs)
         ("\(Int(top / 2))" as NSString).draw(at: CGPoint(x: 2, y: y(top / 2) - 13), withAttributes: attrs)
@@ -127,7 +159,7 @@ final class LatencyChart {
             runs[runs.count - 1].append(p)
             last = p.t
         }
-        g.setFillColor(NSColor(red: 0xe8 / 255.0, green: 0xa3 / 255.0, blue: 0x3d / 255.0, alpha: 0.55).cgColor)
+        g.setFillColor(PlatformColor(red: 0xe8 / 255.0, green: 0xa3 / 255.0, blue: 0x3d / 255.0, alpha: 0.55).cgColor)
         for run in runs where run.count > 1 {
             g.move(to: CGPoint(x: x(run[0].t), y: y(run[0].base)))
             for p in run.dropFirst() { g.addLine(to: CGPoint(x: x(p.t), y: y(p.base))) }
@@ -135,7 +167,7 @@ final class LatencyChart {
             g.closePath()
         }
         g.fillPath()
-        g.setStrokeColor(NSColor(red: 0x39 / 255.0, green: 0x87 / 255.0, blue: 0xe5 / 255.0, alpha: 1).cgColor)
+        g.setStrokeColor(PlatformColor(red: 0x39 / 255.0, green: 0x87 / 255.0, blue: 0xe5 / 255.0, alpha: 1).cgColor)
         g.setLineWidth(1.5)
         g.setLineJoin(.round)
         for run in runs {
@@ -155,11 +187,11 @@ final class LatencyChart {
 /// 6.9 ms as views, 3.6 without.
 func renderOverlay(text: String, chart: LatencyChart, scale: Double) -> CGContext? {
     let attrs: [NSAttributedString.Key: Any] = [
-        .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-        .foregroundColor: NSColor(red: 0.6, green: 1, blue: 0.6, alpha: 1),
+        .font: PlatformFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+        .foregroundColor: PlatformColor(red: 0.6, green: 1, blue: 0.6, alpha: 1),
     ]
     let str = NSAttributedString(string: text, attributes: attrs)
-    let tb = str.boundingRect(with: NSSize(width: 4000, height: 4000), options: [.usesLineFragmentOrigin])
+    let tb = str.boundingRect(with: CGSize(width: 4000, height: 4000), options: [.usesLineFragmentOrigin], context: nil)
     let chartW = 240.0, chartH = 56.0, padX = 8.0, top = 4.0, gap = 4.0, bottom = 6.0
     let w = max(tb.width, chartW) + 2 * padX, h = top + tb.height + gap + chartH + bottom
     let pw = Int((w * scale).rounded(.up)), ph = Int((h * scale).rounded(.up))
@@ -169,16 +201,15 @@ func renderOverlay(text: String, chart: LatencyChart, scale: Double) -> CGContex
     else { return nil }
     g.translateBy(x: 0, y: Double(ph))
     g.scaleBy(x: scale, y: -scale)
-    NSGraphicsContext.saveGraphicsState()
-    defer { NSGraphicsContext.restoreGraphicsState() }
-    NSGraphicsContext.current = NSGraphicsContext(cgContext: g, flipped: true)
-    g.setFillColor(NSColor(white: 0, alpha: 0.65).cgColor)
-    g.addPath(CGPath(roundedRect: CGRect(x: 0, y: 0, width: w, height: h), cornerWidth: 4, cornerHeight: 4, transform: nil))
-    g.fillPath()
-    str.draw(with: NSRect(x: padX, y: top, width: tb.width, height: tb.height), options: [.usesLineFragmentOrigin])
-    g.saveGState()
-    g.translateBy(x: padX, y: top + tb.height + gap)
-    chart.draw(in: g, width: chartW, height: chartH)
-    g.restoreGState()
+    withTextContext(g) {
+        g.setFillColor(PlatformColor(white: 0, alpha: 0.65).cgColor)
+        g.addPath(CGPath(roundedRect: CGRect(x: 0, y: 0, width: w, height: h), cornerWidth: 4, cornerHeight: 4, transform: nil))
+        g.fillPath()
+        str.draw(with: CGRect(x: padX, y: top, width: tb.width, height: tb.height), options: [.usesLineFragmentOrigin], context: nil)
+        g.saveGState()
+        g.translateBy(x: padX, y: top + tb.height + gap)
+        chart.draw(in: g, width: chartW, height: chartH)
+        g.restoreGState()
+    }
     return g
 }

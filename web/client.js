@@ -62,6 +62,7 @@ const DEFAULTS = {
   audioBufferMs: 20,  // jitter buffer target
   gapWaitMs: 30,      // how long a missing frame may hold up later ones
   rawMouse: true,     // Pointer Lock without OS acceleration
+  forceClientCursor: false, // an arrow also where the host shows no cursor
   smoothing: true,    // scale the video smoothly (else pixelated)
   videoStreams: 'auto', // 'auto', 'per-frame', 'one' or 'datagrams' (see helloVideoFlags)
   hud: true,
@@ -273,6 +274,7 @@ class Session {
     this.audio?.close();
     if (document.pointerLockElement) document.exitPointerLock();
     canvas.style.cursor = '';
+    hostCursorHidden = false;
     session = null;
     if (final) wantConnected = false;
     if (quiet) return;
@@ -728,10 +730,13 @@ class AudioPlayer {
 /* ---- cursor ------------------------------------------------------------ */
 
 const cursorCanvas = document.createElement('canvas');
+let hostCursorHidden = false;
+function showHiddenCursor() { canvas.style.cursor = settings.forceClientCursor ? 'default' : 'none'; }
 function setCursor(v, body) {
   const w = v.getUint16(0, true), h = v.getUint16(2, true);
   const hx = v.getInt16(4, true), hy = v.getInt16(6, true);
-  if (w === 0 || h === 0) { canvas.style.cursor = 'none'; return; }
+  hostCursorHidden = w === 0 || h === 0;
+  if (hostCursorHidden) { showHiddenCursor(); return; }
   cursorCanvas.width = w; cursorCanvas.height = h;
   const c = cursorCanvas.getContext('2d');
   c.putImageData(new ImageData(new Uint8ClampedArray(body.slice(8, 8 + w * h * 4).buffer), w, h), 0, 0);
@@ -943,6 +948,7 @@ const field = name => panel.querySelector(`[name="${name}"]`);
 function applySettings() {
   hud.hidden = !settings.hud;
   canvas.style.imageRendering = settings.smoothing ? 'auto' : 'pixelated';
+  if (hostCursorHidden) showHiddenCursor();
   if (audioCtx) settings.audio ? audioCtx.resume() : audioCtx.suspend();
   session?.audio?.node.port.postMessage({ targetMs: settings.audioBufferMs });
 }

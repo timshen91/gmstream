@@ -1,4 +1,4 @@
-// Measuring (--mock): test frames made on this Mac and handed straight to the
+// Measuring (--mock): test frames made here and handed straight to the
 // renderer, with no host, network or decode, to measure the display path
 // alone. A frame is "presented by gamescope" when it is made, so the total
 // is made → on screen. Frames follow the display grid the phase lock would
@@ -9,6 +9,7 @@ import Metal
 final class MockSource {
     private let lock = NSLock()
     private var grid: (anchor: UInt64, interval: Double)?
+    private var stopped = false
     private let interval: Double
     private let frames: [[MTLTexture]]
 
@@ -16,8 +17,14 @@ final class MockSource {
         interval = 1e9 / refreshHz
         if getenv("GM_MOCK_COLORS") != nil {
             // A 4×2 card of known sRGB colors, BT.709 full range (color checks).
-            let card: [(Double, Double, Double)] = [(200, 100, 50), (50, 150, 200), (100, 200, 80), (230, 200, 170),
-                                                     (255, 0, 0), (0, 255, 0), (0, 0, 255), (128, 128, 128)]
+            // "gamut": pairs, each Display P3's primary (or yellow) beside
+            // sRGB's in P3 values: with Vivid colors on, the left of each
+            // pair is more saturated if the wide gamut reaches the panel.
+            let card: [(Double, Double, Double)] = String(cString: getenv("GM_MOCK_COLORS")) == "gamut"
+                ? [(255, 0, 0), (234, 51, 35), (0, 255, 0), (117, 251, 76),
+                   (0, 0, 255), (0, 0, 245), (255, 255, 0), (255, 255, 84)]
+                : [(200, 100, 50), (50, 150, 200), (100, 200, 80), (230, 200, 170),
+                   (255, 0, 0), (0, 255, 0), (0, 0, 255), (128, 128, 128)]
             let ycc = card.map { c -> (Double, Double, Double) in
                 let (r, g, b) = (c.0 / 255, c.1 / 255, c.2 / 255)
                 let y = 0.2126 * r + 0.7152 * g + 0.0722 * b
@@ -66,14 +73,20 @@ final class MockSource {
         lock.unlock()
     }
 
+    /// No more frames (within one frame interval).
+    func stop() {
+        lock.lock(); stopped = true; lock.unlock()
+    }
+
     func start(submit: @escaping (DecodedImage, FrameTiming) -> Void) {
         let thread = Thread { [self] in
             var next = Double(nowNs()) + interval
             var i = 0
             while true {
                 lock.lock()
-                let g = grid
+                let (g, stopped) = (grid, self.stopped)
                 lock.unlock()
+                if stopped { return }
                 if let g {
                     // The first grid point after the last frame.
                     let k = ((next - Double(g.anchor)) / g.interval).rounded(.up)

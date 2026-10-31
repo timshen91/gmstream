@@ -28,7 +28,7 @@ at the client's own resolution and refresh rate, with:
 - **Valve's input handling.** Mouse, keyboard and touch enter through
   gamescope's normal Wayland seat; gamepads appear as real controllers so
   Steam Input handles them.
-- **The built-in screen still works** (planned, §6.2). With no client
+- **The built-in screen still works** (panel mode, §6.3). With no client
   connected, the machine is a normal handheld/laptop running Game Mode.
 - **One binary, no host tools.** A single executable that runs directly on
   SteamOS: no container at run time, nothing installed on the read-only root.
@@ -209,9 +209,52 @@ feedback uploads (FF_RUMBLE) are tracked and played effects are forwarded as
 A reference client for latency work: plain UDP (PROTOCOL.md, "Plain UDP"),
 built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
 
-- Video: H.264/HEVC through VideoToolbox (NV12 output, converted in our
-  shader), PyroWave through its Metal port (`build/pyrowave`, same commit
+Source layout (shared with the iPad app, §3.8):
+- `apple/`: everything but the app shell. Session.swift is one stream
+  (connection, decoders, renderer, pacing, audio, controllers, stats, the
+  input messages); it asks the app for its view and screen through
+  `SessionShell`. The rest are the parts it uses (Connection, Video,
+  Phase, PanelRate, Latency, Audio, Gamepads, PyroWave, Mock, Options,
+  Stats, Trace), with `#if os(macOS)` where the platforms differ (vsync
+  off, the audio device buffer, text drawing).
+- `mac/Sources`: the AppKit app (main.swift: window, menu, keyboard
+  capture, the cursor decision tree, pointer lock; Settings.swift; Keys.swift,
+  macOS key codes; Display.swift, VRR detection).
+
+Unit tests (`mac/test.sh [Class[/testMethod]]`, needs Xcode for XCTest; ~10 s):
+`apple/` and `mac/Sources` except `main.swift` and `Settings.swift`,
+compiled with `mac/Tests` into one XCTest bundle. They cover:
+- the wire format, and Connection against a fake host on loopback (Hello,
+  control reassembly out of order, video fragments, audio, PyroWave
+  datagrams, the clock, keep-awake);
+- the decoders, fed by this Mac's VideoToolbox, PyroWave and Opus
+  encoders;
+- the phase lock against a simulated display and host (sweep, lock,
+  following a slower network, drain, vsync-off steering);
+- the hold, PanelRate, FrameGate, the stats, the options and Pacing;
+- Session against a fake host with a fake shell (the Hello's size and
+  rate, Auto pacing and Steam's VRR policy, vsync off waiting for the
+  grid, settings changes, keys, the click that recaptures the pointer,
+  positions, scrolling, letterboxing, the host cursor's image, the forced
+  client cursor).
+
+Not covered yet: the app shells (the macOS cursor decision tree, keyboard
+capture, iPad touch and pointer input), MetalRenderer, audio output,
+controllers.
+
+- Video: H.264/HEVC, and AV1 where the hardware decodes it (M3 and later:
+  `Decoder.hasAV1`; apple/AV1.swift), through VideoToolbox (NV12 output,
+  converted in our shader), PyroWave through its Metal port (`build/pyrowave`, same commit
   as the host). Frames are drawn on a CAMetalLayer from a render thread.
+- AV1 (2026-11-01; not yet run against the live host): VideoToolbox takes a
+  frame's OBUs without temporal delimiters, plus an av1C record built from
+  the sequence header. Clips from the test machine's `av1_vaapi` at 2560x1600, 40
+  Mb/s, paced at 120 Hz, decoded on the M4 (3 runs): AV1 2.1 / 2.4 / 4.1 ms
+  p50 / p90 / p99, HEVC 2.0 / 2.3 / 2.8; frame 100's luma is bit-identical
+  to dav1d. The encoder (AMD VCN) pads some heights (360 -> 362, 1080 ->
+  1082; 1600 stays): the frame header carries the size asked for, and the
+  renderer leaves out the rows below it. `mac/Tests/av1-640x360.obu` is
+  eight frames from that encoder.
 - Presentation (measured on an M4 MacBook Air, 60 Hz panel, in §5):
   - vsync on, and the private `CAMetalLayer.disableFIFO`: a newer drawable
     replaces a queued one. With FIFO, one frame that misses its refresh
@@ -245,8 +288,19 @@ built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
     full screen): the window server stops compositing (private
     `displayCompositingInternalStatus` 0) and frames flip straight to the
     panel: display stage ~4 ms instead of ~20. It tears: Metal's presented
-    times (the flips) land anywhere in the refresh, while with vsync they all
-    land at one phase (GM_DEBUG_FLIP logs each flip's phase).
+    times (the flips) land wherever the frame was submitted, while with vsync
+    they all land at one phase (GM_DEBUG_FLIP logs each flip's phase). The
+    phase lock stays on there: it steers the flips to 0.3 ms before the
+    vblank (`GM_FLIP_LEAD`), where a tear shows least, on the panel's grid
+    as measured from vsync-on flips (vsync stays on for the first second
+    of frames, and again after the screen changes, wakes or is
+    reconfigured, until it is measured). Mock on the built-in panel: 83% of
+    flips within 1.75 ms before the vblank, display 3.3 ms p50. The other
+    17% flip 3–4 ms later (tearing 15–22% down the screen), about one frame
+    in six at irregular intervals of ~100 ms, wherever the target is: the
+    GPU is done 1.3 ms after submit either way, so the delay is in macOS's
+    flip path (not the stats overlay, the cursor, or the terminal
+    redrawing). Not explained yet.
   - Full screen on a variable-refresh (Adaptive-Sync) display: the panel
     refreshes when a frame arrives, so vsync costs nothing. The settings
     alone decide what happens there (the app used to turn pacing and
@@ -321,7 +375,7 @@ built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
   Control, screenshots) until the window loses focus. The trackpad and
   mouse stay macOS's, and are how to leave: menu bar, another window, a
   Mission Control swipe. App menu items work by mouse only.
-- Stats overlay (menu, or Settings): per-stage p50 / p90 / max over 5 s (encode,
+- Stats overlay (menu, or Settings): per-stage p50 / p99 / max over 5 s (encode,
   network, queue, decode, render, display, total present → on screen), a
   pacing row (|presentation interval − capture interval|), dropped frames,
   the phase state, and a 10 s latency chart.
@@ -339,6 +393,97 @@ built with the Command Line Tools' `swiftc` (`mac/build.sh`, no Xcode).
   `GM_DEBUG_FRAMES` (one line per frame shown or dropped, every timestamp
   from gamescope's present to the flip), `GM_DEBUG_STALL=<s>` (one 30 ms
   render hiccup).
+
+### 3.8 Native iPadOS client (`ipad/`)
+
+The macOS client's Session (`apple/`) in a UIKit app: same protocol,
+decoders (PyroWave's Metal decoder too), pacing, stats overlay and
+settings, built with Xcode through XcodeGen (`ipad/build.sh`; signing team
+in `GM_TEAM`, a free Apple ID's profiles last 7 days).
+`ipad/run.sh [ARGS]` installs it on the connected iPad and launches it with
+the macOS client's options (`--mock`, a host, `--stats-log`) and `GM_*`
+environment, printing its output.
+
+- Display: full screen; a CADisplayLink holds ProMotion at its top rate
+  (120 Hz), so the panel is a fixed refresh: Auto pacing is the phase lock
+  (Steam's VRR off). No vsync off on iPadOS.
+- Input: fingers are the host's touchscreen (protocol Touch, gamescope
+  patch 0006; SteamOS passes touches through to Steam and the game, as
+  the Deck's own touchscreen), or with the setting off, a finger is the
+  pointer with the left button held; a mouse or
+  trackpad moves the pointer by hover and clicks with its buttons
+  (UIApplicationSupportsIndirectInputEvents); trackpad and wheel scrolling;
+  the hardware keyboard by HID usage (`ipad/Sources/Keys.swift`), except
+  the shortcuts iPadOS keeps. Pointer lock is `prefersPointerLocked` (only
+  in full screen, when iPadOS grants it) with motion and buttons from
+  GCMouse. Game controllers as on macOS.
+- Cursor: iPadOS's pointer takes no image, so it is hidden over the stream
+  and the host's cursor is drawn into our frames (as on a macOS VRR
+  display).
+- "Force client cursor" (macOS, iPad, web; `--force-client-cursor`): where
+  the host shows no cursor in absolute mode, the client shows an arrow, at
+  no stream latency, through the same paths (`Session.clientCursor`). A
+  locked pointer stays locked with no cursor: its motion is the game's, so
+  an arrow would point at nothing. Nothing on the host changes, because
+  nothing there paints a cursor: nested, gamescope never composites one
+  (`ShouldDrawCursor()` is false: not `--force-grab-cursor`, and the Wayland
+  backend's `ShouldPaintCursor()` is false; `cursor_composite 0` is the same
+  thing) and gmstream puts it only on the test machine's own panel. A cursor the
+  game paints itself (Ender Lilies) is game pixels, so it stays in the
+  video and trails the arrow by the stream's latency while the mouse moves.
+- Settings: a three-finger tap (the touches it began are cancelled on the
+  host, which ends them). The stream stops in the background (no GPU
+  work there) and reconnects when the app comes back.
+
+Phase lock on the iPad (2026-10-29): with the lead pinned (`GM_HOST_LEAD=<ms>`,
+--mock, zero jitter) the display stage is exactly a refresh plus the lead
+(8.34 + lead) down to 1.0 ms with no drops; 0.75 ms drops ~0.75 frames/s and
+below 0.5 frames miss their flip: iPadOS's cut-off is ~0.8 ms before it. The
+old lock sat at 4.5 ms: each lead bin's shown share was estimated with even
+odds as the prior, so the bin it sat on (thousands of frames) always
+outscored lower bins seen clean (tens of frames), and it never moved down;
+the 100 ms settle after each step also hid exactly the drops a step caused;
+and leads wrapped round the refresh put Wi-Fi spikes (frames 5 ms late,
+missed and replaced) in the early bins. Now (Phase.swift): bins unwrapped
+around the median lateness, every frame counted, a frame shown a refresh
+late counted as a miss, and the lowest lead that would show 99.9% of the
+recent latenesses. iPad --mock display 12.8 → 9.3 ms; iPad over Wi-Fi
+(PyroWave) 16.3 / 16.9 → 14.3 / 15.2 ms p50 / p90 at ~0.12 drops/s (the
+drops: frames 5–7 ms later than the median; lateness p99 is +5.4 ms, which
+is what the lead now covers); Mac --mock in a window 21.2 → 20.2 ms.
+
+Wi-Fi jitter on the iPad (2026-10-29, PyroWave 400 Mb/s, GM_DEBUG_NET, 90 s):
+0.5–0.6% of frames arrive 3+ ms late: their first packet or a stall inside
+their burst (5–10 ms), 0.5–0.6 events/s at intervals of almost exactly
+1.024 s or multiples (10 beacon intervals). The read lag is ~0.1 ms (not the
+app). The router's 5 GHz network is on channel 44 (80 MHz); pinging it from
+the Mac (whose AWDL is off) at the same time showed no 1.024 s pattern, so
+it is likely the iPad's own radio: AWDL (AirDrop, Handoff, Universal
+Control), which gave the Mac the same 1.02 s pattern before its AWDL was
+turned off. An app cannot turn AWDL off; declaring the app a game with Game
+Mode support (LSApplicationCategoryType games, GCSupportsGameMode) changed
+nothing and was dropped. These spikes are what the phase lock's lead covers
+(~6 ms of the iPad's display stage).
+
+Vivid colors on the iPad: the 8-bit layer tagged Display P3 shows P3's
+primaries (checked by eye with `GM_MOCK_COLORS=gamut`: each P3 primary beside
+sRGB's in P3 values; red, green and yellow differ, blue only in brightness,
+the two spaces share their blue primary). iPadOS's screenshots clip to sRGB
+(pure P3 red reads as sRGB red, in a P3-tagged PNG), so they cannot check
+color: a 10-bit extended-range layer looked identical in them and on screen,
+and was dropped.
+
+Measured on an iPad Pro 12.9" (M1, 2021), 2026-10-29:
+- `--mock`: 120 fps, phase lock locked on a measured 8.338 ms refresh,
+  display 12.8 ms p50/p90, no drops.
+- Ender Lilies over Wi-Fi, H.264 at the native 2732x2048: total 27.6 /
+  28.2 ms p50 / p90 (encode 8.5, network 2.9, decode 4.5, display 11.5),
+  no drops or gaps, audio and an Xbox controller working. The game showed
+  60 fps.
+
+Touch on Steam's UI tried by hand (2026-10-29): works. PyroWave at
+300 Mb/s ran at 120 fps. Not yet tried: a mouse or trackpad (pointer lock
+and GCMouse's motion sign), the keyboard.
 
 ## 4. gamescope facts this design depends on
 
@@ -458,6 +603,34 @@ encode: host send path + ~2 ms Wi-Fi one way; then a 264-packet burst of
 (one syscall and allocation per datagram; batch with `sendmmsg`/GSO, larger
 packets on plain UDP, DSCP marking), and AWDL on the Mac (`sudo ifconfig
 awdl0 down` is the usual fix for periodic Wi-Fi spikes; needs root).
+
+Host stages, 2026-10-29, the test machine, Ender Lilies' animated title screen at
+120 fps, headless probe on the host (PyroWave 1920x1080@120, 100 Mb/s, 30 s
+each), forced composition. Traces: gamescope patch 0007 (`GM_GS_TIMING`),
+gmstream `GM_DEBUG_GRID` + `GM_DEBUG_ENCODE`, joined by
+`stages.py` (session scratchpad). p50 / p99 ms:
+
+| stage | default (Steam VRR off, no grid) | VRR (`-v 2`) |
+|---|---|---|
+| game commit → its GPU work done | 0.68 / 1.68 | 0.25 / 1.02 |
+| done → gamescope paint starts (waits for its next tick) | **4.80 / 6.62** | **6.69 / 7.31** |
+| paint + composite + `vulkan_wait` | 0.66 / 0.77 | 0.65 / 0.77 |
+| composited → handed to gmstream | 0.006 / 0.03 | 0.006 / 0.03 |
+| hop: gamescope → gmstream | 0.03 / 0.10 | 0.03 / 0.12 |
+| gmstream hold to the slot | **3.35 / 3.47** | 0.005 / 0.02 |
+| hand-off to the PyroWave worker | 0.013 / 0.04 | 0.013 / 0.05 |
+| PyroWave GPU (incl. CPU wake) | 0.35 / 1.29 | 0.66 / 0.99 |
+| packetize | 0.015 / 0.05 | 0.017 / 0.05 |
+
+What fusing composite and encode in gamescope's queue could remove is the
+composite, the hop and the hand-off: ~0.7 ms p50, ~0.9 ms p99 (most of it,
+the composite, also goes by dropping forced composition). The waits are
+10x that: the game finishes a frame ~1 ms after the previous flip and then
+waits for gamescope's next 120 Hz tick (the game runs at the cap, so it
+renders ahead), and without VRR gmstream also holds each frame to its slot.
+(The probe received no PyroWave frames over WebTransport, datagrams lost or
+dropped on loopback, not investigated; the host-side traces do not need
+them.)
 
 Tried and dropped on the Mac (details in §8): presenting with vsync off in a
 window (macOS composites such frames one or two refreshes later
@@ -581,6 +754,17 @@ exists):
    (Proton) has Xwayland lock the pointer with no hint, so gamescope never
    locked the host pointer: the game got absolute positions (wild camera
    turns, no menu cursor). A lock now counts without a hint.
+5. **`0006-nested-touch`.** The Wayland backend held a `wl_touch` but never
+   bound it, so a host touchscreen did nothing. It now binds it when the
+   host seat offers touch (gmstream's does) and feeds `wlserver_touchdown/
+   motion/up` with positions normalized over the output, as for the
+   pointer; they follow the touch mode (SteamOS: passthrough). A cancel
+   ends every touch (wlserver has no cancel).
+6. **`0007-debug-frame-timing`.** Measuring only, off unless
+   `GM_GS_TIMING=<file>`: per frame handed to the host, the base plane's
+   commit arrival, fence done, paint start, composite done and hand-off
+   times (§5). Not deployed: the test machine runs the 0006 build (the 0007 build
+   is kept as `~/gmstream/bin/gamescope.0007-timing`).
 
 Not a patch: Steam writes the root property `GAMESCOPE_COMPOSITE_FORCE` from
 its Settings → Developer → **Force Composite** toggle at startup, and the
@@ -595,20 +779,54 @@ Debugging aids: gamescope's log channels are runtime convars
 (`WAYLAND_DISPLAY=gamescope-0 gamescopectl log_focus debug`, `log_xdg_backend`),
 and our build keeps symbols, so gdb breakpoints on its input handlers work.
 
-### 6.3 Not done
+### 6.3 Panel mode (no client: this machine's own screen)
 
-1. **Panel mode:** with no client connected, gmstream drives the built-in
-   panel: wlroots DRM backend through libseat (logind) and libinput for the
-   built-in keyboard, touchpad and touchscreen; offer a scanout tranche in
-   linux-dmabuf feedback so gamescope's buffers can be scanned out directly;
-   adaptive sync on the panel when supported. Stream mode blanks the panel;
-   disconnect returns to the panel's native mode. Needs wlroots built with
-   `-Dbackends=drm,libinput -Dsession=enabled` (libseat, libinput, libudev
-   and libdisplay-info; libudev stays a host library) and DRM-master
-   handover testing. Until then the built-in screen is dark in Game Mode.
-2. **Touch** (`WL_SEAT_CAPABILITY_TOUCH`; gamescope's backend supports
-   wl_touch) for iPad/Android clients.
-3. Upstreaming the gamescope patches; layered (non-composited) frames from
+With no client connected, gmstream shows gamescope's frames on this machine's
+screen (core/compositor.c, "panel"): gamescope stays nested on gmstream-0
+exactly as when streaming, so connecting is a switch of display, not of
+session.
+
+- **Screen:** wlroots' DRM backend through a logind session (libseat, the
+  seat0 session in XDG_SESSION_ID, as native gamescope takes it). An external
+  screen if one is connected, else the built-in panel (native Game Mode's
+  choice), at its preferred mode, adaptive sync on when supported.
+- **Frames:** each committed buffer goes to the screen as it is (direct
+  scanout) or, if the display engine cannot take it, is copied into the
+  screen's own buffer; one flip at a time, the newest frame committed during
+  a flip going next; presentation feedback answered at the flip (real
+  timestamps, refresh 0 under VRR), so gamescope's scheduler runs on the
+  screen's real vblanks as on its DRM backend. gamescope picks its modifier
+  from linux-dmabuf v3's flat list, not feedback, so with a screen only the
+  formats its primary plane scans out are offered: every frame copied
+  before, none after. The encoder imports the same buffers.
+- **Input:** libinput (keyboard, touchpad, mouse, touchscreen) into the same
+  seat the network's input uses; touch through patch 0006, so SteamOS's
+  touch mode applies. gamescope's cursor goes on the screen's cursor plane.
+- **Switching:** a client connecting turns the screen off (as native Game
+  Mode does when another display is connected) and gamescope's output takes
+  the client's mode; when the last client leaves, the screen comes back at
+  its native mode. No seat, or `GM_NO_PANEL`: streams only, as before.
+- Measured 2026-10-29 on the test machine (ROG Flow Z13 GZ302EA, eDP 2560x1600 at
+  180 Hz, VRR), a test instance with nested gamescope + vkcube: 180 frames
+  presented a second, 0 copied, 0 superseded; a client (probe, 1920x1080@60,
+  PyroWave) turned the panel off and got 60 fps (encode ~1 ms); 10 s after it
+  vanished the panel came back at 180 Hz.
+
+What native Game Mode does that panel mode does not (yet):
+- gamescope composites every frame (`--force-composition`): native can scan
+  a game's buffer out directly and put overlays (MangoHud, Steam's) on
+  planes. Layered frames (gamescope's planes as subsurfaces, mapped to KMS
+  planes) would close that.
+- Display colour management (gamma/CTM LUTs, per-panel calibration) and HDR:
+  none; frames are shown as sRGB.
+- One screen, chosen by gmstream: Steam sees one display; its own display
+  choice and mode/refresh switching (e.g. a 60 Hz mode) do not apply.
+- Idle screen-off (DPMS from Steam's power settings) is not implemented.
+- The keyboard uses gmstream's fixed US keymap, not the system's layout.
+
+### 6.4 Not done
+
+1. Upstreaming the gamescope patches; layered (non-composited) frames from
    gamescope's planes, which also opens per-layer and pre-upscale streaming.
 
 Gamepads are unaffected by the compositor: Steam reads controllers directly
@@ -761,10 +979,13 @@ per-stage p50/p90 over 30–60 s; lessons that cost time:
   submission depending on its own composite timing, not ours; neither
   scheduling presents from frame timestamps nor phase-locking made that
   predictable. In full screen it is a different path (direct flips).
-- A CADisplayLink from the screen tracks this app's own presents; use
-  CVDisplayLink for the panel's refresh grid. Its timestamps are not the
-  vblank itself: on the M4 MacBook Air's panel, vsync flips land ~7 ms after
-  them.
+- A CADisplayLink from the screen tracks this app's own presents, and so
+  does CVDisplayLink with vsync off in full screen (built-in panel: ±8 ms off
+  a straight line, against 0.9 ms with vsync on; its timestamps are when its
+  callback ran, and vsync flips land ~7.3 ms after them). The panel's grid
+  comes from vsync-on flips instead: they lie on one line (16666.605 µs on
+  the M4 MacBook Air's panel, the same in every run), and a line fitted to
+  one run placed the flips of a run 149 s later within 5 µs.
 - The window server's vsync cut-off is a whole refresh before the vblank, not
   the vblank (as a PC's exclusive full screen has): CAMetalDisplayLink in full
   screen at frame latency 1 reports its deadline 16.7 ms before the frame is
@@ -917,8 +1138,9 @@ per-stage p50/p90 over 30–60 s; lessons that cost time:
   refresh-rate slider, HDR, and possibly "allow tearing"/frame-limiter
   behaviour to differ from DRM Game Mode. Needs testing in the real session;
   some may be fixable by advertising more (modes, color management).
-- **Panel mode** needs DRM master handover through logind and direct-scanout
-  compatible buffers from gamescope; untested.
+- **Panel mode** (§6.3) is tested with a separate instance and vkcube, not yet
+  as the session's own gmstream with Steam (suspend/resume, VT switches,
+  hotplug, Steam's brightness and idle settings).
 - **AV1 and HEVC in the browser:** both encode fine; the web client has only
   been exercised with H.264 so far.
 - **Browsers:** Chrome only so far. Safari's WebTransport/WebCodecs support
@@ -957,3 +1179,254 @@ per-stage p50/p90 over 30–60 s; lessons that cost time:
 - `polaris-quadlet` repo branch `resume-before-capture` (pushed, not
   merged): Polaris patches 0001/0002 and the fake-display helper.
   Superseded; keep for reference or delete.
+
+## 11. Scheduled pacing: one sequence, read two ways
+
+Design, not built. `apple/Schedule.swift` is the client half and is off by
+default; the host half (§11.9) is not written. This section is the formulation
+both follow.
+
+### 11.1 The invariant
+
+Judder is a nonlinearity in the map from game-world time to display time. A
+VRR panel keeps that map straight by moving the display to the frame; the same
+invariant can be kept the other way round, by moving the frames to the panel's
+grid and advancing the world clock to match where they land.
+
+Index frames `n = 0, 1, 2, ...`. The decision variable is the *advancement*
+`a[n]`: how much game time frame n moves the world forward.
+
+    W[n] = sum(a[:n+1])     game-world time of frame n
+    D[n] = W[n] + L         when frame n is on screen, for one constant L
+
+Then `D[n] - D[n-1] == a[n]`: the advancement sequence and the display-interval
+sequence are the same list. There is nothing to keep in sync. The engine reads
+it as how far to step the world; the panel reads it as when the next picture
+appears.
+
+One `L` for the whole stream is what keeps the map affine. It also carries the
+two machines' clock offset, as the hold's constant does (§3.7), so no clock
+sync is needed: ping-based sync moves 0.5-2.6 ms on busy Wi-Fi (§8), which a
+fixed offset cannot absorb.
+
+The schedule need not be even. Game times 5, 15, 20, 40 shown at 5+L, 15+L,
+20+L, 40+L are perfectly paced. Only the slope matters.
+
+Nothing here commands the engine's clock, because nothing can: §11.11 is what
+the interfaces actually offer, and why the invariant holds anyway.
+
+### 11.2 The grid constraint disappears
+
+`D[n]` has to land on a refresh of the client's panel: `anchor + k*G`. Since
+`D[n] = anchor + W[n] + L` and `W[n]` is the running sum of advancements, the
+constraint is satisfied by construction if every advancement is a whole number
+of refreshes:
+
+    a[n] = m[n] * G     m[n] >= 1, integer    fixed-refresh panel
+    a[n] = any real                           VRR panel (the grid is continuous)
+
+No snapping at display time, and no residual rounding at the panel. That is the
+whole VRR / fixed-refresh unification: the decision variable is integer in one
+case and real in the other, and the rest of the algorithm is identical.
+
+### 11.3 A fractional rate from integer steps
+
+`m[n]` being an integer does not quantize the rate. Carry the rounding error
+forward:
+
+```python
+def step(target, carry, G):
+    """One advancement, in ns, and the error to carry into the next."""
+    if G == 0:
+        return target, 0.0          # VRR: take it directly
+    ideal = target + carry
+    m = max(1, round(ideal / G))
+    return m * G, ideal - m * G
+```
+
+A 22.2 ms target on an 8.33 ms grid comes out 3, 2, 3, 3, 2, 3 refreshes, mean
+exactly 22.2. This is error-feedback quantization, the same trick as dithering
+a gradient: round each step, remember what was thrown away, add it to the next.
+
+With a *constant* target the recurrence has a closed form,
+
+    sum(m[:n]) == round(n * target / G)
+
+which is Bresenham's line, and is what `Schedule.slot(n)` computes. That the
+two agree exactly is what lets the client name a frame's slot without being
+sent the sequence. They diverge only when the target varies per frame (§11.8).
+
+### 11.4 Feasibility is a queueing constraint
+
+The histories say what is achievable. With `R[n]` the host's render latency for
+frame n and `S[n]` the delivery latency (commit to on screen), frame n must
+start by `D[n] - S[n] - R[n]` and cannot start before frame n-1 finished.
+Chaining those, the condition is on the running sums, not per frame:
+
+    mean(a) >= mean(R)
+
+Frames cannot be scheduled closer together than the game can produce them on
+average. Jitter around that mean is what the render-ahead buffer absorbs; using
+a high quantile of `R` instead of its mean buys margin for that jitter, and
+§11.7 is what the margin costs.
+
+### 11.5 Three pointers, and the commitment boundary
+
+    n_shown  <=  n_render  <=  n_sched
+
+`a[:n_render]` is **committed**: the engine has already advanced the world by
+those amounts, so they are immutable. `a[n_render:]` is tentative, and
+re-planned freely as measurements arrive.
+
+So re-planning never causes a discontinuity, which was the worry: only terms
+nobody has rendered are ever rewritten, and realized world time never jumps. A
+rate change is not a pacing event at all - the slope stays 1, only the sample
+density changes - so a game dropping from 60 to 40 fps costs nothing. A change
+in `L` *is* a one-time step in the map, so it is stepped, never slewed: a
+slewed offset is many frames at the wrong slope, which is the judder being
+avoided. (Measured, for the hold's constant: an edge-creeping tracker "was
+smooth but never still".)
+
+### 11.6 Generating ahead
+
+The engine must never block waiting for a term, so the schedule runs ahead of
+the renderer. But frames past `n_render` have no measurements yet - they do not
+exist - so their terms come from predictions, including the generator's own
+output fed back in:
+
+```python
+R_hat = list(R_measured)                   # truth where there is truth
+carry = 0.0
+a = a[:n_render]                           # drop the tentative tail
+while len(a) < n_render + LOOKAHEAD:
+    s, carry = step(predict(R_hat, S), carry, G)
+    a.append(s)
+    R_hat.append(s)                        # free-running past the measurements
+```
+
+Keep the decided advancement and the measured render cost as separate series.
+They converge, since the game is throttled to the schedule, but they are not
+the same signal: feasibility needs the true cost, and a history holding only
+the generator's own output loses the evidence that the game is struggling.
+
+### 11.7 Render-ahead depth is the input-latency knob
+
+`B = n_render - n_shown`. A frame samples input when the engine starts it,
+which is about `B` advancements before its slot, so
+
+    input to photon  ~=  B * mean(a) + S
+
+Every frame of render-ahead costs a full frame interval of input lag: two
+frames at 45 fps is 44 ms added deliberately. The tension is one-dimensional -
+`B` too small and render jitter overruns slots, `B` too large and input feels
+mushy - which makes it the knob to expose, rather than a buffer depth.
+
+### 11.8 What to minimize
+
+    minimize   w1 * P(miss slot) + w2 * (B * mean(a) + S) + w3 * var(m)
+    subject to mean(a) >= quantile(R, p),  m[n] >= 1 integer
+
+`var(m)` is the unevenness of hold durations: a frame held 3 refreshes carries
+slightly more motion smear than one held 2. Real, but far below the other two,
+so a uniform `m` is preferred and not required.
+
+The solver is not an optimizer. Set `mean(a)` from a quantile of `R`, set `B`
+as small as keeps the miss rate under target, and let §11.3's carry spread `m`
+as evenly as it can.
+
+The one place learning would earn its place is **predicting `R[n]` per frame**,
+not predicting the sequence. A quantile schedule pays the p99 render cost on
+every frame; a predictive one pays each frame its own cost, and the difference,
+`quantile(R, 0.99) - mean(R)`, is large on a system with translation and
+thermal noise. Seeing a heavy frame coming - scene change, new geometry, a
+shader not yet compiled - means giving that frame three refreshes and the rest
+two, with the world clock following, which is exactly as smooth while running
+faster and with less input lag than the worst-case schedule. This is the case
+with no closed form, so it needs the slots sent explicitly.
+
+### 11.9 Which machine owns what
+
+The two budget terms split by machine, and neither side needs the other's
+statistics:
+
+| | owner | from |
+|---|---|---|
+| `L` (slot to photon) | client | its own decode and display latencies |
+| release lead (game render cost) | host | gamescope's commit timing |
+| `mean(a)` | client proposes | p99 of observed host frame spacing |
+| the world clock, `B` | host | the schedule |
+
+The client proposes the rate and the host refuses it implicitly, by missing
+slots; the two meet through the drop rate rather than through shared estimates.
+Worth one diagnostic field host to client (slots missed) purely for
+attribution, so a drop can be blamed on the right end.
+
+### 11.10 What runs today
+
+With a uniform advancement the schedule is just `(anchor, interval)`, which is
+exactly what `DisplayGrid` (protocol `0x0d`) already carries, so phase 1 is
+client-only and the host needs no change: it already paces gamescope to the
+grid the client sends. Restarting gmstream kills the running game, which is
+reason enough to take the client-only half first.
+
+Phase 2 - a fractional mean, and so §11.3's 3, 2, 3 - needs the host to
+throttle the game to the sequence and advance the world clock by `a[n]`, near
+`grid_release` in `core/compositor.c`. Phase 3 is §11.8's per-frame target,
+which needs a protocol message carrying explicit slots.
+
+### 11.11 Moving the world clock: what the interfaces actually offer
+
+**No API says "advance by X".** Vulkan, Wayland and gamescope all expose
+timing that is completion-shaped - here is when your last frame appeared - not
+command-shaped. `wp_presentation`, `VK_GOOGLE_display_timing` and
+`VK_KHR_present_wait` report the past. `VK_EXT_present_timing`, Reflex and
+Anti-Lag 2 let the *application* say when it wants to present or start a
+frame, which is the opposite direction. Nothing lets a compositor set an
+engine's dt.
+
+What exists is one lever: **when the game is let go.** A typical loop is
+
+    dt = now() - last;  last = now();  simulate(dt);  render();  present()
+
+and it blocks in `present` / `vkAcquireNextImageKHR` until a buffer comes
+back. Holding `wl_buffer.release` therefore sets the loop's period, which is
+exactly what gamescope's own FPS limiter does (§6.2), and DroidDeck's paced
+release, and Armada's patch 0027. The actuator is already there and already in
+the path; what it cannot do today is use a different interval per frame.
+
+And then the clock follows for free, which is the part worth noticing. If the
+loop is release-bound and samples its clock at `r[n]` (plus `e[n]`, for where
+in the loop the sample falls), then
+
+    W[n] = sum(dt) = r[n] - r[0] + e[n] - e[0]
+
+so world time tracks the release times with a *bounded* error rather than a
+drifting one. Showing each frame a constant `L` after its release then gives
+`D[n] = W[n] + const`, which is the §11.1 invariant, with no clock commanding
+anywhere. **The job is not to command the engine's clock; it is to make the
+release schedule and the display schedule the same affine map.** §11.1-11.8
+are that map, and `grid_release` in `core/compositor.c` is already half of it.
+
+The residual, `e[n] - e[0]`, is the variation in where in its loop the engine
+reads the clock. That is judder, and it cannot be removed from outside the
+game. It is small for a tight release-bound loop and grows under load, so the
+scheme is "as good as the engine's own loop timing", not exact.
+
+Three cases where it is worse than that:
+
+- **A game that renders ahead** - deep swapchain, no vsync, not blocking - has
+  release times we do not set, so it has to be throttled before any of this
+  applies. gamescope running at the cap already does this to it (§5).
+- **A fixed-timestep engine** with interpolation (accumulator, render
+  interpolated at the fractional remainder) follows wall-clock dt in the
+  interpolation and is fine. One without interpolation quantizes motion to its
+  own step and judders whatever the compositor does.
+- **An engine that samples its clock off the render thread** breaks the
+  relation between `r[n]` and dt entirely.
+
+The exact version of "advance by X" is to interpose the clock: `LD_PRELOAD`
+over `clock_gettime`, returning scheduled world time instead of real time,
+which is what `libfaketime` does and what the phrase literally means. It is
+exact, and it desynchronizes audio, networking and everything else that
+compares against real time, so it is not a general answer - but it is the
+measurement tool for finding out how large `e[n]` really is in a given game.

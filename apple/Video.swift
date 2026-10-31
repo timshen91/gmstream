@@ -1,16 +1,16 @@
-// Video: the host's Annex B bitstream (start codes, in-band parameter sets on
-// keyframes) → VideoToolbox hardware decode → a Metal layer, presented on the
+// Video: the host's bitstream (Annex B with in-band parameter sets on
+// keyframes, or AV1 OBUs) → VideoToolbox hardware decode → a Metal layer, presented on the
 // next display refresh. Each frame carries timestamps through every stage, and
 // Metal reports when it actually reached the screen.
 
-import AppKit
 import CoreMedia
+import CoreVideo
 import Metal
 import QuartzCore
 import VideoToolbox
 
 enum Codec: UInt8 {
-    case h264 = 0, hevc = 1
+    case h264 = 0, hevc = 1, av1 = 2
 }
 
 /// Times (this Mac's CLOCK_UPTIME_RAW ns, i.e. mach time) one frame passes
@@ -26,6 +26,7 @@ final class FrameTiming {
     var released: UInt64 = 0      // left the hold (= taken to draw, without one)
     var due: UInt64?              // to be presented at (with a hold)
     var submitted: UInt64 = 0     // Metal frame committed
+    var drawn: UInt64 = 0         // the GPU finished drawing it (GM_DEBUG_FLIP)
     var presented: UInt64 = 0     // on screen
 
     init(slotNs: UInt64, encodedNs: UInt64, received: UInt64, toLocal: (UInt64) -> UInt64?) {
@@ -43,6 +44,7 @@ final class FrameTiming {
     /// Measuring (GM_DEBUG_FRAMES): one line per frame shown ("shown") or
     /// never shown ("dropped"), every time in this Mac's ns.
     static let debug = getenv("GM_DEBUG_FRAMES") != nil
+    static let debugFlip = getenv("GM_DEBUG_FLIP") != nil
     func log(_ what: String) {
         FileHandle.standardError.write("frame \(what) \(presentLocal ?? 0) \(encodedLocal ?? 0) \(received) \(decodeStart) \(decoded) \(submitted) \(presented) \(released) \(presentHost)\n".data(using: .utf8)!)
     }
@@ -80,8 +82,13 @@ final class Decoder {
     /// BGRA (an extra conversion pass in VideoToolbox).
     var yuv = true
 
-    /// Called with each decoded image (on the decoder's thread).
-    var onDecoded: (CVPixelBuffer, FrameTiming) -> Void = { _, _ in }
+    /// This device decodes AV1 in hardware (M3 and later).
+    static let hasAV1 = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+
+    /// Called with each decoded image and how many of its rows to show (on
+    /// the decoder's thread). The host's AV1 encoder (AMD VCN) pads some
+    /// heights: 1080 comes out as 1082, with the two extra rows at the bottom.
+    var onDecoded: (CVPixelBuffer, Int, FrameTiming) -> Void = { _, _, _ in }
 
     private var session: VTDecompressionSession?
     private var format: CMVideoFormatDescription?
@@ -91,26 +98,7 @@ final class Decoder {
     /// a keyframe).
     func decode(_ frame: Frame, timing: FrameTiming) -> Bool {
         guard let codec = Codec(rawValue: frame.codec) else { return false }
-        var params: [Data] = []
-        var sample = Data(capacity: frame.bitstream.count + 64)
-        for nal in nalUnits(frame.bitstream) where !nal.isEmpty {
-            let isParam: Bool, isAud: Bool
-            switch codec {
-            case .h264:
-                let type = nal[nal.startIndex] & 0x1f
-                isParam = type == 7 || type == 8
-                isAud = type == 9
-            case .hevc:
-                let type = (nal[nal.startIndex] >> 1) & 0x3f
-                isParam = type == 32 || type == 33 || type == 34
-                isAud = type == 35
-            }
-            if isParam { params.append(nal); continue }
-            if isAud { continue }
-            var len = UInt32(nal.count).bigEndian
-            withUnsafeBytes(of: &len) { sample.append(contentsOf: $0) }
-            sample.append(nal)
-        }
+        let (params, sample) = codec == .av1 ? av1Sample(frame.bitstream) : annexBSample(codec, frame.bitstream)
         if !params.isEmpty && params != parameterSets {
             parameterSets = params
             format = makeFormat(codec, params)
@@ -122,13 +110,49 @@ final class Decoder {
         let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: buffer, flags: [], infoFlagsOut: nil) {
             [weak self] status, _, image, _, _ in
             timing.decoded = nowNs()
-            if status == noErr, let image { self?.onDecoded(image, timing) }
+            if status == noErr, let image { self?.onDecoded(image, frame.height, timing) }
         }
         if status == kVTInvalidSessionErr {
             VTDecompressionSessionInvalidate(session)
             self.session = makeSession(format)
         }
         return status == noErr
+    }
+
+    /// Parameter sets out, the rest with four-byte lengths instead of start codes.
+    private func annexBSample(_ codec: Codec, _ bitstream: Data) -> (params: [Data], sample: Data) {
+        var params: [Data] = []
+        var sample = Data(capacity: bitstream.count + 64)
+        for nal in nalUnits(bitstream) where !nal.isEmpty {
+            let isParam: Bool, isAud: Bool
+            if codec == .h264 {
+                let type = nal[nal.startIndex] & 0x1f
+                isParam = type == 7 || type == 8
+                isAud = type == 9
+            } else {
+                let type = (nal[nal.startIndex] >> 1) & 0x3f
+                isParam = type == 32 || type == 33 || type == 34
+                isAud = type == 35
+            }
+            if isParam { params.append(nal); continue }
+            if isAud { continue }
+            var len = UInt32(nal.count).bigEndian
+            withUnsafeBytes(of: &len) { sample.append(contentsOf: $0) }
+            sample.append(nal)
+        }
+        return (params, sample)
+    }
+
+    /// The frame's OBUs but temporal delimiters (a sample has none); the
+    /// sequence header stays in it, and is the "parameter set" as well.
+    private func av1Sample(_ bitstream: Data) -> (params: [Data], sample: Data) {
+        var params: [Data] = []
+        var sample = Data(capacity: bitstream.count)
+        for obu in av1OBUs(bitstream) where OBU.type(obu) != OBU.temporalDelimiter {
+            if OBU.type(obu) == OBU.sequenceHeader { params = [Data(obu)] }
+            sample.append(obu)
+        }
+        return (params, sample)
     }
 
     private func makeSession(_ format: CMVideoFormatDescription) -> VTDecompressionSession? {
@@ -165,27 +189,33 @@ final class Decoder {
 
     private func makeFormat(_ codec: Codec, _ params: [Data]) -> CMVideoFormatDescription? {
         var format: CMVideoFormatDescription?
+        if codec == .av1 {
+            guard let config = AV1Config(sequenceHeader: params[0]) else { return nil }
+            let atoms = ["av1C": config.av1C] as CFDictionary
+            let extensions = [kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms] as CFDictionary
+            let status = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_AV1,
+                                                        width: Int32(config.width), height: Int32(config.height),
+                                                        extensions: extensions, formatDescriptionOut: &format)
+            return status == noErr ? format : nil
+        }
         let datas = params.map { NSData(data: $0) }
         let pointers = datas.map { $0.bytes.assumingMemoryBound(to: UInt8.self) }
         let sizes = datas.map { $0.length }
-        let status: OSStatus
-        switch codec {
-        case .h264:
-            status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        let status = codec == .h264
+            ? CMVideoFormatDescriptionCreateFromH264ParameterSets(
                 allocator: kCFAllocatorDefault, parameterSetCount: params.count, parameterSetPointers: pointers,
                 parameterSetSizes: sizes, nalUnitHeaderLength: 4, formatDescriptionOut: &format)
-        case .hevc:
-            status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+            : CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                 allocator: kCFAllocatorDefault, parameterSetCount: params.count, parameterSetPointers: pointers,
                 parameterSetSizes: sizes, nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &format)
-        }
         return status == noErr ? format : nil
     }
 }
 
-/// A decoded frame: VideoToolbox's image, or PyroWave's three planes.
+/// A decoded frame: VideoToolbox's image and how many rows to show, or
+/// PyroWave's three planes.
 enum DecodedImage {
-    case buffer(CVPixelBuffer)
+    case buffer(CVPixelBuffer, height: Int)
     case planes([MTLTexture])
 }
 
@@ -193,7 +223,7 @@ enum DecodedImage {
 /// Newest frame wins: one decoded while the thread waits for a drawable
 /// replaces the one it was about to show (counted as skipped). With a hold
 /// (`holdFrames`), each frame instead waits until a fixed delay after the
-/// host presented it (`Hold`), in order. macOS holds
+/// host presented it (`Hold`), in order. The system holds
 /// each frame a fixed number of refreshes, so pacing is steady. (Presenting
 /// with vsync off at scheduled times was tried: lower median, but macOS's
 /// compositor shows such frames one or two refreshes later unpredictably,
@@ -235,10 +265,9 @@ final class MetalRenderer {
     private var repaint = false
     private var skip = false // the next frame is not shown
     // The cursor drawn into each frame at the mouse's position as the frame is
-    // drawn (Controller.updateCursor): its hot spot in drawable pixels, and
-    // the drawable's top left in global display coordinates (points) with its
-    // pixels per point.
-    private var cursor: (texture: MTLTexture, hotSpot: CGPoint, origin: CGPoint, scale: Double)?
+    // drawn (the apps' updateCursor): its hot spot, and where the mouse is,
+    // in drawable pixels from the top left.
+    private var cursor: (texture: MTLTexture, hotSpot: CGPoint, position: () -> CGPoint?)?
     private var refreshNs: UInt64 = 8_333_333 // the panel's shortest refresh
     private var cursorMovedAt: UInt64 = 0
     private var cursorDue: UInt64?            // when to check whether to draw the last frame again
@@ -318,9 +347,11 @@ final class MetalRenderer {
         layer.device = device
         layer.pixelFormat = .bgra8Unorm
         layer.framebufferOnly = true
+        #if os(macOS)
         layer.displaySyncEnabled = true
+        #endif
         layer.maximumDrawableCount = 3
-        layer.backgroundColor = NSColor.black.cgColor
+        layer.backgroundColor = CGColor(gray: 0, alpha: 1)
         // Private: a new drawable replaces one still queued instead of lining
         // up behind it. With FIFO, one frame that misses its refresh delays
         // every later one by a refresh for good (the source runs at the
@@ -393,12 +424,13 @@ final class MetalRenderer {
         cond.unlock()
     }
 
-    /// Draws `texture` (nil: no cursor) into each frame; see `cursor`.
-    func setCursor(_ texture: MTLTexture?, hotSpot: CGPoint = .zero, origin: CGPoint = .zero, scale: Double = 1,
-                   refresh: Double = 1.0 / 120) {
+    /// Draws `texture` (nil: no cursor) into each frame at `position()`, read
+    /// as each frame is drawn (on the render thread); see `cursor`.
+    func setCursor(_ texture: MTLTexture?, hotSpot: CGPoint = .zero, refresh: Double = 1.0 / 120,
+                   position: @escaping () -> CGPoint? = { nil }) {
         cond.lock()
         let had = cursor != nil
-        cursor = texture.map { ($0, hotSpot, origin, scale) }
+        cursor = texture.map { ($0, hotSpot, position) }
         refreshNs = UInt64(refresh * 1e9)
         if had || cursor != nil { cursorMovedAt = nowNs(); scheduleCursor() } // show it, or take it off
         cond.unlock()
@@ -516,6 +548,7 @@ final class MetalRenderer {
     /// Draws `image` (nil: black) and the overlay; `timing` nil for a repaint.
     private func draw(_ image: DecodedImage?, _ timing: FrameTiming?, _ drawable: CAMetalDrawable) {
         let w: Int, h: Int
+        var shown: Int? // rows to show, of `h`
         let textures: [MTLTexture]
         var cvTextures: [CVMetalTexture] = []
         let pipeline: MTLRenderPipelineState
@@ -525,8 +558,9 @@ final class MetalRenderer {
         case .planes(let planes):
             // PyroWave's Y, Cb, Cr.
             (w, h, textures, pipeline) = (planes[0].width, planes[0].height, planes, planarPipeline)
-        case .buffer(let buffer):
+        case .buffer(let buffer, let height):
             w = CVPixelBufferGetWidth(buffer); h = CVPixelBufferGetHeight(buffer)
+            if height > 0 && height < h { shown = height }
             let yuv = CVPixelBufferGetPlaneCount(buffer) == 2
             // Metal views of the decoder's buffer (no copy): one BGRA plane, or
             // NV12's luma and half-size interleaved chroma.
@@ -553,9 +587,14 @@ final class MetalRenderer {
         let dw = Double(drawable.texture.width), dh = Double(drawable.texture.height)
         if !textures.isEmpty {
             // Fit the video into the drawable, letterboxed.
-            let s = min(dw / Double(w), dh / Double(h))
-            let vw = Double(w) * s, vh = Double(h) * s
-            enc.setViewport(MTLViewport(originX: (dw - vw) / 2, originY: (dh - vh) / 2, width: vw, height: vh, znear: 0, zfar: 1))
+            let rows = Double(shown ?? h)
+            let s = min(dw / Double(w), dh / rows)
+            let vw = Double(w) * s, vh = rows * s
+            let x = (dw - vw) / 2, y = (dh - vh) / 2
+            enc.setViewport(MTLViewport(originX: x, originY: y, width: vw, height: Double(h) * s, znear: 0, zfar: 1))
+            if shown != nil { // the rows past `shown` fall outside
+                enc.setScissorRect(MTLScissorRect(x: Int(x), y: Int(y), width: Int(vw.rounded()), height: Int(vh.rounded())))
+            }
             enc.setRenderPipelineState(pipeline)
             for (i, t) in textures.enumerated() { enc.setFragmentTexture(t, index: i) }
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
@@ -571,9 +610,9 @@ final class MetalRenderer {
         }
         lastDrawn = now
         cond.unlock()
-        if let cursor, let p = CGEvent(source: nil)?.location {
-            let x = ((p.x - cursor.origin.x) * cursor.scale - cursor.hotSpot.x).rounded()
-            let y = ((p.y - cursor.origin.y) * cursor.scale - cursor.hotSpot.y).rounded()
+        if let cursor, let p = cursor.position() {
+            let x = (p.x - cursor.hotSpot.x).rounded()
+            let y = (p.y - cursor.hotSpot.y).rounded()
             let cw = Double(cursor.texture.width), ch = Double(cursor.texture.height)
             let x0 = max(0, x), y0 = max(0, y), x1 = min(dw, x + cw), y1 = min(dh, y + ch)
             if x1 > x0 && y1 > y0 {
@@ -612,6 +651,7 @@ final class MetalRenderer {
             self?.onPresented(timing)
         }
         for (k, v) in drawableKeys { (drawable as AnyObject).setValue(NSNumber(value: v), forKey: k) }
+        if FrameTiming.debugFlip { cb.addCompletedHandler { cb in timing.drawn = UInt64(cb.gpuEndTime * 1e9) } }
         present(cb, drawable)
         timing.submitted = nowNs()
         cb.commit()
@@ -642,7 +682,36 @@ extension MetalRenderer {
 
 extension MetalRenderer {
     /// Vsync off lets macOS flip frames straight to the panel (full screen).
-    func setVsync(_ on: Bool) { layer.displaySyncEnabled = on }
+    /// iPadOS has no vsync off.
+    static let canTurnVsyncOff: Bool = {
+        #if os(macOS)
+        return true
+        #else
+        return false
+        #endif
+    }()
+
+    func setVsync(_ on: Bool) {
+        #if os(macOS)
+        layer.displaySyncEnabled = on
+        #endif
+    }
+
+    /// `image` drawn at `width`x`height` pixels, premultiplied, top row
+    /// first: a texture for `setCursor`.
+    func texture(from image: CGImage, width: Int, height: Int) -> MTLTexture? {
+        guard width > 0, height > 0,
+              let g = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let data = g.data else { return nil }
+        g.interpolationQuality = .high
+        g.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
+        desc.usage = .shaderRead
+        let t = device.makeTexture(descriptor: desc)
+        t?.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: data, bytesPerRow: width * 4)
+        return t
+    }
 }
 
 /// The counterweight to the network: each frame is shown a fixed time after
