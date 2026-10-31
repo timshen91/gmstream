@@ -92,6 +92,7 @@ unsafe extern "C" {
     fn gm_pointer_button(button: u32, pressed: bool);
     fn gm_pointer_axis(dx: f64, dy: f64, v120_x: i32, v120_y: i32);
     fn gm_key(key: u32, pressed: bool);
+    fn gm_touch(id: i32, phase: c_int, x: f64, y: f64);
     fn gm_gamepad_update(pad: u8, state: *const GamepadState);
     fn gm_gamepad_remove(pad: u8);
 }
@@ -224,6 +225,10 @@ pub fn pointer_axis(dx: f64, dy: f64, v120_x: i32, v120_y: i32) {
 }
 pub fn key(code: u32, pressed: bool) {
     unsafe { gm_key(code, pressed) }
+}
+/// Phase 0 down, 1 motion, 2 up, 3 cancel (every touch ends).
+pub fn touch(id: u8, phase: u8, x: f64, y: f64) {
+    unsafe { gm_touch(id as i32, phase as c_int, x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)) }
 }
 pub fn gamepad_update(pad: u8, state: &GamepadState) {
     unsafe { gm_gamepad_update(pad, state) }

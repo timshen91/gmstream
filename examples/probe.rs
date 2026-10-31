@@ -2,7 +2,7 @@
 //! audio for a while, prints timing statistics and writes the bitstream.
 //! Run it on the host itself to get exact latencies (same clock).
 //!
-//!   probe [-1 FLAGS (Hello flags: 1 one video stream, 2 video datagrams)] [-C X,Y (click)] [-k KEYS] [-g PAD_BUTTONS] [-x N (stress reconfiguration)] [-m 0 (no pointer motion)] [-c h264|hevc|av1] [-s WxH] [-r HZ] [-b KBPS] [-t SECONDS] [-o FILE] HOST:PORT
+//!   probe [-1 FLAGS (Hello flags: 1 one video stream, 2 video datagrams)] [-C X,Y (click)] [-k KEYS] [-g PAD_BUTTONS] [-x N (stress reconfiguration)] [-m 0 (no pointer motion)] [-c h264|hevc|av1|pyrowave] [-s WxH] [-r HZ] [-b KBPS] [-v 0|1|2 (VrrPolicy)] [-t SECONDS] [-o FILE] HOST:PORT
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
         "h264" => 0,
         "hevc" => 1,
         "av1" => 2,
+        "pyrowave" => 3,
         _ => bail!("bad codec"),
     };
     let size = opt("-s", "1920x1080");
@@ -58,6 +59,11 @@ async fn main() -> Result<()> {
     let secs: u64 = opt("-t", "5").parse()?;
     let out = opt("-o", "");
     let wiggle = opt("-m", "1") != "0";
+    // -v POLICY: send VrrPolicy (0 leave Steam's toggle, 1 fixed refresh, 2 VRR).
+    let vrr: Option<u8> = match opt("-v", "") {
+        v if v.is_empty() => None,
+        v => Some(v.parse()?),
+    };
     // -1 FLAGS: Hello flags, 1 = all video on one stream (as WebKit clients
     // do), 2 = video as datagrams.
     let flags: u8 = opt("-1", "0").parse()?;
@@ -100,6 +106,9 @@ async fn main() -> Result<()> {
         0x81 => println!("HelloAck: codec {}", body[0]),
         0x86 => bail!("host error: {}", String::from_utf8_lossy(&body)),
         t => bail!("unexpected message {t:#x}"),
+    }
+    if let Some(v) = vrr {
+        send.write_all(&message(0x0e, &[v])).await?;
     }
     // Read the rest of the control stream (cursor, lock state) in the background.
     let host_msgs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -241,6 +250,35 @@ async fn main() -> Result<()> {
                     if *got == parts.len() {
                         let (parts, _) = frames.remove(&id).unwrap();
                         let _ = tx.send((parts.into_iter().flatten().flatten().collect(), now_ns()));
+                    }
+                    continue;
+                }
+                // PyroWave: one datagram per packet, each with the frame's
+                // id, index/count, size and times (src/session.rs,
+                // send_pyrowave); a frame counts once all its packets came.
+                if p.len() > 29 && p[0] == 4 {
+                    let id = u32::from_le_bytes(p[1..5].try_into().unwrap());
+                    let index = u16::from_le_bytes(p[5..7].try_into().unwrap()) as usize;
+                    let count = u16::from_le_bytes(p[7..9].try_into().unwrap()) as usize;
+                    if frames.len() > 16 {
+                        let oldest = *frames.keys().min().unwrap();
+                        frames.remove(&oldest);
+                    }
+                    let (parts, got) = frames.entry(id).or_insert_with(|| (vec![None; count], 0));
+                    if index < parts.len() && parts[index].is_none() {
+                        parts[index] = Some(p[29..].to_vec());
+                        *got += 1;
+                    }
+                    if *got == parts.len() {
+                        let (parts, _) = frames.remove(&id).unwrap();
+                        // The stream path's 32-byte frame header, then the packets.
+                        let mut f = vec![0u8; 32];
+                        f[0..4].copy_from_slice(&p[1..5]);
+                        f[4] = 1;
+                        f[6..10].copy_from_slice(&p[9..13]);
+                        f[12..28].copy_from_slice(&p[13..29]);
+                        f.extend(parts.into_iter().flatten().flatten());
+                        let _ = tx.send((f, now_ns()));
                     }
                     continue;
                 }

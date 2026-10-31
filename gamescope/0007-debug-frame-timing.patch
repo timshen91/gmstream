@@ -1,0 +1,154 @@
+Measuring aid, off unless GM_GS_TIMING=<file> is set: one line per frame
+handed to the host, "f commitID commit fence_done paint composited flushed"
+(CLOCK_MONOTONIC ns), for the base plane's commit. commit is when the
+client's wl_surface commit arrived, fence_done when its GPU work was done
+(commit_t::present_time), paint when paint_all started, composited after
+vulkan_wait (0 when not composited), flushed after wl_display_flush.
+
+diff -ru a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
+--- a/src/Backends/WaylandBackend.cpp	2026-10-29 21:07:46
++++ b/src/Backends/WaylandBackend.cpp	2026-10-29 21:07:46
+@@ -1083,6 +1083,7 @@
+         UpdateFullscreenState();
+ 
+         bool bNeedsFullComposite = false;
++        uint64_t ulComposited = 0;
+ 
+         if ( !m_bVisible )
+         {
+@@ -1162,6 +1163,7 @@
+                 }
+ 
+                 vulkan_wait( *oCompositeResult, true );
++                ulComposited = get_time_in_nanos();
+ 
+                 FrameInfo_t::Layer_t compositeLayer{};
+                 compositeLayer.scale.x = 1.0;
+@@ -1187,6 +1189,15 @@
+             m_Planes[i].Commit();
+ 
+         wl_display_flush( m_pBackend->GetDisplay() );
++
++        if ( FILE *pTiming = gm_timing_file() )
++        {
++            const GmFrameTiming &t = g_GmFrameTiming;
++            fprintf( pTiming, "f %lu %lu %lu %lu %lu %lu\n", (unsigned long)t.commitID,
++                (unsigned long)t.commit_ns, (unsigned long)t.done_ns, (unsigned long)t.paint_ns,
++                (unsigned long)ulComposited, (unsigned long)get_time_in_nanos() );
++            fflush( pTiming );
++        }
+ 
+         // Under VRR the flip just committed is pending until the host answers
+         // its presentation feedback (~0.4 ms on gmstream). On DRM a pending
+diff -ru a/src/commit.h b/src/commit.h
+--- a/src/commit.h	2026-10-29 21:07:46
++++ b/src/commit.h	2026-10-29 21:07:46
+@@ -75,6 +75,9 @@
+ 	uint64_t earliest_present_time = 0;
+ 	uint64_t present_margin = 0;
+ 	uint64_t present_time = 0;
++	// When the client's commit arrived (GM_GS_TIMING); present_time is
++	// when its fence signalled.
++	uint64_t commit_ns = 0;
+ 
+ 	std::mutex m_WaitableCommitStateMutex;
+ 	int m_nCommitFence = -1;
+diff -ru a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+--- a/src/steamcompmgr.cpp	2026-10-29 21:07:46
++++ b/src/steamcompmgr.cpp	2026-10-29 21:07:46
+@@ -1722,6 +1722,18 @@
+ 	}
+ }
+ 
++GmFrameTiming g_GmFrameTiming;
++
++FILE *gm_timing_file()
++{
++	static FILE *s_pFile = []() -> FILE *
++	{
++		const char *pPath = getenv( "GM_GS_TIMING" );
++		return pPath ? fopen( pPath, "w" ) : nullptr;
++	}();
++	return s_pFile;
++}
++
+ uint64_t get_time_in_nanos()
+ {
+ 	timespec ts;
+@@ -2770,6 +2782,13 @@
+ 	if ( w )
+ 		get_window_last_done_commit( w, lastCommit );
+ 
++	if ( ( flags & PaintWindowFlag::BasePlane ) && lastCommit != nullptr )
++	{
++		g_GmFrameTiming.commitID = lastCommit->commitID;
++		g_GmFrameTiming.commit_ns = lastCommit->commit_ns;
++		g_GmFrameTiming.done_ns = lastCommit->present_time;
++	}
++
+ 	if ( flags & PaintWindowFlag::BasePlane )
+ 	{
+ 		if ( lastCommit == nullptr || cv_paint_debug_pause_base_plane )
+@@ -3111,6 +3130,8 @@
+ 	if ( !pFocus )
+ 		return;
+ 
++	g_GmFrameTiming = GmFrameTiming{ .paint_ns = get_time_in_nanos() };
++
+ 	gamescope::IBackendConnector *pConnector = pFocus->pVirtualConnector.get();
+ 	if ( !pConnector )
+ 		pConnector = GetBackend()->GetCurrentConnector();
+@@ -8408,6 +8429,7 @@
+ 		// Import failed to import, early exit.
+ 		return;
+ 	}
++	newCommit->commit_ns = reslistentry.commit_ns;
+ 
+ 	int fence = -1;
+ 	global_focus_t *pCurrentFocus = GetCurrentFocus();
+diff -ru a/src/steamcompmgr.hpp b/src/steamcompmgr.hpp
+--- a/src/steamcompmgr.hpp	2026-10-29 21:07:46
++++ b/src/steamcompmgr.hpp	2026-10-29 21:07:46
+@@ -11,6 +11,17 @@
+ 
+ unsigned int get_time_in_milliseconds(void);
+ uint64_t get_time_in_nanos();
++
++// GM_GS_TIMING=<file>: one line per frame presented to the backend, for
++// measuring gamescope's part of the latency: the base plane's commit id,
++// when its commit arrived, when its fence signalled, when paint_all started,
++// when the composite was done and when the frame was handed to the host.
++struct GmFrameTiming
++{
++	uint64_t commitID, commit_ns, done_ns, paint_ns;
++};
++extern GmFrameTiming g_GmFrameTiming;
++FILE *gm_timing_file();
+ void sleep_for_nanos(uint64_t nanos);
+ void sleep_until_nanos(uint64_t nanos);
+ timespec nanos_to_timespec( uint64_t ulNanos );
+diff -ru a/src/wlserver.cpp b/src/wlserver.cpp
+--- a/src/wlserver.cpp	2026-10-29 21:07:46
++++ b/src/wlserver.cpp	2026-10-29 21:07:46
+@@ -167,6 +167,9 @@
+ 		std::move( pAcquirePoint ),
+ 		std::move( pReleasePoint )
+ 	};
++	struct timespec gm_ts;
++	clock_gettime( CLOCK_MONOTONIC, &gm_ts );
++	newEntry.commit_ns = uint64_t( gm_ts.tv_sec ) * 1'000'000'000ull + gm_ts.tv_nsec;
+ 	wl_surf->present_id = std::nullopt;
+ 	wl_surf->desired_present_time = 0;
+ 	wl_surf->pending_presentation_feedbacks.clear();
+diff -ru a/src/wlserver.hpp b/src/wlserver.hpp
+--- a/src/wlserver.hpp	2026-10-29 21:07:46
++++ b/src/wlserver.hpp	2026-10-29 21:07:46
+@@ -50,6 +50,8 @@
+ 	uint64_t desired_present_time;
+ 	std::shared_ptr<gamescope::CAcquireTimelinePoint> pAcquirePoint;
+ 	std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint;
++	// When the client's commit arrived (GM_GS_TIMING).
++	uint64_t commit_ns = 0;
+ };
+ 
+ struct wlserver_content_override;

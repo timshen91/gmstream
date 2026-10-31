@@ -1,0 +1,137 @@
+Nested Wayland backend: the host seat's touchscreen is gamescope's. Its
+touches go to wlserver_touchdown/motion/up, normalized over the output as
+the pointer's motion is, so they follow the touch mode (SteamOS passes them
+through to Steam and games, as the Deck's own touchscreen). The backend
+held a wl_touch but never bound it.
+
+--- a/src/Backends/WaylandBackend.cpp
++++ b/src/Backends/WaylandBackend.cpp
+@@ -604,6 +604,17 @@
+ 
+ 	    void Wayland_RelativePointer_RelativeMotion( zwp_relative_pointer_v1 *pRelativePointer, uint32_t uTimeHi, uint32_t uTimeLo, wl_fixed_t fDx, wl_fixed_t fDy, wl_fixed_t fDxUnaccel, wl_fixed_t fDyUnaccel );
+         static const zwp_relative_pointer_v1_listener s_RelativePointerListener;
++
++        // The host's touchscreen is ours: its touches go to wlserver_touch*,
++        // which follow the touch mode (SteamOS passes touches through).
++        wl_surface *m_pTouchSurface = nullptr;
++        std::unordered_set<int32_t> m_TouchesDown;
++        bool TouchPosition( wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY, double *pflX, double *pflY );
++        void Wayland_Touch_Down( wl_touch *pTouch, uint32_t uSerial, uint32_t uTime, wl_surface *pSurface, int32_t nId, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY );
++        void Wayland_Touch_Up( wl_touch *pTouch, uint32_t uSerial, uint32_t uTime, int32_t nId );
++        void Wayland_Touch_Motion( wl_touch *pTouch, uint32_t uTime, int32_t nId, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY );
++        void Wayland_Touch_Cancel( wl_touch *pTouch );
++        static const wl_touch_listener s_TouchListener;
+     };
+     const wl_registry_listener CWaylandInputThread::s_RegistryListener =
+     {
+@@ -640,6 +651,16 @@
+     const zwp_relative_pointer_v1_listener CWaylandInputThread::s_RelativePointerListener =
+     {
+         .relative_motion = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_RelativePointer_RelativeMotion ),
++    };
++    const wl_touch_listener CWaylandInputThread::s_TouchListener =
++    {
++        .down        = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Down ),
++        .up          = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Up ),
++        .motion      = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Motion ),
++        .frame       = WAYLAND_NULL(),
++        .cancel      = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Cancel ),
++        .shape       = WAYLAND_NULL(),
++        .orientation = WAYLAND_NULL(),
+     };
+ 
+     class CWaylandBackend : public CBaseBackend
+@@ -3119,6 +3140,21 @@
+                 wl_keyboard_add_listener( m_pKeyboard, &s_KeyboardListener, this );
+             }
+         }
++
++        if ( !!( uCapabilities & WL_SEAT_CAPABILITY_TOUCH ) != !!m_pTouch )
++        {
++            if ( m_pTouch )
++            {
++                Wayland_Touch_Cancel( m_pTouch );
++                wl_touch_release( m_pTouch );
++                m_pTouch = nullptr;
++            }
++            else
++            {
++                m_pTouch = wl_seat_get_touch( m_pSeat );
++                wl_touch_add_listener( m_pTouch, &s_TouchListener, this );
++            }
++        }
+     }
+ 
+     void CWaylandInputThread::Wayland_Seat_Name( wl_seat *pSeat, const char *pName )
+@@ -3365,9 +3401,71 @@
+ 
+         wlserver_lock();
+         wlserver_mousemotion( wl_fixed_to_double( fDxUnaccel ), wl_fixed_to_double( fDyUnaccel ), ++m_uFakeTimestamp );
++        wlserver_unlock();
++    }
++
++    // Touch
++
++    bool CWaylandInputThread::TouchPosition( wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY, double *pflX, double *pflY )
++    {
++        CWaylandPlane *pPlane = m_pTouchSurface ? (CWaylandPlane *)wl_surface_get_user_data( m_pTouchSurface ) : nullptr;
++        if ( !pPlane )
++            return false;
++
++        auto oState = pPlane->GetCurrentState();
++        if ( !oState )
++            return false;
++
++        // Normalized over the output, as for the pointer.
++        uint32_t uScale = oState->uFractionalScale;
++        *pflX = ( wl_fixed_to_double( fSurfaceX ) * uScale / 120.0 + oState->nDestX ) / g_nOutputWidth;
++        *pflY = ( wl_fixed_to_double( fSurfaceY ) * uScale / 120.0 + oState->nDestY ) / g_nOutputHeight;
++        return true;
++    }
++    void CWaylandInputThread::Wayland_Touch_Down( wl_touch *pTouch, uint32_t uSerial, uint32_t uTime, wl_surface *pSurface, int32_t nId, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY )
++    {
++        if ( !IsGamescopeToplevel( pSurface ) )
++            return;
++
++        m_pTouchSurface = pSurface;
++        double flX, flY;
++        if ( !TouchPosition( fSurfaceX, fSurfaceY, &flX, &flY ) )
++            return;
++
++        m_TouchesDown.insert( nId );
++        wlserver_lock();
++        wlserver_touchdown( flX, flY, nId, ++m_uFakeTimestamp );
+         wlserver_unlock();
+     }
++    void CWaylandInputThread::Wayland_Touch_Up( wl_touch *pTouch, uint32_t uSerial, uint32_t uTime, int32_t nId )
++    {
++        if ( !m_TouchesDown.erase( nId ) )
++            return;
+ 
++        wlserver_lock();
++        wlserver_touchup( nId, ++m_uFakeTimestamp );
++        wlserver_unlock();
++    }
++    void CWaylandInputThread::Wayland_Touch_Motion( wl_touch *pTouch, uint32_t uTime, int32_t nId, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY )
++    {
++        double flX, flY;
++        if ( !m_TouchesDown.count( nId ) || !TouchPosition( fSurfaceX, fSurfaceY, &flX, &flY ) )
++            return;
++
++        wlserver_lock();
++        wlserver_touchmotion( flX, flY, nId, ++m_uFakeTimestamp );
++        wlserver_unlock();
++    }
++    void CWaylandInputThread::Wayland_Touch_Cancel( wl_touch *pTouch )
++    {
++        // wlserver has no cancel: every touch ends.
++        wlserver_lock();
++        for ( int32_t nId : m_TouchesDown )
++            wlserver_touchup( nId, ++m_uFakeTimestamp );
++        wlserver_unlock();
++        m_TouchesDown.clear();
++    }
++
+     /////////////////////////
+     // Backend Instantiator
+     /////////////////////////

@@ -48,6 +48,7 @@ const C_GAMEPAD_REMOVE: u8 = 0x0b;
 const C_PING: u8 = 0x0c;
 const C_DISPLAY_GRID: u8 = 0x0d;
 const C_VRR_POLICY: u8 = 0x0e;
+const C_TOUCH: u8 = 0x0f;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
@@ -612,6 +613,7 @@ async fn control_loop(recv: &mut RecvStream, client: &Client) -> Result<()> {
             // u64 anchor_ns (a vblank, host clock), u32 interval_ns.
             C_DISPLAY_GRID => core::set_display_grid(r.u64()?, r.u32()? as u64),
             C_VRR_POLICY => steam_vrr(r.u8()?),
+            C_TOUCH => core::touch(r.u8()?, r.u8()?, r.f32()?, r.f32()?),
             C_PING => {
                 let mut p = r.u64()?.to_le_bytes().to_vec();
                 p.extend_from_slice(&core::now_ns().to_le_bytes());

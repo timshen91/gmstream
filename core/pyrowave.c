@@ -12,8 +12,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <linux/dma-buf.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -50,6 +52,7 @@ struct job {
 	int sync_fd; // -1: none
 	int width, height; // encoded size
 	uint64_t slot_ns;
+	uint64_t submit_ns; // handed to the worker (GM_DEBUG_ENCODE)
 };
 
 struct import {
@@ -131,7 +134,7 @@ bool pyrowave_submit(struct gm_pyrowave *pw, struct wlr_buffer *buffer,
 		return false; // gamescope's single-pixel fills: nothing to encode
 	}
 	struct job job = { .valid = true, .sync_fd = -1, .width = width & ~1,
-		.height = height & ~1, .slot_ns = slot_ns };
+		.height = height & ~1, .slot_ns = slot_ns, .submit_ns = gm_now_ns() };
 	job.buf = (struct dmabuf){ .n_planes = attr.n_planes, .width = attr.width,
 		.height = attr.height, .format = attr.format, .modifier = attr.modifier };
 	for (int i = 0; i < attr.n_planes; i++) {
@@ -162,6 +165,24 @@ bool pyrowave_submit(struct gm_pyrowave *pw, struct wlr_buffer *buffer,
 }
 
 /* ---- worker thread ------------------------------------------------------ */
+
+// Measuring (GM_DEBUG_ENCODE=<file>): per encoded frame "e slot submitted
+// started gpu_done packetized", host ns: its slot, when the compositor
+// handed it over, when the worker started on it, when the GPU work was done
+// and when the packets were ready.
+static FILE *encode_trace(void) {
+	static FILE *f;
+	static bool opened;
+	if (!opened) {
+		opened = true;
+		const char *path = getenv("GM_DEBUG_ENCODE");
+		f = path != NULL ? fopen(path, "w") : NULL;
+		if (f != NULL) {
+			setvbuf(f, NULL, _IOLBF, 0);
+		}
+	}
+	return f;
+}
 
 // Takes ownership of the job's file descriptors either way.
 static pyrowave_image import_dmabuf(struct gm_pyrowave *pw, struct dmabuf *b) {
@@ -305,6 +326,7 @@ static void encode_one(struct gm_pyrowave *pw, struct job *job, int bitrate_kbps
 		// Blocks until the GPU is done.
 		r = pyrowave_encoder_compute_num_packets(pw->encoder, packet, &n);
 	}
+	uint64_t gpu_done = gm_now_ns();
 	if (sync != NULL) {
 		pyrowave_sync_object_destroy(sync);
 	}
@@ -333,6 +355,10 @@ static void encode_one(struct gm_pyrowave *pw, struct job *job, int bitrate_kbps
 		off += 2 + len;
 	}
 	uint64_t done = gm_now_ns();
+	if (encode_trace() != NULL) {
+		fprintf(encode_trace(), "e %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+			job->slot_ns, job->submit_ns, start, gpu_done, done);
+	}
 	struct gm_video_packet out = {
 		.data = pw->out,
 		.len = total,

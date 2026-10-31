@@ -95,6 +95,10 @@ void gm_pointer_button(uint32_t button, bool pressed);
 // Scroll in wl_pointer axis units (15 per wheel notch) and value120 steps.
 void gm_pointer_axis(double dx, double dy, int32_t v120_x, int32_t v120_y);
 void gm_key(uint32_t key, bool pressed);
+// A touchscreen: touch `id` went down, moved or up at (x, y), normalized 0..1
+// over the screen. Cancel ends every touch.
+enum gm_touch_phase { GM_TOUCH_DOWN = 0, GM_TOUCH_MOTION = 1, GM_TOUCH_UP = 2, GM_TOUCH_CANCEL = 3 };
+void gm_touch(int32_t id, int phase, double x, double y);
 
 // Gamepads appear as Xbox 360 controllers. Buttons follow the W3C standard
 // gamepad mapping (bit i = buttons[i], 0..16); sticks -32768..32767 (y down

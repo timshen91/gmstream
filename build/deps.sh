@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds the static C libraries gmstream links into its single binary, into
 # /opt/gm. Only the GPU and audio stacks (EGL, GLESv2, GBM, the VA driver,
-# libpipewire) and glibc are left to the host: they have to match its drivers.
+# libpipewire), the session and input stack (libseat, libinput, libudev:
+# they talk to the host's logind and udev) and glibc are left to the host.
 set -eux
 P=/opt/gm
 export PKG_CONFIG_PATH=$P/lib/pkgconfig:$P/share/pkgconfig
@@ -37,9 +38,16 @@ mesonb xkbcommon -Denable-x11=false -Denable-wayland=false -Denable-docs=false \
 	-Denable-xkbregistry=false -Denable-tools=true -Denable-bash-completion=false \
 	-Dxkb-config-root=/usr/share/X11/xkb
 
+# wlroots' DRM backend (the built-in screen, panel mode) parses EDIDs with it;
+# SteamOS ships 0.3 (a different soname from Debian's 0.2), so static.
+fetch https://gitlab.freedesktop.org/emersion/libdisplay-info.git 0.3.0 libdisplay-info
+mesonb libdisplay-info
+
+# DRM and libinput backends with a logind session (libseat): with no client,
+# gmstream drives the built-in screen and input devices itself.
 fetch https://gitlab.freedesktop.org/wlroots/wlroots.git 0.20.2 wlroots
-mesonb wlroots -Dbackends= -Drenderers=gles2 -Dallocators=gbm \
-	-Dsession=disabled -Dxwayland=disabled -Dcolor-management=disabled \
+mesonb wlroots -Dbackends=drm,libinput -Drenderers=gles2 -Dallocators=gbm \
+	-Dsession=enabled -Dxwayland=disabled -Dcolor-management=disabled \
 	-Dlibliftoff=disabled -Dxcb-errors=disabled -Dexamples=false
 
 # libva looks for host drivers in each of these at runtime.

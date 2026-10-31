@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 		build-essential pkg-config meson ninja-build cmake nasm git curl ca-certificates \
 		python3 bison flex libexpat1-dev libffi-dev xkb-data \
 		libegl-dev libgles-dev libgbm-dev libpipewire-0.3-dev \
+		libinput-dev libseat-dev libudev-dev hwdata \
 	&& rm -rf /var/lib/apt/lists/*
 COPY deps.sh pyrowave.sh /
 RUN sh /deps.sh && sh /pyrowave.sh

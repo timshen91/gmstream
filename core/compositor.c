@@ -10,6 +10,12 @@
 // Input arrives from the network side through gm_* calls and enters through
 // our wl_seat; gamescope's cursor image is forwarded so the client can draw
 // it natively.
+//
+// Panel mode: with no client, the frames go to this machine's own screen
+// instead (see "panel" below), as native Game Mode's gamescope would show
+// them, and its keyboard, mouse, touchpad and touchscreen drive the same
+// seat. A client connecting is a switch to another display: the screen turns
+// off and gamescope's output takes the client's mode; when it leaves, back.
 
 #include <assert.h>
 #include <inttypes.h>
@@ -30,9 +36,14 @@
 #include <linux/input-event-codes.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
+#include <wlr/backend/drm.h>
 #include <wlr/backend/headless.h>
+#include <wlr/backend/libinput.h>
+#include <wlr/backend/multi.h>
+#include <wlr/backend/session.h>
 #include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/render/allocator.h>
+#include <wlr/render/pass.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/render/wlr_texture.h>
 #include <wlr/types/wlr_buffer.h>
@@ -43,6 +54,7 @@
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/types/wlr_primary_selection.h>
@@ -51,6 +63,7 @@
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_single_pixel_buffer_v1.h>
 #include <wlr/types/wlr_subcompositor.h>
+#include <wlr/types/wlr_touch.h>
 #include <wlr/types/wlr_viewporter.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
@@ -72,6 +85,26 @@ struct vd_frame {
 	int fence_fd;
 };
 
+// A screen of this machine (a connected DRM connector), for panel mode.
+struct vd_screen {
+	struct vd_server *server;
+	struct wlr_output *output;
+	struct wl_list link; // vd_server.screens
+	struct wl_listener present;
+	struct wl_listener needs_frame;
+	struct wl_listener destroy;
+};
+
+// One of this machine's input devices (libinput), driving our seat as the
+// network's input does.
+struct vd_input {
+	struct vd_server *server;
+	struct wlr_input_device *device;
+	struct wl_list link; // vd_server.inputs
+	struct wl_listener events[4]; // by device type: see handle_new_input
+	struct wl_listener destroy;
+};
+
 struct vd_view {
 	struct vd_server *server;
 	struct wlr_xdg_toplevel *toplevel;
@@ -90,10 +123,11 @@ struct vd_server {
 	const struct gm_callbacks *cb;
 	struct wl_display *display;
 	struct wl_event_loop *loop;
-	struct wlr_backend *backend;
+	struct wlr_backend *backend; // multi: headless (streams), DRM and libinput
+	struct wlr_backend *headless;
 	struct wlr_renderer *renderer;
 	struct wlr_allocator *allocator;
-	struct wlr_output *output;
+	struct wlr_output *output; // the stream's (headless)
 	struct wlr_output_layout *layout;
 	struct wlr_presentation *presentation;
 
@@ -102,6 +136,8 @@ struct vd_server {
 	double cursor_x, cursor_y;
 	uint32_t buttons_down[8]; // pressed BTN_* codes, to release on stop
 	int n_buttons_down;
+	int32_t touches_down[10]; // touch ids down, likewise
+	int n_touches_down;
 	struct wlr_relative_pointer_manager_v1 *relative_pointer;
 	struct wlr_pointer_constraints_v1 *constraints;
 	struct wlr_pointer_constraint_v1 *active_constraint;
@@ -162,11 +198,31 @@ struct vd_server {
 	struct gm_gamepads *gamepads;
 	bool streaming;
 
+	// Panel mode (no client): frames go to `screen` (an external screen if
+	// one is connected, else the built-in panel) through KMS, one flip at a
+	// time as on native gamescope's DRM backend; gamescope's presentation
+	// feedback is answered when its frame is actually on screen. NULL
+	// session: no seat to take the screen from (no panel mode).
+	struct wlr_session *session;
+	struct wl_list screens; // vd_screen
+	struct vd_screen *screen; // in use, NULL: none
+	bool panel; // frames go to `screen`
+	struct wlr_output_cursor *screen_cursor;
+	bool flipping; // a commit is on its way to the screen
+	bool cursor_dirty; // the cursor moved during that commit
+	struct wlr_presentation_feedback *flip_feedback; // its frame's
+	// The newest frame committed during a flip, shown when it is done.
+	struct wlr_buffer *next_buffer; // locked
+	struct wlr_presentation_feedback *next_feedback;
+	struct wl_list inputs; // vd_input
+	struct wl_listener new_input;
+
 	pid_t child;
 
 	// -S: per-second delivery statistics.
 	struct wl_event_source *stats_timer;
 	unsigned stats_presented, stats_superseded, stats_fence_waits;
+	unsigned stats_copied; // panel mode: frames copied, not scanned out
 
 	struct wl_listener new_output;
 	struct wl_listener new_toplevel;
@@ -183,6 +239,8 @@ struct vd_server {
 };
 
 static void try_present(struct vd_server *server);
+static void panel_commit(struct vd_server *server, struct wlr_surface *surface);
+static void view_outputs(struct vd_server *server, struct vd_view *view);
 
 uint64_t gm_now_ns(void) {
 	struct timespec ts;
@@ -370,9 +428,15 @@ static void set_screen_size(struct vd_server *server, int width, int height,
 	}
 }
 
+static void screen_added(struct vd_server *server, struct wlr_output *output);
+
 static void handle_new_output(struct wl_listener *listener, void *data) {
 	struct vd_server *server = wl_container_of(listener, server, new_output);
 	struct wlr_output *output = data;
+	if (wlr_output_is_drm(output)) {
+		screen_added(server, output);
+		return;
+	}
 	if (server->output != NULL) {
 		return;
 	}
@@ -570,6 +634,10 @@ static void handle_view_commit(struct wl_listener *listener, void *data) {
 		server->view = view;
 		focus_view(server);
 	}
+	if (server->panel) {
+		panel_commit(server, surface);
+		return;
+	}
 
 	// Decide when a VRR panel would show this frame: now, or one maximum-
 	// refresh interval after the previous flip; a frame replacing one still
@@ -626,7 +694,7 @@ static void handle_view_map(struct wl_listener *listener, void *data) {
 	struct vd_server *server = view->server;
 	wlr_log(WLR_INFO, "Mapped toplevel %p '%s'", (void *)view,
 		view->toplevel->title ? view->toplevel->title : "");
-	wlr_surface_send_enter(view->toplevel->base->surface, server->output);
+	view_outputs(server, view);
 	if (server->view == NULL) {
 		server->view = view;
 		focus_view(server);
@@ -804,12 +872,15 @@ static void clear_cursor_surface(struct vd_server *server) {
 	}
 }
 
+static void screen_cursor_update(struct vd_server *server);
+
 static void handle_cursor_commit(struct wl_listener *listener, void *data) {
 	struct vd_server *server =
 		wl_container_of(listener, server, cursor_commit);
 	server->cursor_hotspot_x -= server->cursor_surface->current.dx;
 	server->cursor_hotspot_y -= server->cursor_surface->current.dy;
 	send_cursor(server);
+	screen_cursor_update(server);
 }
 
 static void handle_cursor_destroy(struct wl_listener *listener, void *data) {
@@ -817,6 +888,7 @@ static void handle_cursor_destroy(struct wl_listener *listener, void *data) {
 		wl_container_of(listener, server, cursor_destroy);
 	clear_cursor_surface(server);
 	send_cursor(server);
+	screen_cursor_update(server);
 }
 
 static void handle_request_set_cursor(struct wl_listener *listener,
@@ -838,6 +910,7 @@ static void handle_request_set_cursor(struct wl_listener *listener,
 		wl_signal_add(&event->surface->events.destroy, &server->cursor_destroy);
 	}
 	send_cursor(server);
+	screen_cursor_update(server);
 }
 
 /* ---- input ------------------------------------------------------------- */
@@ -895,6 +968,17 @@ static void key(struct vd_server *server, uint32_t code, bool pressed) {
 	wlr_keyboard_notify_key(&server->keyboard, &event);
 }
 
+// The size of what gamescope shows, in surface coordinates (= pixels).
+static void screen_size(struct vd_server *server, int *w, int *h) {
+	if (server->panel) {
+		*w = server->screen->output->width;
+		*h = server->screen->output->height;
+	} else {
+		*w = server->output != NULL ? server->output->width : server->width;
+		*h = server->output != NULL ? server->output->height : server->height;
+	}
+}
+
 static bool pointer_locked(struct vd_server *server) {
 	return server->active_constraint != NULL &&
 		server->active_constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED;
@@ -915,8 +999,8 @@ static void pointer_moved(struct vd_server *server, double dx, double dy,
 	// whenever Steam's cursor is hidden). Relative input under a lock only
 	// moves the client's own cursor.
 	if (absolute || !pointer_locked(server)) {
-		int w = server->output != NULL ? server->output->width : server->width;
-		int h = server->output != NULL ? server->output->height : server->height;
+		int w, h;
+		screen_size(server, &w, &h);
 		x = absolute ? x : server->cursor_x + dx;
 		y = absolute ? y : server->cursor_y + dy;
 		server->cursor_x = x < 0 ? 0 : x > w - 1 ? w - 1 : x;
@@ -926,6 +1010,10 @@ static void pointer_moved(struct vd_server *server, double dx, double dy,
 		// The view is the whole screen at (0, 0): layout == surface coords.
 		wlr_seat_pointer_notify_motion(server->seat, time,
 			server->cursor_x, server->cursor_y);
+		if (server->screen_cursor != NULL) {
+			wlr_output_cursor_move(server->screen_cursor, server->cursor_x,
+				server->cursor_y);
+		}
 	}
 	wlr_seat_pointer_notify_frame(server->seat);
 }
@@ -972,7 +1060,59 @@ static void pointer_axis(struct vd_server *server, double dx, double dy,
 	wlr_seat_pointer_notify_frame(server->seat);
 }
 
+// A client's touchscreen on gamescope's surface, which fills the screen.
+// gamescope (patch 0006) hands the touches to its own seat, following its
+// touch mode: SteamOS passes them through to Steam and the game.
+static void touch(struct vd_server *server, int32_t id, int phase, double x,
+		double y) {
+	uint32_t time = now_msec();
+	int w, h;
+	screen_size(server, &w, &h);
+	int found = -1;
+	for (int i = 0; i < server->n_touches_down; i++) {
+		if (server->touches_down[i] == id) {
+			found = i;
+		}
+	}
+	switch (phase) {
+	case GM_TOUCH_DOWN:
+		if (found >= 0 || server->n_touches_down >= 10 || server->view == NULL) {
+			return;
+		}
+		server->touches_down[server->n_touches_down++] = id;
+		wlr_seat_touch_notify_down(server->seat,
+			server->view->toplevel->base->surface, time, id, x * w, y * h);
+		break;
+	case GM_TOUCH_MOTION:
+		if (found < 0) {
+			return;
+		}
+		wlr_seat_touch_notify_motion(server->seat, time, id, x * w, y * h);
+		break;
+	case GM_TOUCH_UP:
+		if (found < 0) {
+			return;
+		}
+		server->touches_down[found] =
+			server->touches_down[--server->n_touches_down];
+		wlr_seat_touch_notify_up(server->seat, time, id);
+		break;
+	default:
+		// gamescope's own seat has no cancel either: each touch ends.
+		if (server->n_touches_down == 0) {
+			return;
+		}
+		while (server->n_touches_down > 0) {
+			wlr_seat_touch_notify_up(server->seat, time,
+				server->touches_down[--server->n_touches_down]);
+		}
+		break;
+	}
+	wlr_seat_touch_notify_frame(server->seat);
+}
+
 static void release_all_input(struct vd_server *server) {
+	touch(server, 0, GM_TOUCH_CANCEL, 0, 0);
 	while (server->n_buttons_down > 0) {
 		pointer_button(server, server->buttons_down[0], false);
 	}
@@ -1030,6 +1170,509 @@ static void handle_request_set_primary_selection(struct wl_listener *listener,
 	wlr_seat_set_primary_selection(server->seat, event->source, event->serial);
 }
 
+/* ---- panel ------------------------------------------------------------ */
+//
+// With no client, gamescope's frames go to a screen of this machine, the way
+// native Game Mode's gamescope shows them on its DRM backend: each committed
+// buffer goes to the screen as is when the display engine can scan it out,
+// else it is copied into the screen's own buffer; one flip at a time, the
+// newest frame committed during a flip going next. Presentation feedback is
+// answered from the flip's completion (real timestamps; refresh 0 under VRR),
+// so gamescope's scheduler runs on the screen's real vblanks as it does
+// natively. gamescope's cursor is put on the screen's cursor plane.
+
+static bool screen_internal(struct wlr_output *output) {
+	return strncmp(output->name, "eDP", 3) == 0 || strncmp(output->name, "LVDS", 4) == 0 ||
+		strncmp(output->name, "DSI", 3) == 0;
+}
+
+// The surface is on the output frames go to: the screen, or the stream's.
+static void view_outputs(struct vd_server *server, struct vd_view *view) {
+	struct wlr_surface *surface = view->toplevel->base->surface;
+	struct vd_screen *screen;
+	wl_list_for_each(screen, &server->screens, link) {
+		if (server->panel && screen == server->screen) {
+			wlr_surface_send_enter(surface, screen->output);
+		} else {
+			wlr_surface_send_leave(surface, screen->output);
+		}
+	}
+	if (server->output != NULL) {
+		if (server->panel) {
+			wlr_surface_send_leave(surface, server->output);
+		} else {
+			wlr_surface_send_enter(surface, server->output);
+		}
+	}
+}
+
+static void send_frame_done_at(struct vd_server *server, const struct timespec *when) {
+	if (server->view != NULL) {
+		wlr_xdg_surface_for_each_surface(server->view->toplevel->base,
+			send_frame_done, (void *)when);
+	}
+}
+
+static void answer_now(struct vd_server *server,
+		struct wlr_presentation_feedback *feedback) {
+	if (feedback == NULL) {
+		return;
+	}
+	uint64_t now = gm_now_ns();
+	struct wlr_presentation_event event = {
+		.output = server->screen != NULL ? server->screen->output : server->output,
+		.tv_sec = now / 1000000000,
+		.tv_nsec = now % 1000000000,
+	};
+	wlr_presentation_feedback_send_presented(feedback, &event);
+	wlr_presentation_feedback_destroy(feedback);
+}
+
+// Commits `buffer` (NULL: nothing new, e.g. for the cursor) to the screen.
+static void screen_show(struct vd_server *server, struct wlr_buffer *buffer,
+		struct wlr_presentation_feedback *feedback) {
+	struct wlr_output *output = server->screen->output;
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	if (buffer != NULL) {
+		wlr_output_state_set_buffer(&state, buffer);
+		if (!wlr_output_test_state(output, &state)) {
+			// Not scanned out as is (format, modifier, size): copied into
+			// the screen's own buffer, scaled to fit.
+			wlr_output_state_finish(&state);
+			wlr_output_state_init(&state);
+			server->stats_copied++;
+			struct wlr_texture *texture =
+				wlr_texture_from_buffer(server->renderer, buffer);
+			struct wlr_render_pass *pass = texture != NULL ?
+				wlr_output_begin_render_pass(output, &state, NULL) : NULL;
+			if (pass != NULL) {
+				wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
+					.texture = texture,
+					.dst_box = { .width = output->width, .height = output->height },
+					.filter_mode = WLR_SCALE_FILTER_BILINEAR,
+				});
+				wlr_render_pass_submit(pass);
+			}
+			wlr_texture_destroy(texture);
+			if (pass == NULL) {
+				wlr_log(WLR_ERROR, "Panel: cannot draw the frame");
+				wlr_output_state_finish(&state);
+				answer_now(server, feedback);
+				return;
+			}
+		}
+	}
+	server->cursor_dirty = false;
+	if (wlr_output_commit_state(output, &state)) {
+		server->flipping = true;
+		server->flip_feedback = feedback;
+		server->stats_presented += buffer != NULL;
+	} else {
+		// Session inactive (another VT), or the screen went away.
+		answer_now(server, feedback);
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		send_frame_done_at(server, &now);
+	}
+	wlr_output_state_finish(&state);
+}
+
+static void panel_commit(struct vd_server *server, struct wlr_surface *surface) {
+	struct wlr_presentation_feedback *feedback =
+		wlr_presentation_surface_sampled(surface);
+	struct wlr_buffer *buffer = surface->current.buffer;
+	// The last frame, for a client that joins (repeat_last_frame).
+	wlr_buffer_unlock(server->last_buffer);
+	server->last_buffer = wlr_buffer_lock(buffer);
+	server->last_width = surface->current.width;
+	server->last_height = surface->current.height;
+	if (server->flipping) {
+		// Replaces any frame already waiting, as a newer flip would.
+		if (server->next_buffer != NULL) {
+			server->stats_superseded++;
+			wlr_buffer_unlock(server->next_buffer);
+		}
+		if (server->next_feedback != NULL) {
+			wlr_presentation_feedback_destroy(server->next_feedback); // discarded
+		}
+		server->next_buffer = wlr_buffer_lock(buffer);
+		server->next_feedback = feedback;
+		return;
+	}
+	screen_show(server, buffer, feedback);
+}
+
+static void handle_screen_present(struct wl_listener *listener, void *data) {
+	struct vd_screen *screen = wl_container_of(listener, screen, present);
+	struct vd_server *server = screen->server;
+	struct wlr_output_event_present *event = data;
+	if (server->screen != screen || !server->flipping) {
+		return;
+	}
+	server->flipping = false;
+	if (server->flip_feedback != NULL) {
+		if (event->presented) {
+			struct wlr_presentation_event presented;
+			wlr_presentation_event_from_output(&presented, event);
+			wlr_presentation_feedback_send_presented(server->flip_feedback, &presented);
+		}
+		wlr_presentation_feedback_destroy(server->flip_feedback);
+		server->flip_feedback = NULL;
+	}
+	send_frame_done_at(server, &event->when);
+	if (!server->panel) {
+		return;
+	}
+	if (server->next_buffer != NULL) {
+		struct wlr_buffer *buffer = server->next_buffer;
+		struct wlr_presentation_feedback *feedback = server->next_feedback;
+		server->next_buffer = NULL;
+		server->next_feedback = NULL;
+		screen_show(server, buffer, feedback);
+		wlr_buffer_unlock(buffer);
+	} else if (server->cursor_dirty) {
+		screen_show(server, NULL, NULL);
+	}
+}
+
+// The cursor moved (or the backend needs a commit for another reason).
+static void handle_screen_needs_frame(struct wl_listener *listener, void *data) {
+	struct vd_screen *screen = wl_container_of(listener, screen, needs_frame);
+	struct vd_server *server = screen->server;
+	if (!server->panel || server->screen != screen) {
+		return;
+	}
+	if (server->flipping) {
+		server->cursor_dirty = true;
+	} else {
+		screen_show(server, NULL, NULL);
+	}
+}
+
+static void screen_cursor_update(struct vd_server *server) {
+	if (server->screen_cursor == NULL) {
+		return;
+	}
+	struct wlr_surface *surface = server->cursor_surface;
+	struct wlr_buffer *buffer = surface != NULL && surface->buffer != NULL ?
+		&surface->buffer->base : NULL;
+	wlr_output_cursor_set_buffer(server->screen_cursor, buffer,
+		server->cursor_hotspot_x, server->cursor_hotspot_y);
+	wlr_output_cursor_move(server->screen_cursor, server->cursor_x, server->cursor_y);
+}
+
+static void drop_next_frame(struct vd_server *server) {
+	wlr_buffer_unlock(server->next_buffer);
+	server->next_buffer = NULL;
+	if (server->next_feedback != NULL) {
+		wlr_presentation_feedback_destroy(server->next_feedback);
+		server->next_feedback = NULL;
+	}
+}
+
+// Back to this machine's screen (no client): gamescope's output takes its
+// native mode, as on native Game Mode.
+static void panel_enter(struct vd_server *server) {
+	if (server->panel || server->screen == NULL || server->streaming) {
+		return;
+	}
+	struct wlr_output *output = server->screen->output;
+	struct wlr_output_mode *mode = wlr_output_preferred_mode(output);
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	wlr_output_state_set_enabled(&state, true);
+	if (mode != NULL) {
+		wlr_output_state_set_mode(&state, mode);
+	}
+	if (output->adaptive_sync_supported) {
+		wlr_output_state_set_adaptive_sync_enabled(&state, true);
+	}
+	bool ok = wlr_output_commit_state(output, &state);
+	wlr_output_state_finish(&state);
+	if (!ok) {
+		wlr_log(WLR_ERROR, "Panel: cannot enable %s", output->name);
+		return;
+	}
+	server->panel = true;
+	// The modeset is a flip too: frames wait for it (sending one right
+	// behind it failed with "a page-flip is already pending").
+	server->flipping = true;
+	server->screen_cursor = wlr_output_cursor_create(output);
+	wlr_log(WLR_INFO, "Panel: showing on %s, %dx%d@%.3fHz%s", output->name,
+		output->width, output->height, output->refresh / 1000.0,
+		output->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED ? " VRR" : "");
+	set_screen_size(server, output->width, output->height, output->refresh);
+	struct vd_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->toplevel->base->surface->mapped) {
+			view_outputs(server, view);
+		}
+	}
+	screen_cursor_update(server);
+	if (server->last_buffer != NULL) {
+		server->next_buffer = wlr_buffer_lock(server->last_buffer); // after the modeset
+	}
+}
+
+// A client takes over: the screen turns off, as when native Game Mode moves
+// to a newly connected display.
+static void panel_leave(struct vd_server *server) {
+	if (!server->panel) {
+		return;
+	}
+	server->panel = false;
+	drop_next_frame(server);
+	if (server->flip_feedback != NULL) {
+		answer_now(server, server->flip_feedback);
+		server->flip_feedback = NULL;
+	}
+	server->flipping = false;
+	if (server->screen_cursor != NULL) {
+		wlr_output_cursor_destroy(server->screen_cursor);
+		server->screen_cursor = NULL;
+	}
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	wlr_output_state_set_enabled(&state, false);
+	wlr_output_commit_state(server->screen->output, &state);
+	wlr_output_state_finish(&state);
+	wlr_log(WLR_INFO, "Panel: %s off", server->screen->output->name);
+	struct vd_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->toplevel->base->surface->mapped) {
+			view_outputs(server, view);
+		}
+	}
+}
+
+// The screen to use: an external one if connected, else the built-in panel
+// (native Game Mode's choice).
+static void choose_screen(struct vd_server *server) {
+	struct vd_screen *best = NULL, *screen;
+	wl_list_for_each(screen, &server->screens, link) {
+		if (best == NULL || (screen_internal(best->output) && !screen_internal(screen->output))) {
+			best = screen;
+		}
+	}
+	if (best == server->screen) {
+		return;
+	}
+	bool was = server->panel;
+	if (was) {
+		panel_leave(server);
+	}
+	server->screen = best;
+	if (was || !server->streaming) {
+		panel_enter(server);
+	}
+}
+
+static void handle_screen_destroy(struct wl_listener *listener, void *data) {
+	struct vd_screen *screen = wl_container_of(listener, screen, destroy);
+	struct vd_server *server = screen->server;
+	if (server->screen == screen) {
+		panel_leave(server);
+		server->screen = NULL;
+	}
+	wl_list_remove(&screen->link);
+	wl_list_remove(&screen->present.link);
+	wl_list_remove(&screen->needs_frame.link);
+	wl_list_remove(&screen->destroy.link);
+	free(screen);
+	choose_screen(server);
+}
+
+static void screen_added(struct vd_server *server, struct wlr_output *output) {
+	if (output->non_desktop) {
+		return;
+	}
+	wlr_output_init_render(output, server->allocator, server->renderer);
+	struct vd_screen *screen = calloc(1, sizeof(*screen));
+	screen->server = server;
+	screen->output = output;
+	screen->present.notify = handle_screen_present;
+	wl_signal_add(&output->events.present, &screen->present);
+	screen->needs_frame.notify = handle_screen_needs_frame;
+	wl_signal_add(&output->events.needs_frame, &screen->needs_frame);
+	screen->destroy.notify = handle_screen_destroy;
+	wl_signal_add(&output->events.destroy, &screen->destroy);
+	wl_list_insert(&server->screens, &screen->link);
+	wlr_output_create_global(output, server->display);
+	wlr_log(WLR_INFO, "Panel: screen %s (%s)", output->name,
+		output->description ? output->description : "");
+	if (server->output != NULL) { // past start-up: hotplug
+		choose_screen(server);
+	}
+}
+
+// Input devices of this machine.
+
+static void input_key(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[0]);
+	struct wlr_keyboard_key_event *event = data;
+	key(input->server, event->keycode, event->state == WL_KEYBOARD_KEY_STATE_PRESSED);
+}
+
+static void input_motion(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[0]);
+	struct wlr_pointer_motion_event *event = data;
+	pointer_moved(input->server, event->delta_x, event->delta_y, false, 0, 0);
+}
+
+static void input_motion_absolute(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[1]);
+	struct wlr_pointer_motion_absolute_event *event = data;
+	int w, h;
+	screen_size(input->server, &w, &h);
+	pointer_moved(input->server, 0, 0, true, event->x * w, event->y * h);
+}
+
+static void input_button(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[2]);
+	struct wlr_pointer_button_event *event = data;
+	pointer_button(input->server, event->button,
+		event->state == WL_POINTER_BUTTON_STATE_PRESSED);
+}
+
+static void input_axis(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[3]);
+	struct wlr_pointer_axis_event *event = data;
+	if (event->orientation == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+		pointer_axis(input->server, 0, event->delta, 0, event->delta_discrete);
+	} else {
+		pointer_axis(input->server, event->delta, 0, event->delta_discrete, 0);
+	}
+}
+
+static void input_touch_down(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[0]);
+	struct wlr_touch_down_event *event = data;
+	touch(input->server, event->touch_id, GM_TOUCH_DOWN, event->x, event->y);
+}
+
+static void input_touch_motion(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[1]);
+	struct wlr_touch_motion_event *event = data;
+	touch(input->server, event->touch_id, GM_TOUCH_MOTION, event->x, event->y);
+}
+
+static void input_touch_up(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[2]);
+	struct wlr_touch_up_event *event = data;
+	touch(input->server, event->touch_id, GM_TOUCH_UP, 0, 0);
+}
+
+static void input_touch_cancel(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, events[3]);
+	touch(input->server, 0, GM_TOUCH_CANCEL, 0, 0);
+}
+
+static void handle_input_destroy(struct wl_listener *listener, void *data) {
+	struct vd_input *input = wl_container_of(listener, input, destroy);
+	for (int i = 0; i < 4; i++) {
+		if (input->events[i].notify != NULL) {
+			wl_list_remove(&input->events[i].link);
+		}
+	}
+	wl_list_remove(&input->destroy.link);
+	wl_list_remove(&input->link);
+	free(input);
+}
+
+static void handle_new_input(struct wl_listener *listener, void *data) {
+	struct vd_server *server = wl_container_of(listener, server, new_input);
+	struct wlr_input_device *device = data;
+	struct vd_input *input = calloc(1, sizeof(*input));
+	input->server = server;
+	input->device = device;
+	struct wl_signal *signals[4] = {0};
+	wl_notify_func_t handlers[4] = {0};
+	switch (device->type) {
+	case WLR_INPUT_DEVICE_KEYBOARD: {
+		struct wlr_keyboard *k = wlr_keyboard_from_input_device(device);
+		signals[0] = &k->events.key;
+		handlers[0] = input_key;
+		break;
+	}
+	case WLR_INPUT_DEVICE_POINTER: {
+		struct wlr_pointer *p = wlr_pointer_from_input_device(device);
+		signals[0] = &p->events.motion;
+		handlers[0] = input_motion;
+		signals[1] = &p->events.motion_absolute;
+		handlers[1] = input_motion_absolute;
+		signals[2] = &p->events.button;
+		handlers[2] = input_button;
+		signals[3] = &p->events.axis;
+		handlers[3] = input_axis;
+		break;
+	}
+	case WLR_INPUT_DEVICE_TOUCH: {
+		struct wlr_touch *t = wlr_touch_from_input_device(device);
+		signals[0] = &t->events.down;
+		handlers[0] = input_touch_down;
+		signals[1] = &t->events.motion;
+		handlers[1] = input_touch_motion;
+		signals[2] = &t->events.up;
+		handlers[2] = input_touch_up;
+		signals[3] = &t->events.cancel;
+		handlers[3] = input_touch_cancel;
+		break;
+	}
+	default: // switches (lid), tablets: not used
+		free(input);
+		return;
+	}
+	for (int i = 0; i < 4; i++) {
+		if (signals[i] != NULL) {
+			input->events[i].notify = handlers[i];
+			wl_signal_add(signals[i], &input->events[i]);
+		}
+	}
+	input->destroy.notify = handle_input_destroy;
+	wl_signal_add(&device->events.destroy, &input->destroy);
+	wl_list_insert(&server->inputs, &input->link);
+	wlr_log(WLR_INFO, "Input: %s", device->name ? device->name : "?");
+}
+
+// gamescope picks its buffers' modifier from the formats we advertise
+// (linux-dmabuf v3: the flat list, no feedback). With a screen, only those
+// its primary plane can scan out (and the renderer read) are offered, so
+// frames go to the screen as they are instead of being copied (180 of 180
+// frames copied at 2560x1600@180 before). The encoder imports these too.
+static void create_linux_dmabuf(struct vd_server *server) {
+	if (wlr_renderer_get_texture_formats(server->renderer, WLR_BUFFER_CAP_DMABUF) == NULL) {
+		return;
+	}
+	struct wlr_linux_dmabuf_v1 *dmabuf = NULL;
+	struct wlr_linux_dmabuf_feedback_v1 feedback = {0};
+	if (server->screen != NULL && wlr_linux_dmabuf_feedback_v1_init_with_options(&feedback,
+			&(struct wlr_linux_dmabuf_feedback_v1_init_options){
+				.main_renderer = server->renderer,
+				.scanout_primary_output = server->screen->output,
+			})) {
+		size_t n = feedback.tranches.size / sizeof(struct wlr_linux_dmabuf_feedback_v1_tranche);
+		struct wlr_linux_dmabuf_feedback_v1_tranche *t = feedback.tranches.data;
+		if (n >= 2 && t[0].formats.len > 0) {
+			// The first tranche scans out; the last is everything the
+			// renderer reads. Legacy clients get their union: narrow the
+			// last to the first.
+			struct wlr_drm_format_set scanout = {0};
+			if (wlr_drm_format_set_intersect(&scanout, &t[0].formats, &t[n - 1].formats)) {
+				wlr_drm_format_set_finish(&t[n - 1].formats);
+				t[n - 1].formats = scanout;
+			}
+			dmabuf = wlr_linux_dmabuf_v1_create(server->display, 4, &feedback);
+			wlr_log(WLR_INFO, "Panel: offering %zu formats %s can scan out",
+				t[0].formats.len, server->screen->output->name);
+		}
+		wlr_linux_dmabuf_feedback_v1_finish(&feedback);
+	}
+	if (dmabuf == NULL) {
+		wlr_linux_dmabuf_v1_create_with_renderer(server->display, 4, server->renderer);
+	}
+}
+
 /* ---- commands from other threads ---------------------------------------- */
 
 enum cmd_type {
@@ -1048,6 +1691,7 @@ enum cmd_type {
 	CMD_PAD_REMOVE,
 	CMD_DISPLAY_GRID,
 	CMD_VRR_POLICY,
+	CMD_TOUCH,
 };
 
 struct cmd {
@@ -1059,6 +1703,7 @@ struct cmd {
 		struct { uint8_t pad; struct gm_gamepad_state state; } pad;
 		struct { uint64_t anchor_ns, interval_ns; } grid;
 		int vrr_policy;
+		struct { int32_t id; int phase; double x, y; } touch;
 	};
 };
 
@@ -1105,6 +1750,7 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		wl_display_terminate(server->display);
 		break;
 	case CMD_STREAM_START:
+		panel_leave(server);
 		set_screen_size(server, c->stream.w, c->stream.h, c->stream.refresh);
 		server->grid_anchor_ns = server->grid_interval_ns = 0; // until this client reports one
 		server->grid_last_vblank_ns = 0;
@@ -1140,6 +1786,7 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		audio_stop(server->audio);
 		release_all_input(server);
 		gamepads_remove_all(server->gamepads);
+		panel_enter(server);
 		break;
 	case CMD_DISPLAY_GRID:
 		if (server->grid_interval_ns == 0 && c->grid.interval_ns != 0) {
@@ -1171,8 +1818,8 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		pointer_moved(server, c->motion.x, c->motion.y, false, 0, 0);
 		break;
 	case CMD_POSITION: {
-		int w = server->output != NULL ? server->output->width : server->width;
-		int h = server->output != NULL ? server->output->height : server->height;
+		int w, h;
+		screen_size(server, &w, &h);
 		pointer_moved(server, 0, 0, true, c->motion.x * w, c->motion.y * h);
 		break;
 	}
@@ -1185,6 +1832,9 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		break;
 	case CMD_KEY:
 		key(server, c->key.code, c->key.pressed);
+		break;
+	case CMD_TOUCH:
+		touch(server, c->touch.id, c->touch.phase, c->touch.x, c->touch.y);
 		break;
 	case CMD_PAD_UPDATE:
 		gamepads_update(server->gamepads, c->pad.pad, &c->pad.state);
@@ -1281,6 +1931,10 @@ void gm_key(uint32_t code, bool pressed) {
 	push((struct cmd){ .type = CMD_KEY, .key = { code, pressed } });
 }
 
+void gm_touch(int32_t id, int phase, double x, double y) {
+	push((struct cmd){ .type = CMD_TOUCH, .touch = { id, phase, x, y } });
+}
+
 void gm_gamepad_update(uint8_t pad, const struct gm_gamepad_state *state) {
 	push((struct cmd){ .type = CMD_PAD_UPDATE, .pad = { pad, *state } });
 }
@@ -1312,13 +1966,14 @@ static int handle_stats(void *data) {
 	if (server->encoder != NULL) {
 		encoder_take_stats(server->encoder, &encoded, &dropped, &encode_ms);
 	}
-	wlr_log(WLR_INFO, "stats: %u presented, %u superseded, %u fence waits, "
-		"%u encoded (%.2f ms avg), %u encoder drops, %dx%d",
-		server->stats_presented, server->stats_superseded,
+	struct wlr_output *shown = server->panel ? server->screen->output : server->output;
+	wlr_log(WLR_INFO, "stats: %u presented (%u copied), %u superseded, %u fence waits, "
+		"%u encoded (%.2f ms avg), %u encoder drops, %s %dx%d",
+		server->stats_presented, server->stats_copied, server->stats_superseded,
 		server->stats_fence_waits, encoded, encode_ms, dropped,
-		server->output->width, server->output->height);
+		shown->name, shown->width, shown->height);
 	server->stats_presented = server->stats_superseded = 0;
-	server->stats_fence_waits = 0;
+	server->stats_fence_waits = server->stats_copied = 0;
 	wl_event_source_timer_update(server->stats_timer, 1000);
 	return 0;
 }
@@ -1337,12 +1992,35 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 	};
 	wlr_log_init(config->debug ? WLR_DEBUG : WLR_INFO, NULL);
 	wl_list_init(&server.views);
+	wl_list_init(&server.screens);
+	wl_list_init(&server.inputs);
 
 	server.display = wl_display_create();
 	server.loop = wl_display_get_event_loop(server.display);
-	server.backend = wlr_headless_backend_create(server.loop);
-	if (server.backend == NULL) {
+	server.backend = wlr_multi_backend_create(server.loop);
+	server.headless = wlr_headless_backend_create(server.loop);
+	if (server.backend == NULL || server.headless == NULL) {
 		return 1;
+	}
+	wlr_multi_backend_add(server.backend, server.headless);
+	// Panel mode: this machine's screens and input devices, through the
+	// seat session (logind) as native gamescope takes them. Without one
+	// (no seat, GM_NO_PANEL), streams only.
+	if (getenv("GM_NO_PANEL") == NULL &&
+			(server.session = wlr_session_create(server.loop)) != NULL) {
+		struct wlr_device *gpu;
+		if (wlr_session_find_gpus(server.session, 1, &gpu) == 1) {
+			struct wlr_backend *drm = wlr_drm_backend_create(server.session, gpu, NULL);
+			if (drm != NULL) {
+				wlr_multi_backend_add(server.backend, drm);
+			}
+		}
+		struct wlr_backend *libinput = wlr_libinput_backend_create(server.session);
+		if (libinput != NULL) {
+			wlr_multi_backend_add(server.backend, libinput);
+		}
+	} else {
+		wlr_log(WLR_INFO, "Panel: no seat session; streams only");
 	}
 	server.renderer = wlr_renderer_autocreate(server.backend);
 	if (server.renderer == NULL) {
@@ -1350,11 +2028,6 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 		return 1;
 	}
 	wlr_renderer_init_wl_shm(server.renderer, server.display);
-	if (wlr_renderer_get_texture_formats(server.renderer,
-			WLR_BUFFER_CAP_DMABUF) != NULL) {
-		wlr_linux_dmabuf_v1_create_with_renderer(server.display, 4,
-			server.renderer);
-	}
 	server.allocator = wlr_allocator_autocreate(server.backend,
 		server.renderer);
 	if (server.allocator == NULL) {
@@ -1387,6 +2060,8 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 	wlr_xdg_output_manager_v1_create(server.display, server.layout);
 	server.new_output.notify = handle_new_output;
 	wl_signal_add(&server.backend->events.new_output, &server.new_output);
+	server.new_input.notify = handle_new_input;
+	wl_signal_add(&server.backend->events.new_input, &server.new_input);
 
 	struct wlr_xdg_shell *xdg_shell = wlr_xdg_shell_create(server.display, 6);
 	server.new_toplevel.notify = handle_new_toplevel;
@@ -1398,8 +2073,8 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 		&server.new_decoration);
 
 	server.seat = wlr_seat_create(server.display, "seat0");
-	wlr_seat_set_capabilities(server.seat,
-		WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+	wlr_seat_set_capabilities(server.seat, WL_SEAT_CAPABILITY_POINTER |
+		WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_TOUCH);
 	server.cursor_hide_timer = wl_event_loop_add_timer(server.loop,
 		handle_cursor_hide, &server);
 	server.request_set_cursor.notify = handle_request_set_cursor;
@@ -1435,9 +2110,11 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 	if (!wlr_backend_start(server.backend)) {
 		return 1;
 	}
-	wlr_headless_add_output(server.backend, server.width, server.height);
+	wlr_headless_add_output(server.headless, server.width, server.height);
 	server.cursor_x = server.width / 2.0;
 	server.cursor_y = server.height / 2.0;
+	choose_screen(&server); // panel mode until a client connects
+	create_linux_dmabuf(&server);
 
 	setenv("WAYLAND_DISPLAY", socket, true);
 	wlr_log(WLR_INFO, "Running on WAYLAND_DISPLAY=%s", socket);
@@ -1523,6 +2200,7 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 	// wlroots asserts that globals have no listeners left when the display
 	// tears them down.
 	wl_list_remove(&server.new_output.link);
+	wl_list_remove(&server.new_input.link);
 	wl_list_remove(&server.new_toplevel.link);
 	wl_list_remove(&server.new_decoration.link);
 	wl_list_remove(&server.new_constraint.link);
