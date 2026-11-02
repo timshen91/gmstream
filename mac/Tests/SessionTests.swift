@@ -8,8 +8,10 @@ final class FakeShell: SessionShell {
     var shortestRefresh = 1.0 / 60
     var fullScreen = false
     var vrr = false
+    var vrrCapable = false
     var displayColorSpace: CGColorSpace? = CGColorSpace(name: CGColorSpace.displayP3)
     var focused = true
+    var capturesMouse = false
     var lines: [String] = []
     var locks: [Bool] = []
     var cursorChanges = 0
@@ -30,7 +32,7 @@ final class SessionTests: XCTestCase {
     override func setUp() {
         saved = options
         options = Options(["--no-keep-awake"])
-        options.pacingAuto = true
+        options.pacingMode = .auto
         host = FakeHost()
         options.host = "127.0.0.1"
         options.port = host.port
@@ -90,22 +92,40 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(session.pacing.phaseLock)
         XCTAssertTrue(session.renderer.holdFrames)
         XCTAssertEqual(next(Msg.vrrPolicy), Data([2]), "VRR: Steam's VRR on")
-        options.pacingAuto = false
+        shell.vrrCapable = true
+        options.pacingMode = .manual
+        options.vrrMode = .steam
         session.apply(.phaseLock)
-        XCTAssertEqual(next(Msg.vrrPolicy), Data([0]), "manual: Steam's toggle left alone")
+        XCTAssertEqual(next(Msg.vrrPolicy), Data([0]), "manual, Steam: its toggle left alone")
+        options.pacingMode = .lowLatency
+        session.apply(.phaseLock)
+        XCTAssertEqual(next(Msg.vrrPolicy), Data([2]), "low latency, a capable display: on")
+        XCTAssertFalse(session.pacing.phaseLock)
+        XCTAssertFalse(session.renderer.holdFrames)
     }
 
     func testVsyncStaysOnUntilTheGridIsMeasured() {
         options.immediateFullScreen = true
+        options.pacingMode = .manual
+        options.phaseLock = true
         shell.fullScreen = true
         session.applyPresentMode()
         XCTAssertFalse(session.immediate, "phase lock with no grid yet")
         XCTAssertTrue(session.renderer.layer.displaySyncEnabled)
         options.phaseLock = false
-        options.pacingAuto = false
         session.applyPresentMode()
         XCTAssertTrue(session.immediate, "no phase lock: vsync off at once")
         XCTAssertFalse(session.renderer.layer.displaySyncEnabled)
+        options.pacingMode = .auto
+        session.applyPresentMode()
+        XCTAssertFalse(session.immediate, "the setting is Manual's")
+        options.immediateFullScreen = false
+        options.pacingMode = .lowLatency
+        session.applyPresentMode()
+        XCTAssertTrue(session.immediate, "low latency: vsync off, whatever the setting says")
+        shell.fullScreen = false
+        session.applyPresentMode()
+        XCTAssertFalse(session.immediate, "only in full screen")
     }
 
     func testSettingsChangesReachTheHost() {
@@ -133,18 +153,114 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(keys, ["30+", "42+", "42-", "30-"])
     }
 
-    func testAClickWhileTheHostWantsThePointerCapturesItInstead() {
-        _ = connect()
+    func testAClickCapturesThePointer() {
+        shell.capturesMouse = true
         shell.focused = false
-        session.pointerLock(true)
-        XCTAssertEqual(shell.locks, [false], "not focused: not captured yet")
+        _ = connect()
+        XCTAssertFalse(shell.locks.contains(true), "not focused: not captured yet")
         session.button(Session.leftButton, down: true)
-        XCTAssertEqual(shell.locks, [false, true])
+        XCTAssertEqual(shell.locks.last, true)
         session.lockActive = true // the shell captured it
         session.button(Session.rightButton, down: true)
         let b = next(Msg.button)
         XCTAssertEqual(b?.u16(0), Session.rightButton, "the capturing click is not sent")
         XCTAssertEqual(b?[2], 1)
+    }
+
+    func testTheMouseIsCapturedInEverySetting() {
+        shell.capturesMouse = true
+        _ = connect()
+        for mode in CursorMode.allCases {
+            for mouse in MouseMode.allCases {
+                for c in Confinement.allCases {
+                    (options.cursorMode, options.mouseMode, options.confinement) = (mode, mouse, c)
+                    session.apply(.cursor)
+                    XCTAssertEqual(shell.locks.last, true, "\(mode.name) \(mouse.name) \(c.name)")
+                }
+            }
+        }
+        session.relative(true)
+        session.relative(false)
+        XCTAssertEqual(shell.locks.last, true, "whatever the game asks")
+    }
+
+    func testAShellThatCantCaptureOnlyDoesForRelative() {
+        _ = connect()
+        session.relative(true)
+        XCTAssertEqual(shell.locks.last, true, "Auto follows the game")
+        session.relative(false)
+        XCTAssertEqual(shell.locks.last, false)
+    }
+
+    func testAutoFollowsTheGameAndManualDoesNot() {
+        XCTAssertFalse(session.confined, "Auto, no clip: free")
+        XCTAssertFalse(session.sendsMotion, "Auto, absolute")
+        session.relative(true)
+        XCTAssertFalse(session.confined, "relative says nothing about the clip")
+        XCTAssertTrue(session.sendsMotion, "Auto, relative")
+        session.cursorClip(CGRect(x: 0, y: 0, width: 10, height: 10))
+        XCTAssertTrue(session.confined, "Auto, a clip")
+        options.confinement = .none
+        XCTAssertFalse(session.confined, "None stands, whatever the game asks")
+        options.mouseMode = .absolute
+        XCTAssertFalse(session.sendsMotion, "as does the mouse's")
+        session.relative(false)
+        options.mouseMode = .relative
+        XCTAssertTrue(session.sendsMotion, "with the game asking for positions")
+    }
+
+    func testMouseAndConfinementAreIndependent() {
+        options.mouseMode = .relative
+        XCTAssertTrue(session.sendsMotion)
+        XCTAssertFalse(session.confined)
+        options.mouseMode = .absolute
+        session.cursorClip(CGRect(x: 0, y: 0, width: 10, height: 10))
+        XCTAssertFalse(session.sendsMotion)
+        XCTAssertTrue(session.confined)
+    }
+
+    func testTheCursorFollowsGamescopeUnlessSetOtherwise() {
+        XCTAssertNil(session.clientCursor, "Auto, no image: hidden")
+        session.cursor(width: 2, height: 2, hotX: 1, hotY: 0, rgba: Data(count: 16))
+        XCTAssertEqual(session.clientCursor?.hotX, 1, "Auto, an image: drawn")
+        options.cursorMode = .hide
+        XCTAssertNil(session.clientCursor)
+        session.cursor(width: 0, height: 0, hotX: 0, hotY: 0, rgba: Data())
+        options.cursorMode = .show
+        XCTAssertNil(session.clientCursor?.image, "Show, no image: the arrow")
+        XCTAssertNotNil(session.clientCursor)
+    }
+
+    func testTheCursorSourceIsWhatGamescopeSends() {
+        XCTAssertEqual(session.cursorSource, "remote")
+        session.cursor(width: 2, height: 2, hotX: 1, hotY: 0, rgba: Data(count: 16))
+        XCTAssertEqual(session.cursorSource, "hardware")
+        options.cursorMode = .hide
+        XCTAssertEqual(session.cursorSource, "hardware", "what we draw doesn't change what gamescope sends")
+        session.cursor(width: 0, height: 0, hotX: 0, hotY: 0, rgba: Data())
+        options.cursorMode = .show
+        XCTAssertEqual(session.cursorSource, "remote", "Show's arrow is ours, not the game's")
+    }
+
+    func testCursorAreaIsTheClipInsideTheVideo() {
+        session.streamSize = CGSize(width: 3840, height: 2160)
+        let view = CGSize(width: 1920, height: 1200) // half size, letterboxed: y 60...1140
+        XCTAssertEqual(session.cursorArea(in: view), session.videoRect(in: view), "no clip: all of it")
+        session.cursorClip(CGRect(x: 483, y: 3, width: 2874, height: 2154)) // WC3's on a 4K stream
+        let r = session.cursorArea(in: view)
+        XCTAssertEqual(r.minX, 241.5, accuracy: 1e-9)
+        XCTAssertEqual(r.minY, 61.5, accuracy: 1e-9)
+        XCTAssertEqual(r.width, 1437, accuracy: 1e-9)
+        XCTAssertEqual(r.height, 1077, accuracy: 1e-9)
+        options.confinement = .none
+        XCTAssertEqual(session.cursorArea(in: view), session.videoRect(in: view), "None: all of it")
+        options.confinement = .auto
+        session.relative(true)
+        XCTAssertEqual(session.cursorArea(in: view), r, "with relative too")
+        session.relative(false)
+        session.cursorClip(nil) // gamescope: Steam took the mouse
+        XCTAssertFalse(session.confined)
+        XCTAssertEqual(session.cursorArea(in: view), session.videoRect(in: view))
     }
 
     func testPointerPositionsAndScrolling() {
@@ -184,7 +300,7 @@ final class SessionTests: XCTestCase {
     func testForceClientCursorShowsAnArrowWhereTheHostShowsNone() {
         session.cursor(width: 0, height: 0, hotX: 0, hotY: 0, rgba: Data())
         XCTAssertNil(session.clientCursor, "the host's call by default")
-        options.forceClientCursor = true
+        options.cursorMode = .show
         let changes = shell.cursorChanges
         session.apply(.cursor)
         XCTAssertEqual(shell.cursorChanges, changes + 1, "the app redraws it at once")

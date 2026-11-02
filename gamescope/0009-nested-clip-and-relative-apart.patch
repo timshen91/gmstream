@@ -1,0 +1,308 @@
+Nested backend: clip, relative and the cursor image reach the host separately.
+
+
+diff -ru a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
+--- a/src/Backends/WaylandBackend.cpp	2026-11-01 17:00:54
++++ b/src/Backends/WaylandBackend.cpp	2026-11-02 20:31:35
+@@ -461,6 +461,7 @@
+         ///////////////////
+ 
+         virtual void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info ) override;
++        virtual void SetCursorClip( const CursorClip &clip ) override;
+         virtual void SetRelativeMouseMode( bool bRelative ) override;
+         virtual void SetVisible( bool bVisible ) override;
+         virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override;
+@@ -482,6 +483,7 @@
+         CWaylandPlane m_Planes[k_nMaxLayers + 1];
+         bool m_bVisible = true;
+         std::atomic<bool> m_bDesiredFullscreenState = { false };
++        CursorClip m_CursorClip;
+ 
+         bool m_bHostCompositorIsCurrentlyVRR = false;
+     };
+@@ -721,7 +723,7 @@
+         bool SupportsColorManagement() const;
+ 
+         void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info );
+-        void SetRelativeMouseMode( wl_surface *pSurface, bool bRelative );
++        void SetRelativeMouseMode( wl_surface *pSurface, bool bRelative, const INestedHints::CursorClip &clip, uint32_t uScale );
+         void UpdateCursor();
+ 
+         friend CWaylandConnector;
+@@ -864,9 +866,10 @@
+         wl_pointer *m_pPointer = nullptr;
+         wl_touch *m_pTouch = nullptr;
+         zwp_locked_pointer_v1 *m_pLockedPointer = nullptr;
++        zwp_confined_pointer_v1 *m_pConfinedPointer = nullptr;
+ 		bool m_bPointerLocked = false;
+         wl_surface *m_pLockedSurface = nullptr;
+-        zwp_relative_pointer_v1 *m_pRelativePointer = nullptr;
++        INestedHints::CursorClip m_CursorClip;
+ 
+         bool m_bCanUseModifiers = false;
+         std::unordered_map<uint32_t, std::vector<uint64_t>> m_FormatModifiers;
+@@ -1292,10 +1295,15 @@
+     {
+         m_pBackend->SetCursorImage( std::move( info ) );
+     }
++    void CWaylandConnector::SetCursorClip( const CursorClip &clip )
++    {
++        m_CursorClip = clip;
++    }
+     void CWaylandConnector::SetRelativeMouseMode( bool bRelative )
+     {
+         // TODO: Do more tracking across multiple connectors, and activity here if we ever want to use this.
+-        m_pBackend->SetRelativeMouseMode( m_Planes[0].GetSurface(), bRelative );
++        auto oState = m_Planes[0].GetCurrentState();
++        m_pBackend->SetRelativeMouseMode( m_Planes[0].GetSurface(), bRelative, m_CursorClip, oState ? oState->uFractionalScale : 120u );
+     }
+     void CWaylandConnector::SetVisible( bool bVisible )
+     {
+@@ -2502,41 +2510,63 @@
+ 
+         UpdateCursor();
+     }
+-    void CWaylandBackend::SetRelativeMouseMode( wl_surface *pSurface, bool bRelative )
++    // A surface can have one constraint, so one carries both: a lock asks for
++    // relative input and a confinement doesn't, and the region of either is the
++    // clip. The host takes them as two independent things. Positions and motion
++    // are both taken in at all times: which one comes is the host's choice.
++    void CWaylandBackend::SetRelativeMouseMode( wl_surface *pSurface, bool bRelative, const INestedHints::CursorClip &clip, uint32_t uScale )
+     {
+         if ( !m_pPointer )
+             return;
+ 
+-        if ( !!bRelative != !!m_pLockedPointer || ( pSurface != m_pLockedSurface && bRelative ) )
+-        {
+-            if ( m_pLockedPointer )
+-            {
+-                assert( m_pRelativePointer );
++        m_InputThread.SetRelativePointer( true );
+ 
+-                zwp_locked_pointer_v1_destroy( m_pLockedPointer );
+-                m_pLockedPointer = nullptr;
+-                m_bPointerLocked = false;
++        const bool bConfine = clip.bEnabled && !bRelative;
++        if ( bRelative == !!m_pLockedPointer && bConfine == !!m_pConfinedPointer && clip == m_CursorClip &&
++             ( pSurface == m_pLockedSurface || !( bRelative || bConfine ) ) )
++            return;
+ 
+-                zwp_relative_pointer_v1_destroy( m_pRelativePointer );
+-                m_pRelativePointer = nullptr;
++        if ( m_pLockedPointer )
++        {
++            zwp_locked_pointer_v1_destroy( m_pLockedPointer );
++            m_pLockedPointer = nullptr;
++            m_bPointerLocked = false;
++        }
++        if ( m_pConfinedPointer )
++        {
++            zwp_confined_pointer_v1_destroy( m_pConfinedPointer );
++            m_pConfinedPointer = nullptr;
++        }
++        m_pLockedSurface = nullptr;
++        m_CursorClip = clip;
+ 
+-                m_pLockedSurface = nullptr;
+-            }
++        wl_region *pRegion = nullptr;
++        if ( clip.bEnabled )
++        {
++            const int32_t nLeft = WaylandScaleToLogical( clip.nLeft, uScale );
++            const int32_t nTop = WaylandScaleToLogical( clip.nTop, uScale );
++            pRegion = wl_compositor_create_region( m_pCompositor );
++            wl_region_add( pRegion, nLeft, nTop,
++                WaylandScaleToLogical( clip.nRight, uScale ) - nLeft,
++                WaylandScaleToLogical( clip.nBottom, uScale ) - nTop );
++        }
+ 
+-			if ( bRelative )
+-			{
+-				m_pLockedPointer = zwp_pointer_constraints_v1_lock_pointer( m_pPointerConstraints, pSurface, m_pPointer, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
+-				zwp_locked_pointer_v1_add_listener( m_pLockedPointer, &s_LockedPointerListener, this );
++        if ( bRelative )
++        {
++            m_pLockedPointer = zwp_pointer_constraints_v1_lock_pointer( m_pPointerConstraints, pSurface, m_pPointer, pRegion, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
++            zwp_locked_pointer_v1_add_listener( m_pLockedPointer, &s_LockedPointerListener, this );
++            m_pLockedSurface = pSurface;
++        }
++        else if ( bConfine )
++        {
++            m_pConfinedPointer = zwp_pointer_constraints_v1_confine_pointer( m_pPointerConstraints, pSurface, m_pPointer, pRegion, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
++            m_pLockedSurface = pSurface;
++        }
+ 
+-				m_pRelativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer( m_pRelativePointerManager, m_pPointer );
++        if ( pRegion )
++            wl_region_destroy( pRegion );
+ 
+-				m_pLockedSurface = pSurface;
+-			}
+-
+-            m_InputThread.SetRelativePointer( bRelative );
+-
+-            UpdateCursor();
+-        }
++        UpdateCursor();
+     }
+ 
+     void CWaylandBackend::UpdateCursor()
+@@ -2557,7 +2587,8 @@
+         }
+         else
+         {
+-			bool bHideCursor = m_bPointerLocked || !m_pCursorSurface;
++			// The cursor image goes to the host whatever the mouse mode.
++			bool bHideCursor = !m_pCursorSurface;
+ 
+             if ( bHideCursor )
+                 wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, nullptr, 0, 0 );
+@@ -3000,7 +3031,7 @@
+ 
+     void CWaylandInputThread::SetRelativePointer( bool bRelative )
+     {
+-        if ( bRelative == !!m_pRelativePointer.load() )
++        if ( bRelative == !!m_pRelativePointer.load() || !m_pPointer )
+             return;
+         // This constructors/destructors the display's mutex, so should be safe to do across threads.
+         if ( !bRelative )
+@@ -3205,9 +3236,6 @@
+ 		if ( !pPlane )
+ 			return;
+ 
+-        if ( m_pRelativePointer.load() != nullptr )
+-            return;
+-
+         if ( !cv_wayland_mouse_warp_without_keyboard_focus && !m_bKeyboardEntered )
+         {
+             // Don't do any motion/movement stuff if we don't have kb focus
+@@ -3407,7 +3435,7 @@
+     void CWaylandInputThread::Wayland_RelativePointer_RelativeMotion( zwp_relative_pointer_v1 *pRelativePointer, uint32_t uTimeHi, uint32_t uTimeLo, wl_fixed_t fDx, wl_fixed_t fDy, wl_fixed_t fDxUnaccel, wl_fixed_t fDyUnaccel )
+     {
+ 		// Don't do any motion/movement stuff if we don't have kb focus
+-		if ( !m_pBackend->m_bPointerLocked || ( !cv_wayland_mouse_relmotion_without_keyboard_focus && !m_bKeyboardEntered ) )
++		if ( !cv_wayland_mouse_relmotion_without_keyboard_focus && !m_bKeyboardEntered )
+ 			return;
+ 
+         wlserver_lock();
+diff -ru a/src/backend.h b/src/backend.h
+--- a/src/backend.h	2026-11-01 17:00:54
++++ b/src/backend.h	2026-11-02 20:30:21
+@@ -265,7 +265,19 @@
+             uint32_t uYHotspot;
+         };
+ 
++        // Where the focused game keeps the cursor, in output pixels. It tells a
++        // host that draws the cursor itself as much as the output image does.
++        struct CursorClip
++        {
++            bool bEnabled = false;
++            int32_t nLeft = 0, nTop = 0, nRight = 0, nBottom = 0;
++
++            bool operator==( const CursorClip & ) const = default;
++        };
++
+         virtual void SetCursorImage( std::shared_ptr<CursorInfo> info ) = 0;
++        // Takes effect with the next SetRelativeMouseMode, independently of it.
++        virtual void SetCursorClip( const CursorClip &clip ) {}
+         virtual void SetRelativeMouseMode( bool bRelative ) = 0;
+         virtual void SetVisible( bool bVisible ) = 0;
+         virtual void SetTitle( std::shared_ptr<std::string> szTitle ) = 0;
+diff -ru a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+--- a/src/steamcompmgr.cpp	2026-11-01 17:00:54
++++ b/src/steamcompmgr.cpp	2026-11-02 20:30:21
+@@ -2854,6 +2854,69 @@
+ 
+ bool g_bFirstFrame = true;
+ 
++// Where the game with the input focus keeps the cursor, in output pixels: for a
++// host that draws the cursor itself, which sees only the finished image. Wine's
++// ClipCursor maps an override-redirect InputOnly window at the rectangle, which
++// Xwayland doesn't pass on (only that the pointer is confined); inside the game's
++// window is how Xwayland itself matches such a window to a surface. Any other
++// confinement or lock of the focused surface covers all of the window.
++//
++// The scale and offset are the base plane's, which wlserver_mousewarp_normalized
++// goes by the other way, so the edge of this is the edge of the clip for clicks.
++static gamescope::INestedHints::CursorClip gm_cursor_clip( global_focus_t *pFocus )
++{
++	gamescope::INestedHints::CursorClip clip;
++
++	steamcompmgr_win_t *w = pFocus->inputFocusWindow;
++	if ( !w || w->type != steamcompmgr_win_type_t::XWAYLAND || w == pFocus->overlayWindow || window_is_steam( w ) )
++		return clip;
++
++	const BaseLayerInfo_t &base = pFocus->CachedPlanes[ HELD_COMMIT_BASE ];
++	if ( base.windowScale[0] <= 0.0f || base.windowScale[1] <= 0.0f )
++		return clip;
++
++	const auto window = w->GetGeometry();
++	int32_t nLeft = 0, nTop = 0, nRight = window.nWidth, nBottom = window.nHeight;
++
++	for ( steamcompmgr_win_t *c = w->xwayland().ctx->list; c; c = c->xwayland().next )
++	{
++		const auto &a = c->xwayland().a;
++		if ( a.c_class != InputOnly || !a.override_redirect || a.map_state != IsViewable )
++			continue;
++
++		const int32_t nX = a.x - window.nX, nY = a.y - window.nY;
++		if ( nX < 0 || nY < 0 || nX + a.width > window.nWidth || nY + a.height > window.nHeight )
++			continue;
++
++		nLeft = nX;
++		nTop = nY;
++		nRight = nX + a.width;
++		nBottom = nY + a.height;
++		clip.bEnabled = true;
++		break;
++	}
++
++	if ( !clip.bEnabled )
++	{
++		wlserver_lock();
++		clip.bEnabled = wlserver.GetCursorConstraint() != nullptr;
++		wlserver_unlock();
++	}
++
++	if ( !clip.bEnabled )
++		return clip;
++
++	auto output = []( int32_t nGame, float flScale, float flOffset, uint32_t uSize ) {
++		return std::clamp<int32_t>( lroundf( nGame / flScale - flOffset ), 0, uSize );
++	};
++	clip.nLeft = output( nLeft, base.windowScale[0], base.windowOffset[0], currentOutputWidth );
++	clip.nTop = output( nTop, base.windowScale[1], base.windowOffset[1], currentOutputHeight );
++	clip.nRight = output( nRight, base.windowScale[0], base.windowOffset[0], currentOutputWidth );
++	clip.nBottom = output( nBottom, base.windowScale[1], base.windowOffset[1], currentOutputHeight );
++	clip.bEnabled = clip.nRight > clip.nLeft && clip.nBottom > clip.nTop;
++	return clip;
++}
++
+ static bool is_fading_out( const global_focus_t *pFocus )
+ {
+ 	return pFocus->uFadeOutStartTime || pFocus->bPendingFade;
+@@ -10694,10 +10757,6 @@
+ 
+ 			if ( pPaintFocus->GetNestedHints() && !g_bForceRelativeMouse )
+ 			{
+-				const bool bImageEmpty =
+-					( pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty() ) &&
+-					( !window_is_steam( pPaintFocus->inputFocusWindow ) );
+-
+ 				const bool bHasPointerConstraint = pPaintFocus->cursor && pPaintFocus->cursor->IsConstrained();
+ 
+ 				uint32_t uAppId = pPaintFocus->inputFocusWindow
+@@ -10706,8 +10765,12 @@
+ 
+ 				const bool bExcludedAppId = uAppId && gamescope::Algorithm::Contains( s_uRelativeMouseFilteredAppids, uAppId );
+ 
+-				const bool bRelativeMouseMode = bImageEmpty && bHasPointerConstraint && !bExcludedAppId;
++				// Three things go to the host, each on its own: the cursor image, the
++				// clip, and whether the game wants motion. A lock means it does.
++				const bool bRelativeMouseMode = bHasPointerConstraint && !bExcludedAppId &&
++					!window_is_steam( pPaintFocus->inputFocusWindow );
+ 
++				pPaintFocus->GetNestedHints()->SetCursorClip( gm_cursor_clip( pPaintFocus ) );
+ 				pPaintFocus->GetNestedHints()->SetRelativeMouseMode( bRelativeMouseMode );
+ 			}
+ 

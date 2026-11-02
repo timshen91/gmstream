@@ -4,7 +4,7 @@
 //
 // Threads: gm_run() runs the compositor on the calling thread. All gm_*
 // functions below it are thread-safe; they queue a command for the compositor
-// thread. Callbacks come from the compositor thread (cursor, pointer_lock,
+// thread. Callbacks come from the compositor thread (cursor, relative, cursor_clip,
 // rumble), the encoder thread (video) and the PipeWire thread (audio); they
 // must not block.
 #ifndef GM_H
@@ -52,7 +52,12 @@ struct gm_callbacks {
 	void (*video)(void *ctx, const struct gm_video_packet *packet);
 	void (*audio)(void *ctx, const uint8_t *opus, size_t len, uint64_t pts_ns);
 	void (*cursor)(void *ctx, const struct gm_cursor *cursor);
-	void (*pointer_lock)(void *ctx, bool locked);
+	// Each from gamescope's pointer constraint, and independent of each other and
+	// of the cursor image: whether the game wants motion, and where it keeps the
+	// cursor in stream pixels (all 0: nowhere in particular).
+	void (*relative)(void *ctx, bool relative);
+	void (*cursor_clip)(void *ctx, uint16_t left, uint16_t top, uint16_t right,
+		uint16_t bottom);
 	void (*rumble)(void *ctx, uint8_t pad, uint16_t strong, uint16_t weak,
 		uint16_t duration_ms);
 };

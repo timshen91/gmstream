@@ -11,8 +11,8 @@ enum Msg {
         scroll: UInt8 = 0x09, gamepad: UInt8 = 0x0a, gamepadRemove: UInt8 = 0x0b, ping: UInt8 = 0x0c, displayGrid: UInt8 = 0x0d,
         vrrPolicy: UInt8 = 0x0e, touch: UInt8 = 0x0f
     // Host → client.
-    static let helloAck: UInt8 = 0x81, cursor: UInt8 = 0x82, pointerLock: UInt8 = 0x83,
-        rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86
+    static let helloAck: UInt8 = 0x81, cursor: UInt8 = 0x82, relative: UInt8 = 0x83,
+        rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86, cursorClip: UInt8 = 0x87
 }
 
 let protocolVersion: UInt16 = 3
@@ -62,7 +62,10 @@ protocol ConnectionDelegate: AnyObject {
     /// The rest on the main thread.
     func helloAck(codec: UInt8)
     func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data)
-    func pointerLock(_ locked: Bool)
+    /// The game wants motion, not positions.
+    func relative(_ on: Bool)
+    /// Where the game keeps the cursor, in stream pixels; nil: nowhere in particular.
+    func cursorClip(_ clip: CGRect?)
     func rumble(index: Int, strong: UInt16, weak: UInt16, ms: Int)
     func closed(reason: String)
 }
@@ -484,9 +487,13 @@ final class Connection {
             let w = Int(body.u16(0)), h = Int(body.u16(2)), hx = Int(body.i16(4)), hy = Int(body.i16(6))
             let rgba = body.subdata(in: body.startIndex + 8..<body.endIndex)
             DispatchQueue.main.async { self.delegate?.cursor(width: w, height: h, hotX: hx, hotY: hy, rgba: rgba) }
-        case Msg.pointerLock where body.count >= 1:
-            let locked = body[body.startIndex] != 0
-            DispatchQueue.main.async { self.delegate?.pointerLock(locked) }
+        case Msg.relative where body.count >= 1:
+            let on = body[body.startIndex] != 0
+            DispatchQueue.main.async { self.delegate?.relative(on) }
+        case Msg.cursorClip where body.count >= 8:
+            let (l, t, r, b) = (Int(body.u16(0)), Int(body.u16(2)), Int(body.u16(4)), Int(body.u16(6)))
+            let clip = r > l && b > t ? CGRect(x: l, y: t, width: r - l, height: b - t) : nil
+            DispatchQueue.main.async { self.delegate?.cursorClip(clip) }
         case Msg.rumble where body.count >= 7:
             let (i, s, w, ms) = (Int(body[body.startIndex]), body.u16(1), body.u16(3), Int(body.u16(5)))
             DispatchQueue.main.async { self.delegate?.rumble(index: i, strong: s, weak: w, ms: ms) }

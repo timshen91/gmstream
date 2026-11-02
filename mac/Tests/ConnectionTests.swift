@@ -97,7 +97,9 @@ final class ConnectionTests: XCTestCase {
         let stream = FakeHost.message(Msg.helloAck, Data([3]))
             + FakeHost.message(Msg.pong + 0x40) // an unknown type: skipped
             + FakeHost.message(Msg.cursor, cursor.data)
-            + FakeHost.message(Msg.pointerLock, Data([1]))
+            + FakeHost.message(Msg.relative, Data([1]))
+            + FakeHost.message(Msg.cursorClip, Data([100, 0, 50, 0, 44, 1, 244, 1])) // 100,50 - 300,500
+            + FakeHost.message(Msg.cursorClip, Data(repeating: 0, count: 8))
             + FakeHost.message(Msg.rumble, rumble.data)
             + FakeHost.message(Msg.error, Data("bye".utf8))
         // Seven-byte pieces, each odd/even pair swapped, and a stale repeat.
@@ -108,11 +110,13 @@ final class ConnectionTests: XCTestCase {
             host.sendControl(pieces[i], seq: UInt32(i))
             if n == 4 { host.sendControl(pieces[0], seq: 0) }
         }
-        waitForEvents(5)
+        waitForEvents(7)
         XCTAssertEqual(recorder.snapshot.events, [
             "helloAck 3",
             "cursor 2x1 hot -1,5 [1, 2, 3, 4, 5, 6, 7, 8]",
-            "pointerLock true",
+            "relative true",
+            "cursorClip (100.0, 50.0, 200.0, 450.0)",
+            "cursorClip none",
             "rumble 1 1000 2000 300",
             "closed bye",
         ])

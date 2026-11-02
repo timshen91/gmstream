@@ -131,6 +131,7 @@ fn main() {
         })
         .expect("watchdog thread");
 
+
     let code = core::run(&config, &session::HUB);
     exit(code);
 }

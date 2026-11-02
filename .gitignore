@@ -7,3 +7,5 @@
 /mac/build/
 /ipad/build/
 /ipad/GMStream.xcodeproj/
+tools/mockgame/mockgame.exe
+.DS_Store

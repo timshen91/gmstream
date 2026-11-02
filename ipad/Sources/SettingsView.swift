@@ -6,7 +6,7 @@ import SwiftUI
 
 struct SettingsView: View {
     /// What pacing is in effect (Session.pacingNow).
-    let pacing: (phaseLock: Bool, hold: Bool, note: String)
+    let pacing: (phaseLock: Bool, hold: Bool, vsyncOff: Bool, vrr: VRRMode, note: String)
     /// Called with what changed, after `options` was updated and saved.
     let done: ([SettingsChange]) -> Void
 
@@ -49,8 +49,13 @@ struct SettingsView: View {
                     Toggle("Keep Wi-Fi awake (60 tiny packets/s to the host)", isOn: $o.keepWiFiAwake)
                 }
                 Section {
-                    Toggle("Force client cursor", isOn: $o.forceClientCursor)
-                } footer: { Text("A mouse or trackpad always shows a cursor here, also where the host hides it.") }
+                    Picker("Cursor", selection: $o.cursorMode) {
+                        ForEach(CursorMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    Picker("Mouse", selection: $o.mouseMode) {
+                        ForEach(MouseMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                } footer: { Text("Show: a mouse or trackpad always shows a cursor here, also where the host hides it.") }
                 Section {
                     Toggle("Touch as a touchscreen", isOn: $o.touchscreen)
                 } footer: {
@@ -58,15 +63,14 @@ struct SettingsView: View {
                          : "A finger is the mouse, its left button held.")
                 }
                 Section {
-                    Picker("Pacing", selection: $o.pacingAuto) {
-                        Text("Auto (from the display)").tag(true)
-                        Text("Manual").tag(false)
+                    Picker("Pacing", selection: $o.pacingMode) {
+                        ForEach(PacingMode.allCases, id: \.self) { Text($0.title).tag($0) }
                     }
                     Toggle("Pace the host to this display's refreshes (phase lock)",
-                           isOn: o.pacingAuto ? .constant(pacing.phaseLock) : $o.phaseLock).disabled(o.pacingAuto)
+                           isOn: o.pacingMode == .manual ? $o.phaseLock : .constant(pacing.phaseLock)).disabled(o.pacingMode != .manual)
                     Toggle("Even out network jitter (fixed delay after the host)",
-                           isOn: o.pacingAuto ? .constant(pacing.hold) : $o.holdFrames).disabled(o.pacingAuto)
-                } footer: { Text(o.pacingAuto == options.pacingAuto ? pacing.note : "") }
+                           isOn: o.pacingMode == .manual ? $o.holdFrames : .constant(pacing.hold)).disabled(o.pacingMode != .manual)
+                } footer: { Text(o.pacingMode == options.pacingMode ? pacing.note : "") }
                 Section {
                     Button("Reconnect") { finish(reconnect: true) }
                 }
@@ -93,8 +97,8 @@ struct SettingsView: View {
         if n.showStats != old.showStats { changes.append(.stats) }
         if n.vividColors != old.vividColors { changes.append(.present) }
         if n.keepWiFiAwake != old.keepWiFiAwake { changes.append(.keepAwake) }
-        if n.forceClientCursor != old.forceClientCursor { changes.append(.cursor) }
-        if n.pacingAuto != old.pacingAuto || n.phaseLock != old.phaseLock || n.holdFrames != old.holdFrames { changes.append(.phaseLock) }
+        if n.cursorMode != old.cursorMode || n.mouseMode != old.mouseMode { changes.append(.cursor) }
+        if n.pacingMode != old.pacingMode || n.phaseLock != old.phaseLock || n.holdFrames != old.holdFrames { changes.append(.phaseLock) }
         options = n
         options.save()
         done(changes)

@@ -12,7 +12,7 @@ final class SettingsWindow: NSObject {
     var onChange: (Change) -> Void = { _ in }
     /// What pacing is in effect (Auto picks it from the display): phase lock,
     /// hold, and a line on what Auto chose and did to Steam's VRR toggle.
-    var pacingNow: () -> (phaseLock: Bool, hold: Bool, note: String) = { (options.phaseLock, options.holdFrames, "") }
+    var pacingNow: () -> (phaseLock: Bool, hold: Bool, vsyncOff: Bool, vrr: VRRMode, note: String) = { (options.phaseLock, options.holdFrames, options.immediateFullScreen, options.vrrMode, "") }
 
     private let host = NSTextField()
     private let port = NSTextField()
@@ -21,13 +21,16 @@ final class SettingsWindow: NSObject {
     private let refresh = NSPopUpButton()
     private let size = NSTextField()
     private let stats = NSButton(checkboxWithTitle: "Show stats overlay (Cmd+I)", target: nil, action: nil)
-    private let immediate = NSButton(checkboxWithTitle: "Lowest latency in full screen (vsync off, may tear)", target: nil, action: nil)
+    private let immediate = NSButton(checkboxWithTitle: "Vsync off in full screen (may tear)", target: nil, action: nil)
     private let vivid = NSButton(checkboxWithTitle: "Vivid colors (display's full gamut, as on Windows)", target: nil, action: nil)
     private let awake = NSButton(checkboxWithTitle: "Keep Wi-Fi awake (60 tiny packets/s to the host)", target: nil, action: nil)
-    private let clientCursor = NSButton(checkboxWithTitle: "Force client cursor (also where the host hides it)", target: nil, action: nil)
+    private let cursorMode = NSPopUpButton()
+    private let mouseMode = NSPopUpButton()
+    private let confinement = NSPopUpButton()
     private let pacing = NSButton(checkboxWithTitle: "Pace the host to this display's refreshes (phase lock)", target: nil, action: nil)
     private let hold = NSButton(checkboxWithTitle: "Even out network jitter (fixed delay after the host)", target: nil, action: nil)
     private let pacingMode = NSPopUpButton()
+    private let vrrMode = NSPopUpButton()
     private let pacingNote = NSTextField(wrappingLabelWithString: "")
     private static let refreshRates = [30, 60, 90, 120, 144, 165, 240]
     private static let codecs: [(name: String, id: UInt8)] =
@@ -41,7 +44,11 @@ final class SettingsWindow: NSObject {
         window.isReleasedWhenClosed = false
 
         codec.addItems(withTitles: Self.codecs.map(\.name))
-        pacingMode.addItems(withTitles: ["Auto (from the display)", "Manual"])
+        cursorMode.addItems(withTitles: CursorMode.allCases.map(\.title))
+        mouseMode.addItems(withTitles: MouseMode.allCases.map(\.title))
+        confinement.addItems(withTitles: Confinement.allCases.map(\.title))
+        pacingMode.addItems(withTitles: PacingMode.allCases.map(\.title))
+        vrrMode.addItems(withTitles: VRRMode.allCases.map(\.title))
         pacingNote.textColor = .secondaryLabelColor
         pacingNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         pacingNote.preferredMaxLayoutWidth = 300
@@ -52,7 +59,7 @@ final class SettingsWindow: NSObject {
             field.target = self
             field.action = #selector(changed(_:))
         }
-        for control in [codec, refresh, stats, immediate, pacingMode, pacing, hold, vivid, awake, clientCursor] as [NSControl] {
+        for control in [codec, refresh, stats, immediate, pacingMode, vrrMode, pacing, hold, vivid, awake, cursorMode, mouseMode, confinement] as [NSControl] {
             control.target = self
             control.action = #selector(changed(_:))
         }
@@ -77,14 +84,17 @@ final class SettingsWindow: NSObject {
             row("Refresh rate:", refresh, "The host's frame-rate cap"),
             row("Fixed size:", size, "Empty: follow the window"),
             [NSGridCell.emptyContentView, stats],
-            [NSGridCell.emptyContentView, immediate],
             [NSTextField(labelWithString: "Pacing:"), pacingMode],
             [NSGridCell.emptyContentView, pacingNote],
             [NSGridCell.emptyContentView, pacing],
             [NSGridCell.emptyContentView, hold],
+            [NSGridCell.emptyContentView, immediate],
+            row("VRR:", vrrMode, nil),
             [NSGridCell.emptyContentView, vivid],
             [NSGridCell.emptyContentView, awake],
-            [NSGridCell.emptyContentView, clientCursor],
+            row("Cursor:", cursorMode, nil),
+            row("Mouse:", mouseMode, nil),
+            row("Confinement:", confinement, nil),
         ])
         grid.rowSpacing = 10
         grid.columnSpacing = 8
@@ -123,16 +133,18 @@ final class SettingsWindow: NSObject {
         }
         size.stringValue = options.sizeText
         stats.state = options.showStats ? .on : .off
-        immediate.state = options.immediateFullScreen ? .on : .off
         vivid.state = options.vividColors ? .on : .off
         awake.state = options.keepWiFiAwake ? .on : .off
-        clientCursor.state = options.forceClientCursor ? .on : .off
+        cursorMode.selectItem(at: options.cursorMode.rawValue)
+        mouseMode.selectItem(at: options.mouseMode.rawValue)
+        confinement.selectItem(at: options.confinement.rawValue)
         let now = pacingNow()
-        pacingMode.selectItem(at: options.pacingAuto ? 0 : 1)
+        pacingMode.selectItem(at: options.pacingMode.rawValue)
         pacing.state = now.phaseLock ? .on : .off
         hold.state = now.hold ? .on : .off
-        pacing.isEnabled = !options.pacingAuto
-        hold.isEnabled = !options.pacingAuto
+        immediate.state = now.vsyncOff ? .on : .off
+        vrrMode.selectItem(at: now.vrr.rawValue)
+        for control in [pacing, hold, immediate, vrrMode] as [NSControl] { control.isEnabled = options.pacingMode == .manual }
         pacingNote.stringValue = now.note
     }
 
@@ -176,13 +188,22 @@ final class SettingsWindow: NSObject {
             options.holdFrames = hold.state == .on
             change = .phaseLock
         case pacingMode:
-            options.pacingAuto = pacingMode.indexOfSelectedItem == 0
+            options.pacingMode = PacingMode(rawValue: pacingMode.indexOfSelectedItem) ?? .auto
+            change = .phaseLock
+        case vrrMode:
+            options.vrrMode = VRRMode(rawValue: vrrMode.indexOfSelectedItem) ?? .auto
             change = .phaseLock
         case awake:
             options.keepWiFiAwake = awake.state == .on
             change = .keepAwake
-        case clientCursor:
-            options.forceClientCursor = clientCursor.state == .on
+        case cursorMode:
+            options.cursorMode = CursorMode(rawValue: cursorMode.indexOfSelectedItem) ?? .auto
+            change = .cursor
+        case mouseMode:
+            options.mouseMode = MouseMode(rawValue: mouseMode.indexOfSelectedItem) ?? .auto
+            change = .cursor
+        case confinement:
+            options.confinement = Confinement(rawValue: confinement.indexOfSelectedItem) ?? .auto
             change = .cursor
         default:
             options.showStats = stats.state == .on

@@ -42,13 +42,13 @@ Unknown types are skipped.
 | 0x04 | Bitrate | `u32 kbps` |
 | 0x05 | Key | `u16 evdev_code, u8 pressed` |
 | 0x06 | Button | `u16 evdev_code (BTN_LEFT=0x110 …), u8 pressed` |
-| 0x07 | Motion | `f32 dx, f32 dy` relative, in stream pixels (pointer locked) |
+| 0x07 | Motion | `f32 dx, f32 dy` relative, in stream pixels; only reaches a game while the pointer is locked |
 | 0x08 | Position | `f32 x, f32 y` absolute, normalized 0..1 |
 | 0x09 | Scroll | `f32 dx, f32 dy` (Wayland axis units, 15 ≈ one notch), `i16 v120_x, i16 v120_y` |
 | 0x0a | Gamepad | `u8 index, u32 buttons, i16 lx, i16 ly, i16 rx, i16 ry, u8 lt, u8 rt` |
 | 0x0b | GamepadRemove | `u8 index` |
 | 0x0c | Ping | `u64 client_time_us` |
-| 0x0e | VrrPolicy | `u8 policy`: what the client wants of Steam's VRR. 0 = leave Steam's toggle alone (the default); 1 = off: the host reports the client's grid as a fixed refresh, so gamescope calls the display VRR-incapable and Steam greys its toggle; 2 = on: the host sets gamescope's `adaptive_sync` (what Steam's toggle sets) and hands each frame to the encoder at once, stamped with gamescope's commit time (the client holds frames itself). Leaving 2, the host restores `adaptive_sync` from Steam's preference (`GAMESCOPE_VRR_ENABLED`). Cleared when a stream starts or stops. |
+| 0x0e | VrrPolicy | `u8 policy`: what the client wants of Steam's VRR. 0 = leave Steam's toggle alone (the default); 1 = off: the host reports the client's grid as a fixed refresh, or the stream's rate with no grid, so gamescope calls the display VRR-incapable and Steam greys its toggle; 2 = on: the host sets gamescope's `adaptive_sync` (what Steam's toggle sets) and hands each frame to the encoder at once, stamped with gamescope's commit time (the client holds frames itself). Leaving 2, the host restores `adaptive_sync` from Steam's preference (`GAMESCOPE_VRR_ENABLED`). Cleared when a stream starts or stops. |
 | 0x0f | Touch | `u8 id, u8 phase, f32 x, f32 y`: a touchscreen. Phase 0 = down, 1 = moved, 2 = up, 3 = cancel (every touch ends; id and position ignored); x, y normalized 0..1 over the video. Ids are the client's, reused after up. The host's gamescope applies its touch mode (SteamOS: passed through to Steam and the game as a touchscreen). |
 | 0x0d | DisplayGrid | `u64 anchor_ns, u32 interval_ns`: the client display's refresh grid in host CLOCK_MONOTONIC (a vblank and the interval), shifted by the client to set where frames land. The host then reports gamescope's frames as presented on that grid (still as a VRR-capable display, so Steam's VRR toggle stays available; with it off, gamescope paces to the grid). Native clients send it every 500 ms; it is cleared when a stream starts, and by an interval of 0 (a client on a variable-refresh display, which shows frames as they arrive). |
 
@@ -66,10 +66,11 @@ key repeat itself.
 |---|---|---|
 | 0x81 | HelloAck | `u8 codec` |
 | 0x82 | Cursor | `u16 width, u16 height, i16 hotspot_x, i16 hotspot_y, RGBA (straight alpha)`; width = 0: hidden |
-| 0x83 | PointerLock | `u8 locked` (the game wants relative input; use Pointer Lock) |
+| 0x83 | Relative | `u8 relative` (the game wants motion: Mouse on Auto sends Motion, not Position) |
 | 0x84 | Rumble | `u8 index, u16 strong, u16 weak, u16 duration_ms`; duration 0: stop |
 | 0x85 | Pong | `u64 client_time_us (echoed), u64 host_time_ns (CLOCK_MONOTONIC)` |
 | 0x86 | Error | UTF-8 text; the host closes the session after it |
+| 0x87 | CursorClip | `u16 left, top, right, bottom` in stream pixels: where the game keeps the cursor, while it has the mouse; all 0: nowhere in particular |
 
 The cursor is drawn by the client (gamescope gives it to its host as a
 separate surface, not part of the frame), so it moves without stream latency.

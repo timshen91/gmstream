@@ -23,16 +23,20 @@ protocol SessionShell: AnyObject {
     var fullScreen: Bool { get }
     /// The display refreshes when a frame comes, where the stream is (VRR).
     var vrr: Bool { get }
+    var vrrCapable: Bool { get }
     /// The display's own color space ("Vivid colors").
     var displayColorSpace: CGColorSpace? { get }
     /// The stream has the keyboard and the pointer.
     var focused: Bool { get }
     /// The status in one line (macOS: the title bar).
     func status(_ line: String)
-    /// Who draws the cursor may have changed: the host's cursor, the pointer
+    /// The cursor to draw may have changed: the host's cursor, the pointer
     /// lock, the stream's size or the pacing did.
     func cursorChanged()
-    /// Captures the pointer for relative motion, or frees it. The shell sets
+    /// Whether the mouse is captured all through a stream, not only for
+    /// relative motion.
+    var capturesMouse: Bool { get }
+    /// Captures the pointer, or frees it. The shell sets
     /// `lockActive` when it has (iPadOS decides later, or not at all).
     func setPointerLock(_ on: Bool)
     /// The pacing in effect changed (the settings show it).
@@ -62,11 +66,12 @@ final class Session: ConnectionDelegate {
     let pads = Gamepads()
     let opus = OpusDecoder()
     var player: AudioPlayer?
-    var locked = false     // the host wants relative motion
+    var gameRelative = false // the game wants motion (Mouse Auto follows it)
     var lockActive = false // the pointer is captured (set by the shell)
+    var gameClip: CGRect?  // where the game keeps the cursor, in stream pixels, while it has the mouse
     var fullScreen = false // as the present mode was last applied
     var immediate = false  // vsync off, as last applied
-    var pacing = Pacing(options: options, vrr: false)
+    var pacing = Pacing(options: options, vrr: false, capable: false)
     var codecName = "-"
     var timers: [Timer] = []
     var closedReason: String?
@@ -78,15 +83,57 @@ final class Session: ConnectionDelegate {
     }
     /// The host's cursor (nil: it shows none).
     var hostCursor: HostCursor?
-    /// The cursor the app shows in absolute mode (nil: none).
-    var clientCursor: HostCursor? { hostCursor ?? (options.forceClientCursor ? .noImage : nil) }
+    /// The cursor to draw (nil: none).
+    var clientCursor: HostCursor? {
+        switch options.cursorMode {
+        case .auto: return hostCursor
+        case .show: return hostCursor ?? .noImage
+        case .hide: return nil
+        }
+    }
+
+    /// Stats: "hardware" while gamescope has a cursor image. "remote" otherwise:
+    /// whatever cursor there is, if any, is pixels in the video.
+    var cursorSource: String { hostCursor != nil ? "hardware" : "remote" }
+
+    /// Whether the cursor keeps to the game's clip right now.
+    var confined: Bool { options.confinement == .auto && gameClip != nil }
+    /// Motion instead of positions: the setting, or Auto's answer to the game.
+    var sendsMotion: Bool { options.mouseMode == .auto ? gameRelative : options.mouseMode == .relative }
+
+    /// While there is a stream the mouse is ours: the system cursor stays still
+    /// and hidden in the view and the app adds up the motion, so it can't reach
+    /// a screen's edge (no Dock, menu bar, hot corner or other display). That
+    /// is the shell's way (capturesMouse), or relative alone where it can't.
+    var wantsCapture: Bool {
+        (shell?.capturesMouse == true || sendsMotion) && (conn != nil || options.mock)
+    }
+
+    /// The area the cursor stays in, in a view of `size`, y down as in the stream.
+    func cursorArea(in size: CGSize) -> CGRect {
+        let v = videoRect(in: size)
+        guard confined, let clip = gameClip else { return v }
+        let scale = v.width / streamSize.width
+        return CGRect(x: v.minX + clip.minX * scale, y: v.minY + clip.minY * scale,
+                      width: clip.width * scale, height: clip.height * scale)
+    }
+
+    /// Captures the pointer, or frees it, as the settings and focus now want.
+    func updateCapture() {
+        shell?.setPointerLock(wantsCapture && shell?.focused == true)
+        shell?.cursorChanged()
+    }
     /// Stopped while the app is in the background (no GPU work allowed there).
     private(set) var running = false
+    let probe = MouseProbe()
 
     init(shell: SessionShell) {
         self.shell = shell
         decoder.yuv = !options.bgra
-        decoder.onDecoded = { [renderer] image, height, timing in renderer.submit(.buffer(image, height: height), timing) }
+        decoder.onDecoded = { [renderer, probe] image, height, timing in
+            probe?.decoded(image, timing)
+            renderer.submit(.buffer(image, height: height), timing)
+        }
         pyro?.onDecoded = { [renderer] planes, timing in renderer.submit(.planes(planes), timing) }
         pyro?.onIncomplete = { [stats] in stats.gap() }
         renderer.onPresented = { [stages, chart, phase, panel] t in
@@ -153,7 +200,7 @@ final class Session: ConnectionDelegate {
     /// display too), none: an empty grid, so gamescope paces itself and each
     /// frame is shown as it arrives.
     func sendGrid() {
-        if !immediate && MetalRenderer.canTurnVsyncOff && options.immediateFullScreen && fullScreen && phase.grid() != nil {
+        if !immediate && MetalRenderer.canTurnVsyncOff && pacing.vsyncOff && fullScreen && phase.grid() != nil {
             applyPresentMode()
         }
         if let mock {
@@ -307,6 +354,7 @@ final class Session: ConnectionDelegate {
     }
 
     func helloAck(codec: UInt8) {
+        updateCapture()
         if let seq = getenv("GM_TEST_KEYS").map({ String(cString: $0) }) {
             // Measuring: after 4 s, sends evdev key events "29+,42+,15+,15-,42-,29-".
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
@@ -317,6 +365,7 @@ final class Session: ConnectionDelegate {
                 }
             }
         }
+        probe?.start { [weak self] dx in self?.motion(dx: dx, dy: 0) }
         codecName = ["H.264", "HEVC", "AV1", "PyroWave"][Int(Swift.min(codec, 3))]
         pads.resend()
     }
@@ -354,6 +403,9 @@ final class Session: ConnectionDelegate {
         }
         let s = stats.take()
         let st = stages.take()
+        let now = ProcessInfo.processInfo.systemUptime
+        let cursorFPS = Double(renderer.takeCursorUpdates()) / max(now - cursorFPSSince, 0.001)
+        cursorFPSSince = now
         let pad = { (s: String, n: Int) in s.padding(toLength: n, withPad: " ", startingAt: 0) }
         let num = { (v: Double?) in pad(fmt(v), 6) }
         let total = st.rows.first { $0.name == "total" }!
@@ -366,9 +418,14 @@ final class Session: ConnectionDelegate {
             if ["to \(systemName)", "total", "spacing"].contains(row.name) { lines.append(String(repeating: "─", count: 28)) }
             lines.append("\(pad(row.name, 10))\(num(row.p50)) \(num(row.p99)) \(fmt(row.max))")
         }
-        let phaseText = (options.pacingAuto ? "pacing auto (\(pacing.vrr ? "VRR: hold" : "fixed refresh: phase lock")), " : "") +
-            (!pacing.phaseLock ? "phase: off" : phase.summary())
-        lines.append(phaseText + "  compositing \(renderer.compositingStatus)  cursor \(cursorMode)")
+        let mode = switch options.pacingMode {
+        case .auto: "pacing auto (\(pacing.vrr ? "VRR: hold" : "fixed refresh: phase lock")), "
+        case .lowLatency: "pacing low latency, "
+        case .manual: ""
+        }
+        let phaseText = mode + (!pacing.phaseLock ? "phase: off" : phase.summary())
+        lines.append(phaseText + "  vsync \(immediate ? "off" : "on")  VRR \(["Steam", "off", "on"][Int(pacing.steamVRR)])  compositing \(renderer.compositingStatus)")
+        lines.append("cursor \(cursorSource), \(cursorMode) \(String(format: "%.0f", cursorFPS)) fps  game mouse \(gameRelative ? "relative" : "absolute")  clip \(gameClip != nil ? "yes" : "no")  mouse \(sendsMotion ? "relative" : "absolute")  confined \(confined ? "yes" : "no")")
         let hold = renderer.holdStatus(offset: conn?.clockOffsetNs)
         lines += [
             "rtt \(fmt(conn.map { Double($0.rttNs) / 1e6 })) ms  skipped \(st.skipped)  dropped \(st.dropped)  gaps \(s.gaps)" +
@@ -390,6 +447,7 @@ final class Session: ConnectionDelegate {
     /// Who draws the cursor, for the stats (set by the shell): "host",
     /// "frame" (into ours) or "macOS".
     var cursorMode = "host"
+    private var cursorFPSSince = ProcessInfo.processInfo.systemUptime
 
     /// Redraws the stats overlay into the video (Latency.swift, renderOverlay).
     func updateOverlay() {
@@ -402,13 +460,22 @@ final class Session: ConnectionDelegate {
 
     // MARK: Settings and display
 
-    /// What pacing is in effect, for the settings: phase lock, hold, and a
-    /// line on what Auto chose and did to Steam's VRR toggle.
-    func pacingNow() -> (phaseLock: Bool, hold: Bool, note: String) {
-        let note = !options.pacingAuto ? "Steam's VRR toggle is left to you."
-            : pacing.vrr ? "Variable-refresh display in full screen: fixed delay, no phase lock; Steam's VRR is forced on (the game runs free)."
+    /// What pacing is in effect, for the settings: phase lock, hold, vsync off,
+    /// and a line on what the mode chose and did to Steam's VRR toggle.
+    func pacingNow() -> (phaseLock: Bool, hold: Bool, vsyncOff: Bool, vrr: VRRMode, note: String) {
+        let note = switch options.pacingMode {
+        case .manual: switch pacing.steamVRR {
+            case 0: "Steam's VRR toggle is left to you."
+            case 2: "VRR is on, whatever Steam's toggle shows."
+            default: "VRR is off."
+            }
+        case .lowLatency: "Frames show as they come: no phase lock, no fixed delay"
+            + (MetalRenderer.canTurnVsyncOff ? ", vsync off in full screen (may tear)" : "")
+            + (pacing.steamVRR == 2 ? "; VRR is on, whatever Steam's toggle shows." : "; VRR is off (this display can't do it).")
+        case .auto: pacing.vrr ? "Variable-refresh display in full screen: fixed delay, no phase lock; Steam's VRR is forced on (the game runs free)."
             : "Fixed refresh (or a window): phase lock, no fixed delay; Steam's VRR is off (its toggle greyed)."
-        return (pacing.phaseLock, pacing.hold, note)
+        }
+        return (pacing.phaseLock, pacing.hold, pacing.vsyncOff, pacing.vrrMode, note)
     }
 
     /// `options` changed (and was saved) in the settings.
@@ -423,7 +490,7 @@ final class Session: ConnectionDelegate {
         case .stats: updateOverlay()
         case .present: applyPresentMode()
         case .keepAwake: conn?.keepAwake(options.keepWiFiAwake)
-        case .cursor: shell?.cursorChanged()
+        case .cursor: updateCapture()
         case .phaseLock: applyPresentMode() // pacing settings: phase lock, hold, auto
         }
     }
@@ -461,8 +528,8 @@ final class Session: ConnectionDelegate {
         guard let shell else { return }
         let wasFullScreen = fullScreen, was = pacing
         fullScreen = shell.fullScreen
-        pacing = Pacing(options: options, vrr: shell.vrr)
-        immediate = MetalRenderer.canTurnVsyncOff && options.immediateFullScreen && fullScreen
+        pacing = Pacing(options: options, vrr: shell.vrr, capable: shell.vrrCapable)
+        immediate = MetalRenderer.canTurnVsyncOff && pacing.vsyncOff && fullScreen
             && (!pacing.phaseLock || phase.grid() != nil)
         renderer.setVsync(!immediate)
         renderer.holdFrames = pacing.hold
@@ -525,7 +592,7 @@ final class Session: ConnectionDelegate {
     /// A mouse button (evdev BTN_*). A click while the host wants the
     /// pointer but it is not captured (focus came back) captures it instead.
     func button(_ code: UInt16, down: Bool) {
-        if down && locked && !lockActive { shell?.setPointerLock(true); return }
+        if down && wantsCapture && !lockActive { shell?.setPointerLock(true); return }
         var m = Writer()
         m.u16(code); m.u8(down ? 1 : 0)
         conn?.send(Msg.button, m.data)
@@ -552,27 +619,29 @@ final class Session: ConnectionDelegate {
         conn?.send(Msg.scroll, m.data)
     }
 
-    // MARK: Cursor and pointer lock
+    // MARK: The cursor
     //
-    // In absolute mode, when the host shows a cursor, the app draws it at the
-    // local pointer position, with no network delay; otherwise the host
-    // handles it: hidden, drawn by the game into the picture, or a locked
-    // pointer. "Force client cursor" takes the first two from the host: the
-    // app shows an arrow there too. A locked pointer stays locked, with no
-    // cursor: the game turns its motion into a camera or its own cursor, and
-    // an arrow would point at nothing. Where it is drawn (the system cursor
-    // with the host's image, or into our frames) is the app's choice
-    // (updateCursor).
+    // The cursor is the client's: its position is added up here and it is
+    // drawn after decoding, at the display's rate. gamescope says what it looks
+    // like (Cursor), whether the game wants motion (Relative) and where the game
+    // keeps it (CursorClip), each on its own; none carries its position, and no
+    // cursor can mean hidden or a game drawing its own, which to us are the same.
 
     func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data) {
         hostCursor = width > 0 && height > 0 ? HostCursor(width: width, height: height, hotX: hotX, hotY: hotY, rgba: rgba) : nil
         shell?.cursorChanged()
     }
 
-    /// The game wants relative mouse input: capture the pointer.
-    func pointerLock(_ on: Bool) {
-        locked = on
-        shell?.setPointerLock(on && shell?.focused == true)
+    /// The focused window's size: its shape is the game's in the stream, centered.
+    func cursorClip(_ clip: CGRect?) {
+        gameClip = clip
+        shell?.cursorChanged()
+    }
+
+    /// The game wants motion: Mouse on Auto follows it, a manual setting doesn't.
+    func relative(_ on: Bool) {
+        gameRelative = on
+        updateCapture()
     }
 }
 

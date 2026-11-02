@@ -311,15 +311,22 @@ controllers.
     display stage 3.1 / 3.6 ms, pacing p90 ~2 ms. `present(atTime:)` to
     smooth pacing made both pacing and p90 worse. In a window the desktop is
     composited at a fixed rate (22–25 ms total).
-- Settings → Pacing: **Auto** (the default) or **Manual**. The two models do
-  not mix. Auto, in full screen on an Adaptive-Sync display: the hold on, the
+- Settings → Pacing: **Auto** (the default), **Low latency** or **Manual**.
+  The two models of Auto do not mix. Auto, in full screen on an Adaptive-Sync display: the hold on, the
   phase lock off, Steam's VRR forced on (protocol VrrPolicy 2: the game runs
   free, gamescope commits each frame when it is ready, gmstream passes it on
   at once stamped with that commit, and the hold makes commit → present a
   constant). Auto otherwise (a window, a fixed-refresh display): the phase
   lock on, no hold, Steam's VRR off and its toggle greyed (VrrPolicy 1: the
-  grid reported as a fixed refresh). Manual: the two settings as they are,
-  Steam's toggle left alone. Settings shows what Auto chose.
+  grid reported as a fixed refresh, or the stream's rate with no grid). Low
+  latency: frames as they come, no phase lock, no hold, vsync off in full screen
+  (may tear; the iPad keeps vsync), and VRR on where the display can do it, so
+  gamescope doesn't step them on its vblanks. Manual: phase lock, hold, vsync off
+  and VRR as set. VRR is Auto, as Auto pacing does it; Off; On, a capable display
+  in a window too, whatever Steam's toggle shows (`adaptive_sync` is set directly;
+  the toggle stays and flipping it can undo this: hiding it while VRR runs takes
+  a gamescope change); or Steam, its toggle decides. A display that can't do VRR
+  always has it off. Settings shows what the mode chose.
 - macOS does VRR on the Dell U2725QE in full screen, the way the panel's
   ticks allow: it refreshes on its own fastest ticks (8.3443 ms, 119.84 Hz,
   not the nominal 1/120 s) and only waits for a frame that comes after the
@@ -366,15 +373,16 @@ controllers.
   panel), and the Steam Deck's screen (Steam's color vibrance). Settings →
   "Vivid colors" tags the layer with the display's own color space
   instead: the pixels go to the panel unconverted, as on Windows.
-- Keyboard: all of it goes to the host while the stream window has focus,
-  Command as Meta. A local event monitor takes key events before AppKit's
-  menus and key-view handling (Ctrl+Tab / Ctrl+Shift+Tab, Steam's Quick
+- Keyboard: macOS first, then the host, Command as Meta. The window
+  server's shortcuts (Cmd+Tab, Spotlight, Mission Control, screenshots) never
+  reach the app, so games don't get them. A local event monitor then offers
+  each key to the app's menu and sends the rest to the host; it runs before
+  AppKit's key-view handling (Ctrl+Tab / Ctrl+Shift+Tab, Steam's Quick
   Access, never reach keyDown otherwise; key-ups with Command held are
-  dropped by AppKit), and the private `CGSSetGlobalHotKeyOperatingMode`
-  turns off the window server's shortcuts (Cmd+Tab, Spotlight, Mission
-  Control, screenshots) until the window loses focus. The trackpad and
-  mouse stay macOS's, and are how to leave: menu bar, another window, a
-  Mission Control swipe. App menu items work by mouse only.
+  dropped by AppKit). Modifiers come from the event's flags, not a toggle:
+  focus can return with one held (Cmd+Tab). Until 2026-11-01 the private
+  `CGSSetGlobalHotKeyOperatingMode` turned the window server's shortcuts off
+  and the whole keyboard went to the host.
 - Stats overlay (menu, or Settings): per-stage p50 / p99 / max over 5 s (encode,
   network, queue, decode, render, display, total present → on screen), a
   pacing row (|presentation interval − capture interval|), dropped frames,
@@ -420,17 +428,53 @@ environment, printing its output.
 - Cursor: iPadOS's pointer takes no image, so it is hidden over the stream
   and the host's cursor is drawn into our frames (as on a macOS VRR
   display).
-- "Force client cursor" (macOS, iPad, web; `--force-client-cursor`): where
-  the host shows no cursor in absolute mode, the client shows an arrow, at
-  no stream latency, through the same paths (`Session.clientCursor`). A
-  locked pointer stays locked with no cursor: its motion is the game's, so
-  an arrow would point at nothing. Nothing on the host changes, because
-  nothing there paints a cursor: nested, gamescope never composites one
-  (`ShouldDrawCursor()` is false: not `--force-grab-cursor`, and the Wayland
-  backend's `ShouldPaintCursor()` is false; `cursor_composite 0` is the same
-  thing) and gmstream puts it only on the test machine's own panel. A cursor the
-  game paints itself (Ender Lilies) is game pixels, so it stays in the
-  video and trails the arrow by the stream's latency while the mouse moves.
+- The mouse (macOS). Two locks that have nothing to do with each other. The
+  macOS cursor is hidden and captured through the whole stream, in every setting:
+  it stays still in the middle of the view, so nothing that watches it can fire
+  (the Dock pops up even with `.hideDock`, and a flick beats any warp back or
+  margin). The cursor is the client's: the app adds up the motion and draws it
+  after decoding, redrawing the last frame at the display's refresh while it
+  moves, whatever the stream's rate. gamescope sends no position, only the image
+  (none: hidden, or a game drawing its own, or locked, which look the same) and
+  a one-bit lock (`lock_pointer`: empty image, a constraint, not Steam).
+- Cursor setting (`--cursor`): Auto draws ours when gamescope has an image and
+  not when it has none; Show always, with an arrow where there is no image
+  (`--force-client-cursor`); Hide never. A cursor the game paints itself (Ender
+  Lilies) is game pixels: it stays in the video, trailing ours by the stream's
+  latency if both show.
+- gamescope tells a client three things about the mouse, each on its own
+  (gamescope patch 0009): the cursor image (or none), whether the game wants
+  motion (a lock on its surface, Relative), and where it keeps the cursor
+  (CursorClip, in stream pixels). The last two travel as one pointer constraint,
+  because a surface can have only one: a lock or a confinement says which, its
+  region is the clip. The compositor passes them on as separate messages.
+  The clip comes from Wine's ClipCursor, which maps an override-redirect InputOnly
+  window at the rectangle: Xwayland tells gamescope only that the pointer is
+  confined, but gamescope is the window manager and sees that window. With no such
+  window, a lock or confinement of the focused surface is a clip of all of the
+  window. gamescope maps it to the output with the base plane's scale and offset,
+  the inverse of what clicks go through, so it holds under any scaler, zoom or
+  overscan, and gives none while its window doesn't have the input focus: the
+  clip window stays mapped when Steam's overlay opens, and the overlay's side
+  panels lie outside a 4:3 game. A game that keeps the cursor in by warping it has
+  no clip.
+- Mouse setting (`--mouse`), what the game gets: Auto sends motion while the game
+  wants it and positions otherwise; Absolute and Relative stand, whatever it asks.
+  gamescope takes in both at all times, but a locked game ignores positions and
+  a game reading the cursor's position still sees it move with motion.
+- Confinement setting (`--confine`): Auto keeps our cursor to the game's clip while
+  there is one; None lets it go anywhere, whatever the game asks. Outside a clip,
+  when it leaves the window for another place on a screen the capture ends and the
+  system cursor takes over at that spot, until it comes back in, ours going on
+  from there (past an edge with no screen beyond, as in full screen, it just
+  stops, off the Dock). The capture only starts with the mouse inside the view, in every setting (the
+  title bar stays the system's), and parks the system cursor in the middle of the
+  view, hidden: clicks go to its real place, and frozen at an edge that can be the
+  title bar (a double click there zooms the window); after
+  a warp mouse events are ignored until it settles, as queued ones still say
+  where it was and a later one can carry the whole jump as its delta. The iPad has Mouse only,
+  and captures for relative only, as iPadOS decides the lock; the web client
+  still follows the host.
 - Settings: a three-finger tap (the touches it began are cancelled on the
   host, which ends them). The stream stops in the background (no GPU
   work there) and reconnects when the app comes back.
@@ -703,8 +747,10 @@ gmstream side, found on the way:
   and scaled; the output size follows the surface (viewport) size.
 - Keep the last frame and re-encode it when a client joins or asks for a
   keyframe: Steam's UI is often static and gamescope only presents on change.
-- Absolute pointer input is tracked even while the pointer is locked, so the
-  relative motion derived from it stays true.
+- A client's mouse is passed on as it came: Position as an absolute move, Motion
+  as relative motion, with no conversion. gamescope hears only the one its mode
+  uses, relative under a lock and absolute otherwise, so Position under a lock
+  does nothing, nor does Motion without one. Choosing is the client's job.
 - Cursor "hidden" is debounced by 50 ms: gamescope sets an empty cursor
   between two images (arrow ↔ hand in Steam), which a browser shows as a
   blink.
@@ -763,8 +809,26 @@ exists):
 6. **`0007-debug-frame-timing`.** Measuring only, off unless
    `GM_GS_TIMING=<file>`: per frame handed to the host, the base plane's
    commit arrival, fence done, paint start, composite done and hand-off
-   times (§5). Not deployed: the test machine runs the 0006 build (the 0007 build
-   is kept as `~/gmstream/bin/gamescope.0007-timing`).
+   times (§5).
+7. **`0008-throttle-fifo-games`** (convar `gm_throttle`, on by default).
+   A FIFO game is released when a frame is shown, runs ahead by its frame
+   latency, and that many finished frames then wait in gamescope for as long
+   as it makes them no slower than they leave (§11.7). The patch holds
+   `wp_presentation` presented events, which is what Vulkan's present wait and
+   so DXVK block on, and lets go of one per refresh; while frames still wait it
+   skips a release, so the backlog drains and no frame is dropped. With no
+   queue a frame's phase decides everything (done just after a latch, it waits
+   a whole refresh), so each release is nudged until frames are done 2 ms
+   before the latch. Held events survive a client exiting (each has a destroy
+   listener). Tested: Warcraft III killed with `kill` and `kill -9` while
+   held, capped at 30 fps (30.09 fps, no stall), Witcher 3 (59.6 fps, no gap
+   over 100 ms, latency not measured).
+8. **`0009-nested-clip-and-relative-apart`.** The nested backend now gives its
+   host the cursor image, the clip and absolute or relative as three
+   independent things (§3.8, the mouse notes). A visible cursor no longer blocks
+   relative, and relative no longer hides the image: a lock on the focused
+   surface is relative, Steam's own and filtered app IDs excepted. Positions and
+   motion are taken in at all times, not chosen by the lock.
 
 Not a patch: Steam writes the root property `GAMESCOPE_COMPOSITE_FORCE` from
 its Settings → Developer → **Force Composite** toggle at startup, and the
@@ -1320,6 +1384,94 @@ Every frame of render-ahead costs a full frame interval of input lag: two
 frames at 45 fps is 44 ms added deliberately. The tension is one-dimensional -
 `B` too small and render jitter overruns slots, `B` too large and input feels
 mushy - which makes it the knob to expose, rather than a buffer depth.
+
+Measured with `tools/mockgame` (2026-11-01): a Windows D3D9 program run from
+Steam under Proton, which flips a strip the frame it sees the cursor move. The
+Mac client's `GM_DEBUG_MOUSE=<file>` (`apple/MouseProbe.swift`, H.264, HEVC or
+AV1) steps the pointer and times the flip. Built-in 60 Hz screen, HEVC, hotspot,
+p50 ms, 70 steps each:
+
+| game | mouse to game | game to gamescope present | present to on screen | total |
+|---|---|---|---|---|
+| vsync, as is | 13.6 | 53.6 | 16.5 | 83.4 |
+| `d3d9.maxFrameLatency = 1` | 7.8 | 36.9 | 14.0 | 58.6 |
+| that, vsync off, cap 60 | 9.0 | 36.9 | 16.0 | 62.7 |
+| `d3d9.maxFrameRate = 59` | 13.4 | 1.9 | 14.1 | 31.8 |
+| vsync, client asks for 120 Hz | 10.6 | 50.7 | 26.5 | 87.3 |
+| vsync, no client grid (`--no-phase`) | 6.0 | 53.6 | 19.6 | 79.1 |
+| vsync, no client grid, 120 Hz | 10.5 | 50.6 | 26.1 | 87.3 |
+| `d3d9.maxFrameRate = 60` | 7.5 | 53.6 | 14.2 | 76.3 |
+| `d3d9.presentInterval = 0` (still 60 fps) | 10.3 | 53.6 | 16.5 | 81.0 |
+
+"Mouse to game" is mostly the wait for the game's next read: uniform over a
+frame, with a floor of 2-3 ms. The frames between the game's read and the
+screen wait in gamescope's commit queue (table below), and the stats overlay
+cannot see them: its total starts when gamescope hands a frame over.
+
+The gap as seen, `GM_DEBUG_MOUSE_SWEEP=0.4`: the real cursor swept across the
+window (warped, without Accessibility) and each frame's orange block matched to
+when the cursor was there, about 1200 frames each: cursor to block on screen
+p50/p90 80.7/83.2 ms as is, 31.5/35.9 ms with `d3d9.maxFrameRate = 59`.
+
+Warcraft III itself (`GM_DEBUG_MOUSE_GRID`, 48 px steps, its cursor found by
+which video cells change after each step; client full screen on the Dell, HEVC,
+main menu). It draws the cursor itself and runs at about 58.2 fps here, cause
+unknown, so a cap has to be under that, not under 60:
+
+| `dxvk.conf` next to the game | frames after a step | step to present | step to on screen |
+|---|---|---|---|
+| none | 3 | 63 ms | 88 ms |
+| `d3d9.maxFrameRate = 59` | 3 | 62 ms | 88 ms |
+| `d3d9.maxFrameRate = 57` | 0-1 | 26 ms | 53 ms |
+| `d3d9.maxFrameRate = 30` | 0-1 | 36 ms | 62 ms |
+
+The grid scan runs on the decoder's thread and may add to these totals.
+
+**Cause, measured with the 0007 gamescope build** (commit arrival to paint):
+in FIFO mode gamescope latches one commit per vblank (or per limiter slot) for
+a window (`handle_done_commits_xwayland`), so a queue only shrinks if frames
+leave faster than they arrive. DXVK lets the game run up to three frames ahead
+of the last frame shown. If the slowest stage is after the game (gamescope's
+vblank or limiter), the queue stays full. If it is before the game's read
+(DXVK's limiter, which holds the game in `Present`), the queue is empty.
+
+| Mock game, Dell | stream | gamescope limit | commit to paint | total |
+|---|---|---|---|---|
+| default | 60 Hz | Steam's 59 | 49.6 ms | 74.4 ms |
+| `d3d9.maxFrameRate = 57` | 60 Hz | Steam's 59 | 0.6 ms | 27.5 ms |
+| default | 120 Hz | Steam's 59 | 50.5 ms | 78.9 ms |
+| default | 120 Hz | none | 0.6 ms | 24.0 ms |
+
+| Warcraft III, Dell, no `dxvk.conf` | stream | gamescope limit | frames after a step | step to on screen |
+|---|---|---|---|---|
+| | 60 Hz | Steam's 59 | 3 | 88 ms |
+| | 60 Hz | none | 3 | 84 ms |
+| | 120 Hz | none | 0 | 32 ms |
+
+Steam's frame limit reaches gamescope through
+`gamescope_control.set_app_target_refresh_cycle`, not `GAMESCOPE_FPS_LIMIT`
+(`[Gamescope WSI] Swapchain received new refresh cycle` logs it; cleared for a
+test with `gamescopectl debug_set_fps_limit 0`). It is a limit after the game:
+it paces the queue, so it holds latency up instead of lowering it. With no
+limit, DXVK holds a game that asked for 60 Hz vsync at 60 by itself, so a 120 Hz
+stream leaves the queue empty. A game as fast as the stream fills it again, at
+three frames of that rate.
+
+So gamescope now throttles the game instead (§6.2, patch 0008). Warcraft III,
+Dell, HEVC, 60 Hz stream, no frame cap, step to on screen:
+
+| `gm_throttle` | commit to paint | frames after a step | p50 | fps |
+|---|---|---|---|---|
+| 0 | 47.7 ms | 3-4 | 89 ms | 60.0 |
+| 1, no phase lock | 0.3 ms | 0-2 | 40-58 ms, by luck | 60.0 |
+| 1, phase lock | | 0-1 | 41-42 ms | 60.06 |
+
+A release period longer than the refresh only repeats frames (about 20 a minute
+at 100 us longer), so it is exactly the refresh. `GM_DEBUG_MOUSE` steps run off
+the main queue: on it, full screen, they fell in step with the frames and each
+run sampled one phase of the frame. They are still not spread evenly. Commit to
+paint was not measured with the phase lock, and the phase-locked runs are from
+the 0008 build without the timing drop-in.
 
 ### 11.8 What to minimize
 

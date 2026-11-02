@@ -256,7 +256,7 @@ final class MetalRenderer {
         didSet { cond.lock(); hold.enabled = holdFrames; cond.unlock() }
     }
     // The stats overlay, drawn over each frame at `overlayInset` pixels from
-    // the top left; with no new frame for a while, the last one is drawn
+    // the top right; with no new frame for a while, the last one is drawn
     // again so the overlay still updates.
     private var overlay: MTLTexture?
     private var overlayInset = 0.0
@@ -269,7 +269,10 @@ final class MetalRenderer {
     // in drawable pixels from the top left.
     private var cursor: (texture: MTLTexture, hotSpot: CGPoint, position: () -> CGPoint?)?
     private var refreshNs: UInt64 = 8_333_333 // the panel's shortest refresh
+    private var cursorLocal = false           // the display's rate, not the video's (setCursor)
     private var cursorMovedAt: UInt64 = 0
+    private var cursorDrawnAt: CGPoint?       // where it was last drawn
+    private var cursorUpdates = 0             // draws that moved it, since takeCursorUpdates
     private var cursorDue: UInt64?            // when to check whether to draw the last frame again
     private var lastVideo: UInt64 = 0         // last frame from the host drawn
     private var videoInterval: UInt64 = 0     // between them, averaged (0: not coming steadily)
@@ -405,7 +408,7 @@ final class MetalRenderer {
     }
 
     /// Replaces the overlay (nil: none) with the image in `g`, drawn `inset`
-    /// pixels from the top left.
+    /// pixels from the top right.
     func setOverlay(_ g: CGContext?, inset: Double) {
         var texture: MTLTexture?
         if let g, let data = g.data {
@@ -425,15 +428,28 @@ final class MetalRenderer {
     }
 
     /// Draws `texture` (nil: no cursor) into each frame at `position()`, read
-    /// as each frame is drawn (on the render thread); see `cursor`.
-    func setCursor(_ texture: MTLTexture?, hotSpot: CGPoint = .zero, refresh: Double = 1.0 / 120,
+    /// as each frame is drawn (on the render thread); see `cursor`. `local`:
+    /// while it moves it is drawn once per `refresh`, the display's, whatever
+    /// the video does: otherwise it rides the video when a frame is due.
+    func setCursor(_ texture: MTLTexture?, hotSpot: CGPoint = .zero, refresh: Double = 1.0 / 120, local: Bool = false,
                    position: @escaping () -> CGPoint? = { nil }) {
         cond.lock()
         let had = cursor != nil
         cursor = texture.map { ($0, hotSpot, position) }
+        cursorLocal = local
         refreshNs = UInt64(refresh * 1e9)
         if had || cursor != nil { cursorMovedAt = nowNs(); scheduleCursor() } // show it, or take it off
         cond.unlock()
+    }
+
+    /// Draws that showed the cursor somewhere new since the last call: how
+    /// fast it really moves on screen, 0 with the mouse still.
+    func takeCursorUpdates() -> Int {
+        cond.lock()
+        defer { cond.unlock() }
+        let n = cursorUpdates
+        cursorUpdates = 0
+        return n
     }
 
     /// The mouse moved: the cursor needs drawing where it is now.
@@ -447,7 +463,7 @@ final class MetalRenderer {
     /// shortest refresh, or macOS shows it a refresh later.
     private func scheduleCursor() {
         guard cursorDue == nil else { return }
-        cursorDue = max(nowNs(), lastDrawn + max(hold.minSpacing, refreshNs + 100_000))
+        cursorDue = max(nowNs(), lastDrawn + (cursorLocal ? refreshNs : max(hold.minSpacing, refreshNs + 100_000)))
         cond.signal()
     }
 
@@ -458,6 +474,7 @@ final class MetalRenderer {
     /// (checked again 2 ms after it was expected, in case it does not come).
     private func cursorRepaint(_ now: UInt64) -> Bool {
         guard lastDrawn < cursorMovedAt else { return false }
+        if cursorLocal { return true }
         let next = lastVideo + videoInterval
         if videoInterval > 0, next + 2_000_000 > now, next < now + max(hold.minSpacing, refreshNs + 100_000) {
             cursorDue = next + 2_000_000
@@ -613,6 +630,12 @@ final class MetalRenderer {
         if let cursor, let p = cursor.position() {
             let x = (p.x - cursor.hotSpot.x).rounded()
             let y = (p.y - cursor.hotSpot.y).rounded()
+            cond.lock()
+            if cursorDrawnAt != CGPoint(x: x, y: y) {
+                cursorDrawnAt = CGPoint(x: x, y: y)
+                cursorUpdates += 1
+            }
+            cond.unlock()
             let cw = Double(cursor.texture.width), ch = Double(cursor.texture.height)
             let x0 = max(0, x), y0 = max(0, y), x1 = min(dw, x + cw), y1 = min(dh, y + ch)
             if x1 > x0 && y1 > y0 {
@@ -624,10 +647,11 @@ final class MetalRenderer {
             }
         }
         if let overlay {
-            let ow = min(Double(overlay.width), dw - inset), oh = min(Double(overlay.height), dh - inset)
+            let x = max(0, (dw - inset - Double(overlay.width)).rounded()) // too wide: cut off on the right
+            let ow = min(Double(overlay.width), dw - x), oh = min(Double(overlay.height), dh - inset)
             if ow > 0 && oh > 0 {
-                enc.setViewport(MTLViewport(originX: inset, originY: inset, width: Double(overlay.width), height: Double(overlay.height), znear: 0, zfar: 1))
-                enc.setScissorRect(MTLScissorRect(x: Int(inset), y: Int(inset), width: Int(ow), height: Int(oh)))
+                enc.setViewport(MTLViewport(originX: x, originY: inset, width: Double(overlay.width), height: Double(overlay.height), znear: 0, zfar: 1))
+                enc.setScissorRect(MTLScissorRect(x: Int(x), y: Int(inset), width: Int(ow), height: Int(oh)))
                 enc.setRenderPipelineState(overlayPipeline)
                 enc.setFragmentTexture(overlay, index: 0)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)

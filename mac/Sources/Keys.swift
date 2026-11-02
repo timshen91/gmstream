@@ -1,6 +1,6 @@
 // macOS virtual key code (kVK_*, US layout positions) → Linux evdev key code.
-// The whole keyboard goes to the host, Command as Meta (Super); see
-// Controller.captureKeyboard.
+// Keys macOS leaves go to the host, Command as Meta (Super); see
+// Controller.takeKeyboard.
 
 let evdevKeys: [UInt16: UInt16] = [
     0x00: 30, 0x01: 31, 0x02: 32, 0x03: 33, 0x04: 35, 0x05: 34, 0x06: 44, 0x07: 45, 0x08: 46, 0x09: 47,
@@ -20,3 +20,7 @@ let evdevKeys: [UInt16: UInt16] = [
 
 /// Modifier keys arrive as flagsChanged events, not keyDown/keyUp.
 let modifierKeys: Set<UInt16> = [0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E]
+
+/// Each modifier's own bit in an event's flags (NX_DEVICE*KEYMASK, left and
+/// right apart). Caps Lock has none: its flag is the lock's state.
+let modifierMasks: [UInt16: UInt] = [0x36: 0x10, 0x37: 0x08, 0x38: 0x02, 0x3A: 0x20, 0x3B: 0x01, 0x3C: 0x04, 0x3D: 0x40, 0x3E: 0x2000]

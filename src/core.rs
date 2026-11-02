@@ -59,7 +59,8 @@ struct GmCallbacks {
     video: extern "C" fn(*mut c_void, *const VideoPacket),
     audio: extern "C" fn(*mut c_void, *const u8, usize, u64),
     cursor: extern "C" fn(*mut c_void, *const Cursor),
-    pointer_lock: extern "C" fn(*mut c_void, bool),
+    relative: extern "C" fn(*mut c_void, bool),
+    cursor_clip: extern "C" fn(*mut c_void, u16, u16, u16, u16),
     rumble: extern "C" fn(*mut c_void, u8, u16, u16, u16),
 }
 
@@ -102,7 +103,8 @@ pub trait Sink: Sync + 'static {
     fn video(&self, packet: &VideoPacket);
     fn audio(&self, opus: &[u8], pts_ns: u64);
     fn cursor(&self, cursor: &Cursor);
-    fn pointer_lock(&self, locked: bool);
+    fn relative(&self, relative: bool);
+    fn cursor_clip(&self, clip: [u16; 4]);
     fn rumble(&self, pad: u8, strong: u16, weak: u16, duration_ms: u16);
 }
 
@@ -122,8 +124,11 @@ extern "C" fn on_audio(_: *mut c_void, data: *const u8, len: usize, pts: u64) {
 extern "C" fn on_cursor(_: *mut c_void, c: *const Cursor) {
     sink().cursor(unsafe { &*c });
 }
-extern "C" fn on_pointer_lock(_: *mut c_void, locked: bool) {
-    sink().pointer_lock(locked);
+extern "C" fn on_relative(_: *mut c_void, relative: bool) {
+    sink().relative(relative);
+}
+extern "C" fn on_cursor_clip(_: *mut c_void, left: u16, top: u16, right: u16, bottom: u16) {
+    sink().cursor_clip([left, top, right, bottom]);
 }
 extern "C" fn on_rumble(_: *mut c_void, pad: u8, strong: u16, weak: u16, ms: u16) {
     sink().rumble(pad, strong, weak, ms);
@@ -164,7 +169,8 @@ pub fn run(config: &Config, sink: &'static dyn Sink) -> i32 {
         video: on_video,
         audio: on_audio,
         cursor: on_cursor,
-        pointer_lock: on_pointer_lock,
+        relative: on_relative,
+        cursor_clip: on_cursor_clip,
         rumble: on_rumble,
     };
     unsafe { gm_run(&c, &cb) }

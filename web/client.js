@@ -20,7 +20,7 @@ const C_HELLO = 0x01, C_CONFIGURE = 0x02, C_KEYFRAME = 0x03, C_BITRATE = 0x04,
   C_KEY = 0x05, C_BUTTON = 0x06, C_MOTION = 0x07, C_POSITION = 0x08,
   C_SCROLL = 0x09, C_GAMEPAD = 0x0a, C_GAMEPAD_REMOVE = 0x0b, C_PING = 0x0c;
 // Host → client.
-const H_HELLO_ACK = 0x81, H_CURSOR = 0x82, H_POINTER_LOCK = 0x83,
+const H_HELLO_ACK = 0x81, H_CURSOR = 0x82, H_POINTER_LOCK = 0x83, // Relative: the game wants motion
   H_RUMBLE = 0x84, H_PONG = 0x85, H_ERROR = 0x86;
 
 const params = new URLSearchParams(location.search);

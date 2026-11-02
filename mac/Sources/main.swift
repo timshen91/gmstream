@@ -18,6 +18,7 @@
 //   --hide-stats, --fullscreen
 
 import AppKit
+import GameController
 
 // MARK: - Probe mode
 
@@ -47,7 +48,8 @@ final class Probe: ConnectionDelegate {
     }
     func helloAck(codec: UInt8) { ack = true; print("connected, codec \(codec)") }
     func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data) {}
-    func pointerLock(_ locked: Bool) {}
+    func relative(_ on: Bool) {}
+    func cursorClip(_ clip: CGRect?) {}
     func rumble(index: Int, strong: UInt16, weak: UInt16, ms: Int) {}
     func closed(reason: String) { print("closed: \(reason)"); exit(1) }
 }
@@ -83,7 +85,6 @@ if let seconds = options.probe {
 
 final class StreamView: NSView {
     let metalLayer: CAMetalLayer
-    var cursor = NSCursor.arrow
     weak var controller: Controller?
 
     init(frame: NSRect, layer: CAMetalLayer) {
@@ -106,26 +107,17 @@ final class StreamView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow,
-                                                              .inVisibleRect, .cursorUpdate],
-                                       owner: self, userInfo: nil))
-    }
-    override func mouseEntered(with e: NSEvent) { controller?.pointerInView = true; controller?.updateCursor() }
-    override func mouseExited(with e: NSEvent) { controller?.pointerInView = false; controller?.updateCursor() }
-    override func resetCursorRects() { addCursorRect(bounds, cursor: cursor) }
-    override func cursorUpdate(with event: NSEvent) { cursor.set() }
-
-    // Keys: Controller.captureKeyboard takes them before they get here.
+    // Keys: Controller.takeKeyboard takes them before they get here.
     override func keyDown(with e: NSEvent) {}
 
     override func mouseMoved(with e: NSEvent) { controller?.moved(e) }
     override func mouseDragged(with e: NSEvent) { controller?.moved(e) }
     override func rightMouseDragged(with e: NSEvent) { controller?.moved(e) }
     override func otherMouseDragged(with e: NSEvent) { controller?.moved(e) }
-    override func mouseDown(with e: NSEvent) { controller?.session.button(Session.leftButton, down: true) }
+    override func mouseDown(with e: NSEvent) {
+        logCursor("click view")
+        controller?.session.button(Session.leftButton, down: true)
+    }
     override func mouseUp(with e: NSEvent) { controller?.session.button(Session.leftButton, down: false) }
     override func rightMouseDown(with e: NSEvent) { controller?.session.button(Session.rightButton, down: true) }
     override func rightMouseUp(with e: NSEvent) { controller?.session.button(Session.rightButton, down: false) }
@@ -141,7 +133,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
     var view: StreamView!
     lazy var session = Session(shell: self)
     var renderer: MetalRenderer { session.renderer }
-    var pointerInView = false, cursorHidden = false
+    var cursorHidden = false
     var keyMonitor: Any?
     var configureTimer: Timer?
 
@@ -164,6 +156,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "GMStream — \(options.host)"
         window.collectionBehavior = [.fullScreenPrimary]
+        // Outside the view too, for coming back in. A tracking area as well would
+        // deliver every event inside the view twice.
         window.acceptsMouseMovedEvents = true
         window.delegate = self
         view = StreamView(frame: window.contentLayoutRect, layer: renderer.layer)
@@ -175,7 +169,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
         }
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(view)
-        captureKeyboard()
+        takeKeyboard()
         NSApp.activate(ignoringOtherApps: true)
 
         // A panel that slept or was reconfigured may refresh on a new grid.
@@ -187,12 +181,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
         }
         if options.fullScreen { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.window.toggleFullScreen(nil) } }
         session.start()
+        session.probe?.sweep(how: AXIsProcessTrusted() ? "events" : "warp") { [weak self] x in self?.placeMouse(x) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
     func applicationWillTerminate(_ n: Notification) {
         session.stop()
-        setSystemHotKeys(enabled: true)
     }
 
     // MARK: SessionShell
@@ -205,18 +199,73 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
     var maxFPS: Double { Double(window.screen?.maximumFramesPerSecond ?? 60) }
     var shortestRefresh: Double { window.screen?.minimumRefreshInterval ?? 1.0 / 120 }
     var fullScreen: Bool { window.styleMask.contains(.fullScreen) }
-    var vrr: Bool { fullScreen && window.screen?.variableRefresh == true }
+    var vrr: Bool { fullScreen && vrrCapable }
+    var vrrCapable: Bool { window.screen?.variableRefresh == true }
     var displayColorSpace: CGColorSpace? { window.screen?.colorSpace?.cgColorSpace }
     var focused: Bool { window.isKeyWindow }
     func status(_ line: String) { window.title = "GMStream — \(line)" }
     func cursorChanged() { makeCursor() }
+    var capturesMouse: Bool { true }
     func pacingChanged() { settings.load() }
 
     func setPointerLock(_ on: Bool) {
         guard on != session.lockActive else { return }
+        // The mouse outside the view is the system's (the title bar, dragging
+        // the window), until it comes in (moved).
+        let mouse = view.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        if on && !view.bounds.contains(mouse) { return }
         session.lockActive = on
-        CGAssociateMouseAndMouseCursorPosition(on ? 0 : 1)
+        logCursor(String(format: "capture %d mouse %.1f %.1f view %.0f %.0f", on ? 1 : 0, mouse.x, view.bounds.height - mouse.y, view.bounds.width, view.bounds.height))
+        if on {
+            // Our cursor goes on from where the mouse is. The system's waits
+            // in the middle of the view, hidden: macOS sends clicks to where it
+            // really is, and at an edge that can be the title bar.
+            capturedPoint.value = session.confined ? clampedToArea(mouse) : mouse
+            warpMouse(to: CGPoint(x: view.bounds.midX, y: view.bounds.midY))
+            CGAssociateMouseAndMouseCursorPosition(0)
+        } else {
+            // And the system's goes on from where ours went.
+            CGAssociateMouseAndMouseCursorPosition(1)
+            warpMouse(to: capturedPoint.value)
+            CGAssociateMouseAndMouseCursorPosition(1) // or macOS ignores the mouse for 0.25 s after a warp
+        }
         updateCursor()
+    }
+
+    private func clampedToArea(_ p: CGPoint) -> CGPoint {
+        var area = session.cursorArea(in: view.bounds.size)
+        area.origin.y = view.bounds.height - area.maxY // AppKit's y points up
+        return clamped(p, to: area)
+    }
+
+    private func clamped(_ p: CGPoint, to r: CGRect) -> CGPoint {
+        CGPoint(x: min(r.maxX, max(r.minX, p.x)), y: min(r.maxY, max(r.minY, p.y)))
+    }
+
+    /// Whether a point in the view is on some screen. In full screen past an
+    /// edge with nothing beyond, it isn't: the cursor stays ours, off the Dock.
+    private func isOnScreen(_ p: CGPoint) -> Bool {
+        let s = window.convertPoint(toScreen: view.convert(p, to: nil))
+        return NSScreen.screens.contains { $0.frame.contains(s) }
+    }
+
+    /// The system cursor to `p` in the view. Mouse events that are already on
+    /// their way still say where it was, and one after it can carry the whole
+    /// jump as its delta: until the warp has settled, none of them count.
+    private func warpMouse(to p: CGPoint) {
+        let s = window.convertPoint(toScreen: view.convert(p, to: nil))
+        let g = CGPoint(x: s.x, y: (NSScreen.screens.first?.frame.maxY ?? 0) - s.y)
+        logCursor(String(format: "warp %.1f %.1f", p.x, view.bounds.height - p.y))
+        CGWarpMouseCursorPosition(g)
+        settling = (g, ProcessInfo.processInfo.systemUptime + 0.1)
+    }
+
+    /// Whether this mouse event is from before a warp settled.
+    private func stillSettling(_ e: NSEvent) -> Bool {
+        guard let s = settling else { return false }
+        let at = e.cgEvent?.location ?? .zero
+        if hypot(at.x - s.at.x, at.y - s.at.y) < 30 || ProcessInfo.processInfo.systemUptime > s.until { settling = nil }
+        return true
     }
 
     // MARK: Menu and settings
@@ -233,7 +282,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
     lazy var settings: SettingsWindow = {
         let s = SettingsWindow()
         s.onChange = { [weak self] change in self?.session.apply(change) }
-        s.pacingNow = { [weak self] in self?.session.pacingNow() ?? (options.phaseLock, options.holdFrames, "") }
+        s.pacingNow = { [weak self] in self?.session.pacingNow() ?? (options.phaseLock, options.holdFrames, options.immediateFullScreen, options.vrrMode, "") }
         return s
     }()
 
@@ -260,62 +309,96 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
         session.releaseAll()
         setPointerLock(false)
         updateCursor()
-        setSystemHotKeys(enabled: true)
     }
     func windowDidBecomeKey(_ n: Notification) {
-        if session.locked { setPointerLock(true) }
-        pointerInView = view.bounds.contains(view.convert(window.mouseLocationOutsideOfEventStream, from: nil))
-        updateCursor()
-        setSystemHotKeys(enabled: false)
+        session.updateCapture()
     }
 
     // MARK: Input
 
-    /// The whole keyboard goes to the host while the stream window has focus:
-    /// every key event is taken before AppKit's menus and key-view handling
-    /// see it (so Command shortcuts, Ctrl+Tab, and the key-ups AppKit drops
-    /// while Command is held all arrive), and the window server's own
-    /// shortcuts (Cmd+Tab, Spotlight, Mission Control, screenshots) are off
-    /// (setSystemHotKeys). The trackpad and mouse stay macOS's: the menu bar,
-    /// another window or a Mission Control swipe gives the keyboard back.
-    func captureKeyboard() {
+    /// macOS has the keyboard first, then the host, while the stream window
+    /// has focus. The window server's shortcuts (Cmd+Tab, Spotlight, Mission
+    /// Control, screenshots) never get here; this app's menu goes next; any
+    /// other key goes to the host. Events are taken before AppKit's key-view
+    /// handling, so Ctrl+Tab and the key-ups AppKit drops while Command is
+    /// held still arrive.
+    func takeKeyboard() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] e in
             guard let self, e.window === self.window, self.window.isKeyWindow else { return e }
             switch e.type {
-            case .keyDown: key(e.keyCode, down: true, repeat: e.isARepeat)
+            case .keyDown:
+                if NSApp.mainMenu?.performKeyEquivalent(with: e) != true { key(e.keyCode, down: true, repeat: e.isARepeat) }
             case .keyUp: key(e.keyCode, down: false, repeat: false)
-            default: modifier(e.keyCode)
+            default: modifier(e)
             }
             return nil
         }
-    }
-
-    /// Private (SkyLight; what VMware Fusion and Parallels use): turns the
-    /// window server's global shortcuts off for this app's session, except
-    /// accessibility ones. No permission needed; macOS restores them when the
-    /// app exits.
-    func setSystemHotKeys(enabled: Bool) {
-        _ = CGSSetGlobalHotKeyOperatingMode(CGSMainConnectionID(), enabled ? 0 : 2)
     }
 
     func key(_ code: UInt16, down: Bool, repeat: Bool) {
         guard let k = evdevKeys[code], !`repeat` else { return } // gamescope repeats keys itself
         session.key(k, down: down)
     }
-    func modifier(_ code: UInt16) {
-        guard modifierKeys.contains(code), let k = evdevKeys[code] else { return }
-        session.key(k, down: !session.held.contains(k))
+    /// From the event's flags, not by toggling: focus can come back with a
+    /// modifier held (Cmd+Tab), and its release must not count as a press.
+    func modifier(_ e: NSEvent) {
+        guard modifierKeys.contains(e.keyCode), let k = evdevKeys[e.keyCode] else { return }
+        let down = modifierMasks[e.keyCode].map { e.modifierFlags.rawValue & $0 != 0 } ?? !session.held.contains(k)
+        session.key(k, down: down)
+    }
+
+    /// Measuring (MouseProbe): the real pointer to x across the video, as a
+    /// mouse would put it there; without Accessibility, a warp and what the
+    /// event would have sent.
+    private func placeMouse(_ x: Double) {
+        let r = session.videoRect(in: view.bounds.size)
+        let p = window.convertPoint(toScreen: view.convert(NSPoint(x: r.minX + x * r.width, y: r.midY), to: nil))
+        let g = CGPoint(x: p.x, y: NSScreen.screens[0].frame.maxY - p.y)
+        if AXIsProcessTrusted() {
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: g, mouseButton: .left)?.post(tap: .cghidEventTap)
+        } else {
+            CGWarpMouseCursorPosition(g)
+            session.position(x: x, y: 0.5)
+        }
     }
 
     func moved(_ e: NSEvent) {
+        let at = view.convert(e.locationInWindow, from: nil), was = capturedPoint.value, wasCaptured = session.lockActive
+        defer {
+            let p = capturedPoint.value, h = view.bounds.height
+            logCursor(String(format: "move loc %.1f %.1f delta %.1f %.1f captured %d cursor_before %.1f %.1f cursor %.1f %.1f in_view %d",
+                             at.x, h - at.y, e.deltaX, e.deltaY, wasCaptured ? 1 : 0, was.x, h - was.y, p.x, h - p.y, view.bounds.contains(at) ? 1 : 0))
+        }
         let r = session.videoRect(in: view.bounds.size)
+        var p = view.convert(e.locationInWindow, from: nil)
+        if stillSettling(e) { return }
         if session.lockActive {
-            // Relative motion in stream pixels.
-            let s = session.streamSize.width / max(r.width, 1)
-            session.motion(dx: e.deltaX * s, dy: e.deltaY * s)
+            // Captured: the system cursor doesn't move, so the cursor is the
+            // sum of the motion (AppKit's y points up, a delta's down).
+            let c = capturedPoint.value
+            let target = CGPoint(x: c.x + e.deltaX, y: c.y - e.deltaY)
+            if !session.confined && !view.bounds.contains(target) && isOnScreen(target) {
+                // It left the window for somewhere the system cursor can be:
+                // that takes over, right there.
+                capturedPoint.value = target
+                setPointerLock(false)
+                return
+            }
+            p = session.confined ? clampedToArea(target) : clamped(target, to: view.bounds)
+            capturedPoint.value = p
+            if session.sendsMotion {
+                // Relative motion in stream pixels.
+                let s = session.streamSize.width / max(r.width, 1)
+                session.motion(dx: e.deltaX * s, dy: e.deltaY * s)
+                renderer.cursorMoved()
+                return
+            }
+        }
+        if !session.lockActive && session.wantsCapture && window.isKeyWindow {
+            // The system cursor is out of the view; in it, it's ours.
+            if view.bounds.contains(p) { session.updateCapture() }
             return
         }
-        let p = view.convert(e.locationInWindow, from: nil)
         session.position(x: (p.x - r.minX) / r.width, y: (r.maxY - p.y) / r.height) // AppKit's y points up
     }
 
@@ -331,13 +414,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
     }
 
     // MARK: Cursor
-    //
-    // In full screen on a variable-refresh display the host's cursor is drawn
-    // into the frame: any cursor sprite the window server moves there (a
-    // transparent one too) makes the panel refresh at its fixed top rate
-    // while the mouse moves, and frames wait for that grid (display stage
-    // 3.2 -> 7.3 ms p50 in --mock). Elsewhere the display refreshes at a
-    // fixed rate anyway: the macOS cursor.
+
+    /// Where a captured mouse is, in the view: the main thread adds to it, the
+    /// render thread reads it.
+    private let capturedPoint = LockedPoint()
+    private var settling: (at: CGPoint, until: TimeInterval)? // a warp, see warpMouse
 
     /// The cursor to show, at the current scale, and its image as a texture.
     private var localCursor: (cursor: NSCursor, texture: MTLTexture?)?
@@ -365,44 +446,69 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
         localCursor = (cursor, texture)
     }
 
-    /// Applies who draws the cursor (above) after any change to the host's
-    /// cursor, the pointer lock, focus, where the pointer is, the window's
-    /// place, or the present mode. NSCursor.hide() nests, so one flag owns it.
+    /// After any change to the cursor, the capture, focus or the window's
+    /// place. The system cursor is hidden whenever the mouse is captured and
+    /// never used otherwise; ours is drawn into every frame. NSCursor.hide()
+    /// nests, so one flag owns it.
     func updateCursor() {
-        let vrr = session.pacing.vrr, lockActive = session.lockActive
-        let over = pointerInView && window.isKeyWindow
-        let show = localCursor != nil && !lockActive
-        let hide = lockActive || (over && (!show || vrr))
-        session.cursorMode = !show ? "host" : vrr ? "frame" : "macOS"
-        if hide != cursorHidden {
-            cursorHidden = hide
-            if hide { NSCursor.hide() } else { NSCursor.unhide() }
+        let captured = session.lockActive && window.isKeyWindow
+        if captured != cursorHidden {
+            cursorHidden = captured
+            if captured { NSCursor.hide() } else { NSCursor.unhide() }
         }
-        view.cursor = localCursor?.cursor ?? .arrow
-        window.invalidateCursorRects(for: view)
-        if over && show && !vrr { view.cursor.set() }
-        guard over && show && vrr, let texture = localCursor?.texture else {
+        session.cursorMode = localCursor == nil ? "hidden" : "drawn"
+        guard captured, let texture = localCursor?.texture else {
             renderer.setCursor(nil)
             return
         }
-        // The drawable's top left in global display coordinates (points, y
-        // down from the top of the main display), as CGEvent reports the
-        // mouse; read on the render thread as each frame is drawn.
-        let scale = window.backingScaleFactor
-        let r = window.convertToScreen(view.convert(view.bounds, to: nil))
-        let origin = CGPoint(x: r.minX, y: (NSScreen.screens.first?.frame.maxY ?? 0) - r.maxY)
-        let hot = localCursor!.cursor.hotSpot
-        renderer.setCursor(texture, hotSpot: CGPoint(x: hot.x * scale, y: hot.y * scale), refresh: shortestRefresh) {
-            CGEvent(source: nil).map { CGPoint(x: ($0.location.x - origin.x) * scale, y: ($0.location.y - origin.y) * scale) }
+        // Read on the render thread as each frame is drawn: drawable pixels
+        // from the top left, the view's y points up.
+        let scale = window.backingScaleFactor, height = view.bounds.height
+        let hot = localCursor!.cursor.hotSpot, point = capturedPoint
+        renderer.setCursor(texture, hotSpot: CGPoint(x: hot.x * scale, y: hot.y * scale), refresh: shortestRefresh, local: true) {
+            let p = point.value
+            return CGPoint(x: p.x * scale, y: (height - p.y) * scale)
         }
     }
 }
 
-@_silgen_name("CGSMainConnectionID") func CGSMainConnectionID() -> Int32
-@_silgen_name("CGSSetGlobalHotKeyOperatingMode") func CGSSetGlobalHotKeyOperatingMode(_ connection: Int32, _ mode: Int32) -> Int32
+/// Measuring (GM_DEBUG_CURSOR=<file>): every mouse event as macOS delivered it,
+/// and what the app did about it, for mac/tools/cursorcheck.py to judge. The
+/// raw device motion from GCMouse doesn't go through the window server, so
+/// warps can't touch it: it says what the hand really did.
+private let cursorLog = getenv("GM_DEBUG_CURSOR").flatMap { fopen($0, "w") }
+private let cursorLogLock = NSLock()
+func logCursor(_ line: @autoclosure () -> String) {
+    guard let cursorLog else { return }
+    let text = String(format: "%.6f ", ProcessInfo.processInfo.systemUptime) + line() + "\n"
+    cursorLogLock.lock()
+    fputs(text, cursorLog)
+    fflush(cursorLog)
+    cursorLogLock.unlock()
+}
+func logRawMouse() {
+    guard cursorLog != nil else { return }
+    GCController.shouldMonitorBackgroundEvents = true
+    let watch: (GCMouse?) -> Void = { mouse in
+        mouse?.mouseInput?.mouseMovedHandler = { _, dx, dy in logCursor(String(format: "hid %.1f %.1f", dx, -dy)) }
+        mouse?.mouseInput?.leftButton.pressedChangedHandler = { _, _, down in if down { logCursor("hidclick") } }
+    }
+    GCMouse.mice().forEach { watch($0) }
+    NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { watch($0.object as? GCMouse) }
+}
+
+final class LockedPoint {
+    private let lock = NSLock()
+    private var point = CGPoint.zero
+    var value: CGPoint {
+        get { lock.lock(); defer { lock.unlock() }; return point }
+        set { lock.lock(); point = newValue; lock.unlock() }
+    }
+}
 
 let app = NSApplication.shared
 let controller = Controller()
 app.delegate = controller
 app.setActivationPolicy(.regular)
+logRawMouse()
 app.run()

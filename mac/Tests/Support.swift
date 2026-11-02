@@ -101,7 +101,8 @@ final class Recorder: ConnectionDelegate {
     func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data) {
         record("cursor \(width)x\(height) hot \(hotX),\(hotY) \([UInt8](rgba))")
     }
-    func pointerLock(_ locked: Bool) { record("pointerLock \(locked)") }
+    func relative(_ on: Bool) { record("relative \(on)") }
+    func cursorClip(_ clip: CGRect?) { record("cursorClip \(clip.map { "\($0)" } ?? "none")") }
     func rumble(index: Int, strong: UInt16, weak: UInt16, ms: Int) { record("rumble \(index) \(strong) \(weak) \(ms)") }
     func closed(reason: String) { record("closed \(reason)") }
 

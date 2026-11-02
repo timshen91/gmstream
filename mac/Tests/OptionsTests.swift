@@ -4,7 +4,7 @@ import XCTest
 /// UserDefaults.standard here is the test runner's own domain, not the app's.
 final class OptionsTests: XCTestCase {
     static let keys = ["host", "port", "codec", "hevc", "mbps", "refresh", "size", "showStats", "immediateFullScreen",
-                       "vividColors", "keepWiFiAwake", "phaseLock", "holdFrames", "pacingAuto", "touchscreen", "forceClientCursor"]
+                       "vividColors", "keepWiFiAwake", "phaseLock", "holdFrames", "pacingMode", "pacingAuto", "vrrMode", "touchscreen", "cursorSetting", "mouseMode", "cursorConfinement"]
 
     override func setUp() { clear() }
     override func tearDown() { clear() }
@@ -24,9 +24,11 @@ final class OptionsTests: XCTestCase {
         XCTAssertTrue(o.keepWiFiAwake)
         XCTAssertTrue(o.phaseLock)
         XCTAssertFalse(o.holdFrames)
-        XCTAssertTrue(o.pacingAuto)
+        XCTAssertEqual(o.pacingMode, .auto)
         XCTAssertTrue(o.touchscreen)
-        XCTAssertFalse(o.forceClientCursor)
+        XCTAssertEqual(o.cursorMode, .auto)
+        XCTAssertEqual(o.mouseMode, .auto)
+        XCTAssertEqual(o.confinement, .auto)
         XCTAssertFalse(o.mock)
     }
 
@@ -45,17 +47,25 @@ final class OptionsTests: XCTestCase {
         XCTAssertTrue(o.vividColors)
         XCTAssertFalse(o.keepWiFiAwake)
         XCTAssertTrue(o.holdFrames)
-        XCTAssertFalse(o.pacingAuto, "--hold means manual pacing")
+        XCTAssertEqual(o.pacingMode, .manual, "--hold means manual pacing")
         XCTAssertTrue(o.fullScreen)
         XCTAssertEqual(o.screen, "DELL")
         XCTAssertTrue(o.mock)
         XCTAssertEqual(o.layerKeys, ["a": 1, "b": 2])
         XCTAssertEqual(Options(["--hevc"]).codec, 1)
         XCTAssertEqual(Options(["--av1"]).codec, 2)
-        XCTAssertTrue(Options(["--manual-pacing", "--auto-pacing"]).pacingAuto)
+        XCTAssertEqual(Options(["--manual-pacing", "--auto-pacing"]).pacingMode, .auto)
+        XCTAssertEqual(Options(["--low-latency"]).pacingMode, .lowLatency)
+        XCTAssertEqual(Options(["--no-vsync"]).pacingMode, .manual, "vsync is a manual setting")
+        XCTAssertEqual(Options(["--vrr", "steam"]).vrrMode, .steam)
+        XCTAssertEqual(Options(["--vrr", "steam"]).pacingMode, .manual, "and VRR")
         XCTAssertFalse(Options(["--no-phase"]).phaseLock)
         XCTAssertFalse(Options(["--touch-mouse"]).touchscreen)
-        XCTAssertTrue(Options(["--force-client-cursor"]).forceClientCursor)
+        XCTAssertEqual(Options(["--force-client-cursor"]).cursorMode, .show)
+        XCTAssertEqual(Options(["--cursor", "hide"]).cursorMode, .hide)
+        XCTAssertEqual(Options(["--confine", "none"]).confinement, .none)
+        XCTAssertEqual(Options(["--confine", "lock"]).confinement, .auto, "gone")
+        XCTAssertEqual(Options(["--mouse", "relative"]).mouseMode, .relative)
     }
 
     func testSavedValuesThenTheCommandLineOnTop() {
@@ -66,7 +76,7 @@ final class OptionsTests: XCTestCase {
         let saved = Options([])
         XCTAssertEqual(saved.mbps, 123)
         XCTAssertEqual(saved.codec, 3)
-        XCTAssertFalse(saved.pacingAuto)
+        XCTAssertEqual(saved.pacingMode, .manual, "an older version's setting")
         XCTAssertEqual(saved.host, "steamdeck.local")
         XCTAssertEqual(Options(["--bitrate", "50"]).mbps, 50)
         UserDefaults.standard.removeObject(forKey: "codec")
@@ -78,8 +88,8 @@ final class OptionsTests: XCTestCase {
         var o = Options([])
         o.host = "h"; o.port = 1234; o.codec = 3; o.mbps = 300; o.refresh = 117; o.size = (2560, 1600)
         o.showStats = false; o.immediateFullScreen = true; o.vividColors = true; o.keepWiFiAwake = false
-        o.phaseLock = false; o.holdFrames = true; o.pacingAuto = false; o.touchscreen = false
-        o.forceClientCursor = true
+        o.phaseLock = false; o.holdFrames = true; o.pacingMode = .lowLatency; o.vrrMode = .steam; o.touchscreen = false
+        o.cursorMode = .hide; o.mouseMode = .absolute; o.confinement = .none
         o.save()
         let r = Options([])
         XCTAssertEqual(r.host, "h")
@@ -94,9 +104,12 @@ final class OptionsTests: XCTestCase {
         XCTAssertFalse(r.keepWiFiAwake)
         XCTAssertFalse(r.phaseLock)
         XCTAssertTrue(r.holdFrames)
-        XCTAssertFalse(r.pacingAuto)
+        XCTAssertEqual(r.pacingMode, .lowLatency)
+        XCTAssertEqual(r.vrrMode, .steam)
         XCTAssertFalse(r.touchscreen)
-        XCTAssertTrue(r.forceClientCursor)
+        XCTAssertEqual(r.cursorMode, .hide)
+        XCTAssertEqual(r.mouseMode, .absolute)
+        XCTAssertEqual(r.confinement, Confinement.none)
         o.refresh = nil; o.size = nil
         o.save()
         XCTAssertNil(Options([]).refresh, "0 saved: match the display")
@@ -127,11 +140,13 @@ final class PacingTests: XCTestCase {
         override var maximumRefreshInterval: TimeInterval { range.max }
     }
 
-    func options(auto: Bool, phaseLock: Bool = true, hold: Bool = false) -> Options {
+    func options(mode: PacingMode, phaseLock: Bool = true, hold: Bool = false, vsyncOff: Bool = false, vrr: VRRMode = .auto) -> Options {
         var o = Options(["--no-keep-awake"])
-        o.pacingAuto = auto
+        o.pacingMode = mode
+        o.vrrMode = vrr
         o.phaseLock = phaseLock
         o.holdFrames = hold
+        o.immediateFullScreen = vsyncOff
         return o
     }
 
@@ -140,7 +155,7 @@ final class PacingTests: XCTestCase {
         let vrr = FakeScreen()
         vrr.range = (1.0 / 120, 1.0 / 48)
         for (fullScreen, screen) in [(true, fixed), (false, vrr), (true, nil)] as [(Bool, NSScreen?)] {
-            let p = Pacing(options: options(auto: true), fullScreen: fullScreen, screen: screen)
+            let p = Pacing(options: options(mode: .auto, vsyncOff: true), fullScreen: fullScreen, screen: screen)
             XCTAssertFalse(p.vrr)
             XCTAssertTrue(p.phaseLock)
             XCTAssertFalse(p.hold)
@@ -151,23 +166,51 @@ final class PacingTests: XCTestCase {
     func testAutoInFullScreenOnAVRRDisplayHoldsAndTurnsSteamVRROn() {
         let screen = FakeScreen()
         screen.range = (1.0 / 120, 1.0 / 48)
-        let p = Pacing(options: options(auto: true), fullScreen: true, screen: screen)
+        let p = Pacing(options: options(mode: .auto, vsyncOff: true), fullScreen: true, screen: screen)
         XCTAssertTrue(p.vrr)
         XCTAssertFalse(p.phaseLock)
         XCTAssertTrue(p.hold)
         XCTAssertEqual(p.steamVRR, 2)
+        XCTAssertFalse(p.vsyncOff, "the setting is Manual's")
+    }
+
+    func testLowLatencyTurnsEverythingOff() {
+        let on = options(mode: .lowLatency, phaseLock: true, hold: true)
+        for (capable, policy) in [(true, 2), (false, 1)] as [(Bool, UInt8)] {
+            let p = Pacing(options: on, vrr: false, capable: capable)
+            XCTAssertFalse(p.phaseLock)
+            XCTAssertFalse(p.hold)
+            XCTAssertTrue(p.vsyncOff)
+            XCTAssertEqual(p.steamVRR, policy, "on where it can be")
+        }
+    }
+
+    func testTheVRRSetting() {
+        func policy(_ mode: VRRMode, vrr: Bool = false, capable: Bool) -> UInt8 {
+            Pacing(options: options(mode: .manual, vrr: mode), vrr: vrr, capable: capable).steamVRR
+        }
+        for mode in VRRMode.allCases {
+            XCTAssertEqual(policy(mode, capable: false), 1, "\(mode.name): a display that can't is always off")
+        }
+        XCTAssertEqual(policy(.off, vrr: true, capable: true), 1)
+        XCTAssertEqual(policy(.on, capable: true), 2, "in a window too")
+        XCTAssertEqual(policy(.steam, capable: true), 0, "Steam's toggle")
+        XCTAssertEqual(policy(.auto, capable: true), 1, "capable, but not where it would happen")
+        XCTAssertEqual(policy(.auto, vrr: true, capable: true), 2)
     }
 
     func testManualTakesTheSettingsAndLeavesSteamAlone() {
         let screen = FakeScreen()
         screen.range = (1.0 / 120, 1.0 / 48)
-        let p = Pacing(options: options(auto: false, phaseLock: false, hold: true), fullScreen: true, screen: screen)
+        let p = Pacing(options: options(mode: .manual, phaseLock: false, hold: true, vsyncOff: true, vrr: .steam), fullScreen: true, screen: screen)
         XCTAssertFalse(p.phaseLock)
         XCTAssertTrue(p.hold)
+        XCTAssertTrue(p.vsyncOff)
         XCTAssertEqual(p.steamVRR, 0)
-        let q = Pacing(options: options(auto: false, phaseLock: true, hold: false), fullScreen: false, screen: nil)
+        let q = Pacing(options: options(mode: .manual, phaseLock: true, hold: false, vrr: .steam), fullScreen: false, screen: screen)
         XCTAssertTrue(q.phaseLock)
         XCTAssertFalse(q.hold)
+        XCTAssertFalse(q.vsyncOff)
         XCTAssertEqual(q.steamVRR, 0)
     }
 }

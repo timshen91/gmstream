@@ -52,7 +52,8 @@ const C_TOUCH: u8 = 0x0f;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
-const H_POINTER_LOCK: u8 = 0x83;
+const H_RELATIVE: u8 = 0x83;
+const H_CURSOR_CLIP: u8 = 0x87;
 const H_RUMBLE: u8 = 0x84;
 const H_PONG: u8 = 0x85;
 const H_ERROR: u8 = 0x86;
@@ -178,8 +179,13 @@ impl core::Sink for Hub {
         self.control(message(H_CURSOR, &p));
     }
 
-    fn pointer_lock(&self, locked: bool) {
-        self.control(message(H_POINTER_LOCK, &[locked as u8]));
+    fn relative(&self, relative: bool) {
+        self.control(message(H_RELATIVE, &[relative as u8]));
+    }
+
+    fn cursor_clip(&self, clip: [u16; 4]) {
+        let p: Vec<u8> = clip.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.control(message(H_CURSOR_CLIP, &p));
     }
 
     fn rumble(&self, pad: u8, strong: u16, weak: u16, duration_ms: u16) {

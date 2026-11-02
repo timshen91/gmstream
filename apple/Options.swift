@@ -5,6 +5,51 @@ import Foundation
 /// This launch's settings; the Settings window (or sheet) changes and saves them.
 var options = Options(Array(CommandLine.arguments.dropFirst()))
 
+/// How frames reach the screen. Auto: chosen from the display (Pacing). Low
+/// latency: as they come, no phase lock, no hold, vsync off. Manual: the three
+/// settings as they are.
+enum PacingMode: Int, CaseIterable {
+    case auto, lowLatency, manual
+    var title: String { ["Auto (from the display)", "Low latency", "Manual"][rawValue] }
+}
+
+/// Manual pacing: the host's VRR. A display that can't do VRR always has it off.
+/// Auto: on where it really happens, in full screen on a capable display (the
+/// host then runs just under the panel's top rate, PanelRate), else off. On: on,
+/// whatever Steam's toggle shows. Steam: left to Steam's toggle.
+enum VRRMode: Int, CaseIterable {
+    case auto, off, on, steam
+    var title: String { ["Auto", "Off", "On (capable display)", "Steam (capable display)"][rawValue] }
+    var name: String { ["auto", "off", "on", "steam"][rawValue] }
+}
+
+/// Whether the client draws its cursor. Auto: when gamescope has a cursor
+/// image, not when it has none (a game that hid its cursor, or draws its own
+/// into the picture). Show: always, with an arrow if there is no image.
+enum CursorMode: Int, CaseIterable {
+    case auto, show, hide
+    var title: String { ["Auto (as gamescope shows it)", "Show", "Hide"][rawValue] }
+    var name: String { ["auto", "show", "hide"][rawValue] }
+}
+
+/// What the game gets. Auto: motion while it asks for a lock, else positions.
+/// Manual settings stand, whatever the game asks.
+enum MouseMode: Int, CaseIterable {
+    case auto, absolute, relative
+    var title: String { ["Auto (as the game asks)", "Absolute", "Relative"][rawValue] }
+    var name: String { ["auto", "absolute", "relative"][rawValue] }
+}
+
+/// Whether the client's cursor keeps to the game's clip. Auto: it does, as far as
+/// the game has one and has the mouse. None: it goes anywhere, whatever the game
+/// asks. (The macOS cursor is another matter: it is hidden and captured all
+/// along, Session.wantsCapture.)
+enum Confinement: Int, CaseIterable {
+    case auto, none
+    var title: String { ["Auto (as the game asks)", "None"][rawValue] }
+    var name: String { ["auto", "none"][rawValue] }
+}
+
 /// Settings: saved ones (Settings window, Cmd+,; on iPad a three-finger
 /// tap), then command-line options on top for this launch.
 struct Options {
@@ -19,9 +64,9 @@ struct Options {
     var fullScreen = false
     var screen: String? // start on the screen whose name contains this
     var mock = false // measuring: local test frames, no host (Mock.swift)
-    // Full screen with vsync off: macOS flips frames straight to the panel
-    // (measured total 13.7 / 17 ms p50 / p90 against ~29 with vsync), but
-    // late frames may tear. Only in full screen: in a window vsync off is
+    // Manual pacing: vsync off in full screen. macOS flips frames straight to
+    // the panel (measured total 13.7 / 17 ms p50 / p90 against ~29 with vsync),
+    // but late frames may tear. Only in full screen: in a window vsync off is
     // erratic.
     var immediateFullScreen = false
     // The stream's sRGB pixels shown as the display's own colors, without
@@ -32,23 +77,21 @@ struct Options {
     // A tiny datagram to the host 60 times a second, so this Mac's Wi-Fi
     // doesn't doze while only receiving (Connection.keepAwake).
     var keepWiFiAwake = true
-    // Phase lock (Phase.swift): gamescope produces frames on this display's
+    // Manual pacing. Phase lock (Phase.swift): gamescope produces frames on this display's
     // refresh grid. Off: an empty grid, so gamescope paces itself and frames
     // are shown as they arrive (as on a variable-refresh display).
     var phaseLock = true
-    // Hold each frame until a fixed delay after the host presented it
+    // Manual pacing. Hold each frame until a fixed delay after the host presented it
     // (Video.swift, Hold): the network's jitter traded for a constant delay.
     var holdFrames = false
-    // Pacing chosen from the display (Session.pacing) instead of the two
-    // settings above, Steam's VRR toggle included.
-    var pacingAuto = true
+    var pacingMode = PacingMode.auto
+    var vrrMode = VRRMode.auto
     // iPad: fingers are a touchscreen on the host (Steam's touch input, as
     // on a Deck); off, a finger is the mouse with its left button held.
     var touchscreen = true
-    // The cursor is always the client's in absolute mode: where the host shows
-    // none (a game that hides it, or paints its own into the picture), the
-    // system's arrow (Session.clientCursor).
-    var forceClientCursor = false
+    var cursorMode = CursorMode.auto
+    var mouseMode = MouseMode.auto
+    var confinement = Confinement.auto
     var layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:] // measuring
     var bgra = false // decoder output BGRA instead of NV12 (measuring)
     var probe: Double?
@@ -61,15 +104,22 @@ struct Options {
         if d.integer(forKey: "mbps") > 0 { mbps = UInt32(d.integer(forKey: "mbps")) }
         if d.double(forKey: "refresh") > 0 { refresh = d.double(forKey: "refresh") }
         size = Options.parseSize(d.string(forKey: "size") ?? "")
+        vrrMode = VRRMode(rawValue: d.integer(forKey: "vrrMode")) ?? .auto
         if d.object(forKey: "showStats") != nil { showStats = d.bool(forKey: "showStats") }
         immediateFullScreen = d.bool(forKey: "immediateFullScreen")
         vividColors = d.bool(forKey: "vividColors")
         if d.object(forKey: "keepWiFiAwake") != nil { keepWiFiAwake = d.bool(forKey: "keepWiFiAwake") }
         if d.object(forKey: "phaseLock") != nil { phaseLock = d.bool(forKey: "phaseLock") }
         holdFrames = d.bool(forKey: "holdFrames")
-        if d.object(forKey: "pacingAuto") != nil { pacingAuto = d.bool(forKey: "pacingAuto") }
+        if d.object(forKey: "pacingMode") != nil {
+            pacingMode = PacingMode(rawValue: d.integer(forKey: "pacingMode")) ?? .auto
+        } else if d.object(forKey: "pacingAuto") != nil { // saved by an older version
+            pacingMode = d.bool(forKey: "pacingAuto") ? .auto : .manual
+        }
         if d.object(forKey: "touchscreen") != nil { touchscreen = d.bool(forKey: "touchscreen") }
-        forceClientCursor = d.bool(forKey: "forceClientCursor")
+        cursorMode = CursorMode(rawValue: d.integer(forKey: "cursorSetting")) ?? .auto
+        mouseMode = MouseMode(rawValue: d.integer(forKey: "mouseMode")) ?? .auto
+        confinement = Confinement(rawValue: d.integer(forKey: "cursorConfinement")) ?? .auto
 
         var it = args.makeIterator()
         while let a = it.next() {
@@ -88,16 +138,29 @@ struct Options {
             case "--fullscreen": fullScreen = true
             case "--screen": screen = it.next()
             case "--mock": mock = true
-            case "--no-vsync": immediateFullScreen = true
+            case "--no-vsync": immediateFullScreen = true; pacingMode = .manual
             case "--vivid": vividColors = true
             case "--no-keep-awake": keepWiFiAwake = false
             case "--no-phase": phaseLock = false
-            case "--hold": holdFrames = true; pacingAuto = false
-            case "--no-hold": holdFrames = false; pacingAuto = false
-            case "--auto-pacing": pacingAuto = true
-            case "--manual-pacing": pacingAuto = false
+            case "--hold": holdFrames = true; pacingMode = .manual
+            case "--no-hold": holdFrames = false; pacingMode = .manual
+            case "--auto-pacing": pacingMode = .auto
+            case "--low-latency": pacingMode = .lowLatency
+            case "--manual-pacing": pacingMode = .manual
+            case "--vrr":
+                let n = it.next()?.lowercased()
+                if let m = VRRMode.allCases.first(where: { $0.name == n }) { vrrMode = m; pacingMode = .manual }
             case "--touch-mouse": touchscreen = false
-            case "--force-client-cursor": forceClientCursor = true
+            case "--force-client-cursor": cursorMode = .show
+            case "--cursor":
+                let n = it.next()?.lowercased()
+                cursorMode = CursorMode.allCases.first { $0.name == n } ?? cursorMode
+            case "--mouse":
+                let n = it.next()?.lowercased()
+                mouseMode = MouseMode.allCases.first { $0.name == n } ?? mouseMode
+            case "--confine":
+                let n = it.next()?.lowercased()
+                confinement = Confinement.allCases.first { $0.name == n } ?? confinement
             case "--layer": layerKeys = Options.parseKeys(it.next() ?? "")
             case "--drawable": drawableKeys = Options.parseKeys(it.next() ?? "")
             case let s where s.hasPrefix("-"): _ = it.next() // e.g. -NSDocumentRevisionsDebugMode YES
@@ -137,9 +200,12 @@ struct Options {
         d.set(keepWiFiAwake, forKey: "keepWiFiAwake")
         d.set(phaseLock, forKey: "phaseLock")
         d.set(holdFrames, forKey: "holdFrames")
-        d.set(pacingAuto, forKey: "pacingAuto")
+        d.set(pacingMode.rawValue, forKey: "pacingMode")
+        d.set(vrrMode.rawValue, forKey: "vrrMode")
         d.set(touchscreen, forKey: "touchscreen")
-        d.set(forceClientCursor, forKey: "forceClientCursor")
+        d.set(cursorMode.rawValue, forKey: "cursorSetting")
+        d.set(mouseMode.rawValue, forKey: "mouseMode")
+        d.set(confinement.rawValue, forKey: "cursorConfinement")
     }
 }
 
@@ -159,15 +225,33 @@ struct Pacing {
     let vrr: Bool       // Auto: this display does VRR here
     let phaseLock: Bool
     let hold: Bool
+    let vsyncOff: Bool  // in full screen, where the platform can
+    let vrrMode: VRRMode
     let steamVRR: UInt8 // protocol VrrPolicy: 0 Steam's own, 1 off, 2 on
 
     /// `vrr`: the display does VRR where the stream is (SessionShell.vrr).
-    init(options: Options, vrr: Bool) {
+    /// `capable`: it can, in a window too (SessionShell.vrrCapable).
+    init(options: Options, vrr: Bool, capable: Bool) {
         self.vrr = vrr
-        if options.pacingAuto {
-            (phaseLock, hold, steamVRR) = vrr ? (false, true, 2) : (true, false, 1)
-        } else {
-            (phaseLock, hold, steamVRR) = (options.phaseLock, options.holdFrames, 0)
+        let mode: VRRMode
+        switch options.pacingMode {
+        case .auto:
+            (phaseLock, hold, vsyncOff) = vrr ? (false, true, false) : (true, false, false)
+            mode = .auto
+        case .lowLatency:
+            // On where it can be, so gamescope doesn't step frames on its vblanks.
+            (phaseLock, hold, vsyncOff) = (false, false, true)
+            mode = .on
+        case .manual:
+            (phaseLock, hold, vsyncOff) = (options.phaseLock, options.holdFrames, options.immediateFullScreen)
+            mode = options.vrrMode
+        }
+        vrrMode = mode
+        switch mode {
+        case .auto: steamVRR = vrr ? 2 : 1
+        case .off: steamVRR = 1
+        case .on: steamVRR = capable ? 2 : 1
+        case .steam: steamVRR = capable ? 0 : 1
         }
     }
 }

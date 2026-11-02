@@ -1,0 +1,252 @@
+Throttle FIFO games instead of queueing their frames (gmstream; gm_throttle, on by default).
+
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -294,6 +294,20 @@ timespec nanos_to_timespec( uint64_t ulNanos )
+ static void
+ update_runtime_info();
+ 
++// gmstream (0008): throttle a FIFO game instead of queueing its frames. Without
++// this a game is released when a frame is shown, runs ahead by its frame
++// latency, and that many finished frames wait here for good if it makes them
++// as fast as we show them. So presented events are held and let go one per
++// refresh: the game starts a frame when it can be shown next, and reads its
++// input as late as it can. While frames still wait, one release is skipped, so
++// the backlog drains without dropping any. With no queue a frame's phase
++// decides everything: done just after a latch it waits a whole refresh. So each
++// release is nudged until frames are done k_ulGmThrottleLeadNs before the latch.
++gamescope::ConVar<bool> cv_gm_throttle( "gm_throttle", true, "Throttle FIFO games instead of queueing their frames." );
++static constexpr uint64_t k_ulGmThrottleLeadNs = 2'000'000;
++// How long the window's last frame was done before it was latched.
++static std::unordered_map<uint64_t, uint64_t> s_GmThrottleWait;
++
+ gamescope::ConVar<bool> cv_adaptive_sync( "adaptive_sync", false, "Whether or not adaptive sync is enabled if available." );
+ gamescope::ConVar<bool> cv_adaptive_sync_ignore_overlay( "adaptive_sync_ignore_overlay", false, "Whether or not to ignore overlay planes for pushing commits with adaptive sync." );
+ gamescope::ConVar<int> cv_adaptive_sync_overlay_cycles( "adaptive_sync_overlay_cycles", 1, "Number of vblank cycles to ignore overlay repaints before forcing a commit with adaptive sync." );
+@@ -8203,7 +8217,16 @@ void handle_presented_for_window( steamcompmgr_win_t* w )
+ 
+ 		if (!lastCommit->presentation_feedbacks.empty() || lastCommit->present_id)
+ 		{
+-			if (!lastCommit->presentation_feedbacks.empty())
++			if ( cv_gm_throttle && lastCommit->fifo && !lastCommit->is_steam )
++			{
++				if ( !lastCommit->presentation_feedbacks.empty() )
++				{
++					uint64_t ulLatched = get_time_in_nanos();
++					s_GmThrottleWait[ w->seq ] = ulLatched > lastCommit->present_time ? ulLatched - lastCommit->present_time : 0;
++				}
++				wlserver_gm_hold_feedback( w->seq, lastCommit->presentation_feedbacks );
++			}
++			else if (!lastCommit->presentation_feedbacks.empty())
+ 			{
+ 				wlserver_presentation_feedback_presented(
+ 					lastCommit->surf,
+@@ -9497,6 +9520,81 @@ static gamescope::CTimerFunction g_FPSLimitVRRTimer{ []
+ 	g_FPSLimitVRRTimer.DisarmTimer();
+ }};
+ 
++static gamescope::CTimerFunction g_GmThrottleTimer{ []
++{
++	g_GmThrottleTimer.DisarmTimer();
++}};
++
++// Lets held presented events go, one per refresh per window (cv_gm_throttle).
++static void gm_throttle_pump()
++{
++	static std::unordered_map<uint64_t, uint64_t> s_NextRelease;
++
++	// Frames ready but not shown yet, per window. Taken before wlserver_lock,
++	// as handle_done_commits takes this lock on its own.
++	std::unordered_map<uint64_t, int> waiting;
++	{
++		gamescope_xwayland_server_t *server = NULL;
++		for ( size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++ )
++		{
++			std::lock_guard<std::mutex> lock( server->ctx->doneCommits.listCommitsDoneLock );
++			for ( const auto &entry : server->ctx->doneCommits.listCommitsDone )
++			{
++				if ( entry.fifo )
++					waiting[ entry.winSeq ]++;
++			}
++		}
++	}
++
++	wlserver_lock();
++	const uint64_t ulNow = get_time_in_nanos();
++	const uint64_t ulPeriod = g_SteamCompMgrLimitedAppRefreshCycle;
++	const uint64_t ulRefreshTime = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
++	uint64_t ulWake = 0;
++
++	for ( uint64_t ulWindow : wlserver_gm_held_windows() )
++	{
++		if ( !cv_gm_throttle )
++		{
++			while ( wlserver_gm_release_feedback( ulWindow, ulRefreshTime, g_SteamCompMgrLimitedAppRefreshCycle ) )
++				;
++			continue;
++		}
++
++		uint64_t &ulNext = s_NextRelease[ ulWindow ];
++		bool bMore = true;
++		if ( ulNow + 200'000 >= ulNext )
++		{
++			bMore = wlserver_gm_release_feedback( ulWindow, ulRefreshTime, g_SteamCompMgrLimitedAppRefreshCycle );
++			ulNext = ulNow + ulPeriod * ( waiting.contains( ulWindow ) ? 2 : 1 );
++
++			// Done a little before the latch is the aim. More than half a
++			// refresh early means it just missed one: that is late, not early.
++			auto iter = s_GmThrottleWait.find( ulWindow );
++			if ( iter != s_GmThrottleWait.end() && iter->second < ulPeriod )
++			{
++				int64_t lEarly = int64_t( iter->second );
++				if ( iter->second > ulPeriod / 2 )
++					lEarly -= int64_t( ulPeriod );
++				ulNext += ( lEarly - int64_t( k_ulGmThrottleLeadNs ) ) / 4;
++			}
++		}
++		if ( bMore && ( !ulWake || ulNext < ulWake ) )
++			ulWake = ulNext;
++	}
++	wlserver_unlock();
++
++	if ( ulWake )
++		g_GmThrottleTimer.ArmTimer( ulWake );
++
++	// Windows come and go: this only ever holds a handful.
++	if ( s_NextRelease.size() > 64 )
++	{
++		s_NextRelease.clear();
++		s_GmThrottleWait.clear();
++	}
++}
++
+ struct MangoappInstance_t
+ {
+ 	uint32_t uMsgType = 0;
+@@ -9991,6 +10089,7 @@ steamcompmgr_main(int argc, char **argv)
+ 
+ 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
+ 	g_SteamCompMgrWaiter.AddWaitable( &g_FPSLimitVRRTimer );
++	g_SteamCompMgrWaiter.AddWaitable( &g_GmThrottleTimer );
+ 	GetVBlankTimer().ArmNextVBlank( true );
+ 	WatchMangoappConfig();
+ 
+@@ -10474,6 +10573,8 @@ steamcompmgr_main(int argc, char **argv)
+ 			wlserver_unlock();
+ 		}
+ 
++		gm_throttle_pump();
++
+ 		//
+ 
+ 		{
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -56,6 +56,8 @@
+ #include "gamescope-swapchain-protocol.h"
+ #include "presentation-time-protocol.h"
+ 
++#include <deque>
++#include <map>
+ #include "wlserver.hpp"
+ #include "hdmi.h"
+ #include "main.hpp"
+@@ -1637,6 +1639,82 @@ void wlserver_presentation_feedback_presented( struct wlr_surface *surface, std:
+ 	presentation_feedbacks.clear();
+ }
+ 
++struct GmHeldFeedback
++{
++	struct wl_resource *resource;
++	uint64_t ulWindow;
++	struct wl_listener destroyed;
++};
++
++static std::map<uint64_t, std::deque<GmHeldFeedback *>> s_GmHeldFeedback;
++static uint64_t s_ulGmFeedbackSequence = 0;
++
++static void gm_held_feedback_erase( GmHeldFeedback *pHeld )
++{
++	auto iter = s_GmHeldFeedback.find( pHeld->ulWindow );
++	if ( iter != s_GmHeldFeedback.end() )
++	{
++		std::erase( iter->second, pHeld );
++		if ( iter->second.empty() )
++			s_GmHeldFeedback.erase( iter );
++	}
++	wl_list_remove( &pHeld->destroyed.link );
++	delete pHeld;
++}
++
++static void gm_held_feedback_destroyed( struct wl_listener *pListener, void *pData )
++{
++	GmHeldFeedback *pHeld = wl_container_of( pListener, pHeld, destroyed );
++	gm_held_feedback_erase( pHeld );
++}
++
++void wlserver_gm_hold_feedback( uint64_t ulWindow, std::vector<struct wl_resource*>& presentation_feedbacks )
++{
++	for ( struct wl_resource *pResource : presentation_feedbacks )
++	{
++		GmHeldFeedback *pHeld = new GmHeldFeedback{ .resource = pResource, .ulWindow = ulWindow };
++		pHeld->destroyed.notify = gm_held_feedback_destroyed;
++		wl_resource_add_destroy_listener( pResource, &pHeld->destroyed );
++		s_GmHeldFeedback[ ulWindow ].push_back( pHeld );
++	}
++	presentation_feedbacks.clear();
++}
++
++bool wlserver_gm_release_feedback( uint64_t ulWindow, uint64_t last_refresh_nsec, uint64_t refresh_cycle )
++{
++	auto iter = s_GmHeldFeedback.find( ulWindow );
++	if ( iter == s_GmHeldFeedback.end() )
++		return false;
++
++	GmHeldFeedback *pHeld = iter->second.front();
++	struct wl_resource *pResource = pHeld->resource;
++	gm_held_feedback_erase( pHeld );
++
++	uint64_t ulSequence = ++s_ulGmFeedbackSequence;
++	timespec last_refresh_ts;
++	last_refresh_ts.tv_sec = time_t(last_refresh_nsec / 1'000'000'000ul);
++	last_refresh_ts.tv_nsec = long(last_refresh_nsec % 1'000'000'000ul);
++	wp_presentation_feedback_send_presented(
++		pResource,
++		last_refresh_ts.tv_sec >> 32,
++		last_refresh_ts.tv_sec & 0xffffffff,
++		last_refresh_ts.tv_nsec,
++		uint32_t(refresh_cycle),
++		ulSequence >> 32,
++		ulSequence & 0xffffffff,
++		WP_PRESENTATION_FEEDBACK_KIND_VSYNC | WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK | WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY );
++	wl_resource_destroy( pResource );
++	return s_GmHeldFeedback.contains( ulWindow );
++}
++
++std::vector<uint64_t> wlserver_gm_held_windows()
++{
++	std::vector<uint64_t> windows;
++	for ( const auto &entry : s_GmHeldFeedback )
++		windows.push_back( entry.first );
++	return windows;
++}
++
+ void wlserver_presentation_feedback_discard( struct wlr_surface *surface, std::vector<struct wl_resource*>& presentation_feedbacks )
+ {
+ 	wlserver_wl_surface_info *wl_surface_info = get_wl_surface_info(surface);
+--- a/src/wlserver.hpp
++++ b/src/wlserver.hpp
+@@ -318,6 +318,13 @@ uint32_t wlserver_make_new_xwayland_server();
+ void wlserver_destroy_xwayland_server(gamescope_xwayland_server_t *server);
+ 
+ void wlserver_presentation_feedback_presented( struct wlr_surface *surface, std::vector<struct wl_resource*>& presentation_feedbacks, uint64_t last_refresh_nsec, uint64_t refresh_cycle );
++// gmstream (0008): presented events held back to throttle a FIFO game, one
++// queue per window. Each frees itself if its client goes away first.
++void wlserver_gm_hold_feedback( uint64_t ulWindow, std::vector<struct wl_resource*>& presentation_feedbacks );
++// Sends the window's oldest; returns whether it has more.
++bool wlserver_gm_release_feedback( uint64_t ulWindow, uint64_t last_refresh_nsec, uint64_t refresh_cycle );
++std::vector<uint64_t> wlserver_gm_held_windows();
++
+ void wlserver_presentation_feedback_discard( struct wlr_surface *surface, std::vector<struct wl_resource*>& presentation_feedbacks );
+ 
+ void wlserver_past_present_timing( struct wlr_surface *surface, uint32_t present_id, uint64_t desired_present_time, uint64_t actual_present_time, uint64_t earliest_present_time, uint64_t present_margin );

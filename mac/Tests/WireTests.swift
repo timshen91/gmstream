@@ -37,8 +37,8 @@ final class WireTests: XCTestCase {
                                Msg.position, Msg.scroll, Msg.gamepad, Msg.gamepadRemove, Msg.ping, Msg.displayGrid,
                                Msg.vrrPolicy]
         XCTAssertEqual(client, Array(0x01...0x0e))
-        let host: [UInt8] = [Msg.helloAck, Msg.cursor, Msg.pointerLock, Msg.rumble, Msg.pong, Msg.error]
-        XCTAssertEqual(host, Array(0x81...0x86))
+        let host: [UInt8] = [Msg.helloAck, Msg.cursor, Msg.relative, Msg.rumble, Msg.pong, Msg.error, Msg.cursorClip]
+        XCTAssertEqual(host, Array(0x81...0x87))
         XCTAssertEqual([datagramAudio, datagramVideo, datagramControl, datagramPyroWave, datagramAwake], [1, 2, 3, 4, 5])
         XCTAssertEqual(maxDatagram, 1400)
     }

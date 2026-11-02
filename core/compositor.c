@@ -141,6 +141,9 @@ struct vd_server {
 	struct wlr_relative_pointer_manager_v1 *relative_pointer;
 	struct wlr_pointer_constraints_v1 *constraints;
 	struct wlr_pointer_constraint_v1 *active_constraint;
+	struct wl_event_source *pointer_report;
+	bool relative_sent;
+	uint16_t clip_sent[4];
 	struct wlr_xdg_decoration_manager_v1 *decoration_manager;
 
 	// gamescope's cursor: the client draws it.
@@ -560,7 +563,8 @@ static uint64_t grid_vblank(struct vd_server *server, uint64_t now, bool frame) 
 // gamescope still paces to these timestamps (its vblank timer, at the output
 // mode's refresh), so a client grid still sets where frames land; with it on,
 // gamescope presents as soon as frames are ready. Reported as a fixed refresh,
-// gamescope takes its refresh from the grid's interval and is never VRR.
+// gamescope takes its refresh from the grid's interval, or with no grid the
+// stream's rate, and is never VRR.
 // Returns when a frame on a client grid may leave for the encoder (0: now).
 static uint64_t send_feedback(struct vd_server *server, struct wlr_surface *surface,
 		uint64_t when_ns, bool frame) {
@@ -581,11 +585,13 @@ static uint64_t send_feedback(struct vd_server *server, struct wlr_surface *surf
 				now, when_ns, frame, release);
 		}
 	}
+	uint64_t fixed_refresh_ns = server->grid_interval_ns != 0 ? server->grid_interval_ns
+		: 1000000000000ull / (uint64_t)server->refresh;
 	struct wlr_presentation_event event = {
 		.output = server->output,
 		.tv_sec = when_ns / 1000000000,
 		.tv_nsec = when_ns % 1000000000,
-		.refresh = server->vrr_policy == 1 ? (uint32_t)server->grid_interval_ns : 0,
+		.refresh = server->vrr_policy == 1 ? (uint32_t)fixed_refresh_ns : 0,
 	};
 	wlr_presentation_feedback_send_presented(feedback, &event);
 	wlr_presentation_feedback_destroy(feedback);
@@ -984,6 +990,28 @@ static bool pointer_locked(struct vd_server *server) {
 		server->active_constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED;
 }
 
+// A client's mouse is passed on as it came, a position as a position and motion
+// as motion, whatever the game wants. gamescope takes in both; the client chooses
+// (protocol Position, Motion).
+static void client_motion(struct vd_server *server, double dx, double dy) {
+	wlr_relative_pointer_manager_v1_send_relative_motion(
+		server->relative_pointer, server->seat, (uint64_t)now_msec() * 1000,
+		dx, dy, dx, dy);
+	wlr_seat_pointer_notify_frame(server->seat);
+}
+
+static void client_position(struct vd_server *server, double x, double y) {
+	int w, h;
+	screen_size(server, &w, &h);
+	server->cursor_x = x < 0 ? 0 : x > w - 1 ? w - 1 : x;
+	server->cursor_y = y < 0 ? 0 : y > h - 1 ? h - 1 : y;
+	// The view is the whole screen at (0, 0): layout == surface coords.
+	wlr_seat_pointer_notify_motion(server->seat, now_msec(),
+		server->cursor_x, server->cursor_y);
+	wlr_seat_pointer_notify_frame(server->seat);
+}
+
+// The mouse on the panel (panel mode), which has no client to keep its position.
 static void pointer_moved(struct vd_server *server, double dx, double dy,
 		bool absolute, double x, double y) {
 	uint32_t time = now_msec();
@@ -991,13 +1019,11 @@ static void pointer_moved(struct vd_server *server, double dx, double dy,
 		dx = x - server->cursor_x;
 		dy = y - server->cursor_y;
 	}
-	wlr_relative_pointer_manager_v1_send_relative_motion(
-		server->relative_pointer, server->seat, (uint64_t)time * 1000,
-		dx, dy, dx, dy);
-	// Absolute input keeps being tracked while the pointer is locked, so the
-	// relative motion derived from it stays true (gamescope locks the pointer
-	// whenever Steam's cursor is hidden). Relative input under a lock only
-	// moves the client's own cursor.
+	if (pointer_locked(server)) {
+		wlr_relative_pointer_manager_v1_send_relative_motion(
+			server->relative_pointer, server->seat, (uint64_t)time * 1000,
+			dx, dy, dx, dy);
+	}
 	if (absolute || !pointer_locked(server)) {
 		int w, h;
 		screen_size(server, &w, &h);
@@ -1121,24 +1147,55 @@ static void release_all_input(struct vd_server *server) {
 	}
 }
 
+// gamescope's constraint says two things: a lock asks for motion, a confinement
+// doesn't, and the region of either is the game's clip (none: no clip). It
+// replaces a constraint to change it, so the news goes out when the event loop
+// is done with the old one going and the new one coming.
+static void report_pointer(void *data) {
+	struct vd_server *server = data;
+	server->pointer_report = NULL;
+	bool relative = pointer_locked(server);
+	uint16_t clip[4] = {0};
+	if (server->active_constraint != NULL &&
+			pixman_region32_not_empty(&server->active_constraint->current.region)) {
+		const pixman_box32_t *box =
+			pixman_region32_extents(&server->active_constraint->current.region);
+		clip[0] = box->x1;
+		clip[1] = box->y1;
+		clip[2] = box->x2;
+		clip[3] = box->y2;
+	}
+	if (relative != server->relative_sent) {
+		server->relative_sent = relative;
+		wlr_log(WLR_INFO, "Game wants %s input", relative ? "relative" : "absolute");
+		server->cb->relative(server->cb->ctx, relative);
+	}
+	if (memcmp(clip, server->clip_sent, sizeof(clip)) != 0) {
+		memcpy(server->clip_sent, clip, sizeof(clip));
+		wlr_log(WLR_INFO, "Cursor clip %d,%d-%d,%d", clip[0], clip[1], clip[2], clip[3]);
+		server->cb->cursor_clip(server->cb->ctx, clip[0], clip[1], clip[2], clip[3]);
+	}
+}
+
+static void report_pointer_soon(struct vd_server *server) {
+	if (server->pointer_report == NULL) {
+		server->pointer_report = wl_event_loop_add_idle(server->loop, report_pointer, server);
+	}
+}
+
 static void handle_constraint_destroy(struct wl_listener *listener,
 		void *data) {
 	struct vd_server *server =
 		wl_container_of(listener, server, constraint_destroy);
-	bool was_locked = pointer_locked(server);
 	wl_list_remove(&server->constraint_destroy.link);
 	server->active_constraint = NULL;
-	if (was_locked) {
-		wlr_log(WLR_INFO, "Pointer unlocked");
-		server->cb->pointer_lock(server->cb->ctx, false);
-	}
+	report_pointer_soon(server);
 }
 
 static void handle_new_constraint(struct wl_listener *listener, void *data) {
 	struct vd_server *server =
 		wl_container_of(listener, server, new_constraint);
 	struct wlr_pointer_constraint_v1 *constraint = data;
-	bool was_locked = pointer_locked(server);
 	// There is only one surface to constrain to, so honor the newest one.
 	if (server->active_constraint != NULL) {
 		wlr_pointer_constraint_v1_send_deactivated(server->active_constraint);
@@ -1148,10 +1205,7 @@ static void handle_new_constraint(struct wl_listener *listener, void *data) {
 	server->constraint_destroy.notify = handle_constraint_destroy;
 	wl_signal_add(&constraint->events.destroy, &server->constraint_destroy);
 	wlr_pointer_constraint_v1_send_activated(constraint);
-	if (pointer_locked(server) != was_locked) {
-		wlr_log(WLR_INFO, "Pointer %s", was_locked ? "unlocked" : "locked");
-		server->cb->pointer_lock(server->cb->ctx, !was_locked);
-	}
+	report_pointer_soon(server);
 }
 
 static void handle_request_set_selection(struct wl_listener *listener,
@@ -1766,7 +1820,12 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		free(server->cursor_sent);
 		server->cursor_sent = NULL;
 		send_cursor(server);
-		server->cb->pointer_lock(server->cb->ctx, pointer_locked(server));
+		// Nor is the rest of the mouse's state: tell this client from scratch.
+		server->relative_sent = false;
+		memset(server->clip_sent, 0, sizeof(server->clip_sent));
+		server->cb->relative(server->cb->ctx, false);
+		server->cb->cursor_clip(server->cb->ctx, 0, 0, 0, 0);
+		report_pointer_soon(server);
 		repeat_last_frame(server);
 		break;
 	case CMD_STREAM_CONFIGURE:
@@ -1815,12 +1874,12 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		}
 		break;
 	case CMD_MOTION:
-		pointer_moved(server, c->motion.x, c->motion.y, false, 0, 0);
+		client_motion(server, c->motion.x, c->motion.y);
 		break;
 	case CMD_POSITION: {
 		int w, h;
 		screen_size(server, &w, &h);
-		pointer_moved(server, 0, 0, true, c->motion.x * w, c->motion.y * h);
+		client_position(server, c->motion.x * w, c->motion.y * h);
 		break;
 	}
 	case CMD_BUTTON:

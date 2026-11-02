@@ -11,6 +11,6 @@ extension Pacing {
     /// VRR only in full screen: in a window macOS composites the desktop at
     /// a fixed rate.
     init(options: Options, fullScreen: Bool, screen: NSScreen?) {
-        self.init(options: options, vrr: fullScreen && screen?.variableRefresh == true)
+        self.init(options: options, vrr: fullScreen && screen?.variableRefresh == true, capable: screen?.variableRefresh == true)
     }
 }

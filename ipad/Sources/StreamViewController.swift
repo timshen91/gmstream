@@ -108,10 +108,12 @@ final class StreamViewController: UIViewController, SessionShell, UIPointerInter
     var shortestRefresh: Double { 1 / maxFPS }
     var fullScreen: Bool { screen.map { view.window?.bounds.size == $0.bounds.size } ?? false }
     var vrr: Bool { false } // held at the top rate (start)
+    var vrrCapable: Bool { false }
     var displayColorSpace: CGColorSpace? { CGColorSpace(name: CGColorSpace.displayP3) }
     var focused: Bool { view.window?.windowScene?.activationState == .foregroundActive && presentedViewController == nil }
     func status(_ line: String) {}
     func cursorChanged() { makeCursor() }
+    var capturesMouse: Bool { false } // iPadOS decides the lock: relative only
     func pacingChanged() {}
 
     func setPointerLock(_ on: Bool) {
