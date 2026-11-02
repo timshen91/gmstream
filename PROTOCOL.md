@@ -183,6 +183,8 @@ type byte:
 | 3 | control: `u32 sequence` then bytes of the control stream, sealed (below) |
 | 5 | keep-awake (client → host): no payload; the host drops it |
 | 6 | handshake (below) |
+| 7 | mouse (client → host): `u32 sequence` then a sealed payload (below) |
+| 8 | acknowledgement (host → client): `u32 sequence` then a sealed `u32` |
 
 A session starts with a handshake. Client → host: type 6, an ephemeral X25519
 public key, then zeros up to 129 bytes in all (so a forged request gets back no
@@ -198,6 +200,22 @@ Both sides take HKDF-SHA256 of the X25519 secret with T as salt: 32 bytes with i
 datagram is sealed with its 5-byte header as additional data and 8 zero bytes then
 the big-endian sequence number as nonce, the 16-byte tag last, so its payload is
 at most 1379 bytes. A datagram that doesn't open is dropped.
+
+The nonce's first byte says what the number counts, each with its own numbers: 0
+control, 1 mouse, 2 acknowledgement.
+
+Mouse datagrams are not ordered, nor resent: a client sends one per mouse event
+and the host ignores any older than the newest it has seen. A payload of `u8 0, f64
+x, f64 y` says how far the mouse has moved since the session began, in stream
+pixels, so a lost datagram is contained in the next. A payload of `u8 1, f32 x, f32
+y` is its position, normalized over the video. The client sends the last one a
+second time, as nothing may follow it. They count from when the host has accepted
+`Auth`. `Motion` and `Position` still work on the control stream; a client sends
+`Position` there just before a button, which is ordered.
+
+The host answers every control datagram with type 8, whose sealed value is the next
+control sequence it wants. A client sends again whatever isn't acknowledged within
+30 ms.
 
 The first control message is `Auth` (0x10): the client's Ed25519 public key (32)
 and its signature (64) over "gmstream client" + T. That key must be in the host
@@ -216,8 +234,9 @@ A client is identified by its address and port. Its control datagram 0
 (which starts with `Auth`), sealed with the handshake's keys, begins a session; a
 later session from another address replaces it, as over WebTransport. The host ends a session after
 10 s without a control datagram from the client, so clients send `Ping`
-every 500 ms. A lost control datagram stalls the stream behind it; once 256
-later ones are waiting, the host ends the session and the client reconnects.
+every 500 ms. A lost client → host control datagram is sent again; one lost the other way
+stalls the stream behind it, and once 256 later ones are waiting the client
+reconnects.
 
 A client on Wi-Fi should send keep-awake datagrams at about 60 Hz. A client
 that only receives lets its Wi-Fi enter power save during the stream (seen

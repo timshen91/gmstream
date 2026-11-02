@@ -18,11 +18,12 @@ enum Msg {
         rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86, cursorClip: UInt8 = 0x87
 }
 
-let protocolVersion: UInt16 = 4
+let protocolVersion: UInt16 = 5
 let datagramAudio: UInt8 = 1, datagramVideo: UInt8 = 2, datagramControl: UInt8 = 3, datagramPyroWave: UInt8 = 4,
     datagramAwake: UInt8 = 5
 let maxDatagram = 1400
 let datagramHandshake: UInt8 = 6
+let datagramMouse: UInt8 = 7, datagramAck: UInt8 = 8
 let handshakeSize = 129 // padded, so a forged request gets back no more than it sent
 let tagSize = 16
 
@@ -86,6 +87,13 @@ final class Connection {
     private var sendKey: SymmetricKey? // under sendLock
     private var recvKey: SymmetricKey? // receive thread only
     private var unsent: [Data] = []    // control bytes before the keys, under sendLock
+    // Sent and not yet acknowledged, oldest first, under sendLock. The host holds
+    // a stream back for a missing datagram, so they go again until it has them.
+    private var unacked: [(seq: UInt32, datagram: Data, sentNs: UInt64)] = []
+    private var resendTimer: DispatchSourceTimer?
+    private static let resendAfterNs: UInt64 = 30_000_000
+    private var mouseSeq: UInt32 = 0, mouseTotal = (x: 0.0, y: 0.0)
+    private var lastMouse: Data?, mouseRepeated = true
     private var running = true
     private var started = false
     private var awakeTimer: DispatchSourceTimer? // under sendLock
@@ -253,6 +261,13 @@ final class Connection {
         started = true
         send(Msg.hello, w.data)
         sendHandshake()
+        let t = DispatchSource.makeTimerSource(queue: .global(qos: .userInteractive))
+        t.schedule(deadline: .now() + .milliseconds(15), repeating: .milliseconds(15), leeway: .milliseconds(2))
+        t.setEventHandler { [weak self] in self?.resend() }
+        t.resume()
+        sendLock.lock()
+        resendTimer = t
+        sendLock.unlock()
         let thread = Thread { [weak self] in self?.receiveLoop() }
         thread.qualityOfService = .userInteractive
         thread.name = "gmstream-net"
@@ -262,7 +277,11 @@ final class Connection {
 
     func stop() {
         keepAwake(false)
+        sendLock.lock()
+        resendTimer?.cancel()
+        resendTimer = nil
         running = false
+        sendLock.unlock()
         shutdown(fd, SHUT_RDWR)
     }
 
@@ -289,10 +308,11 @@ final class Connection {
             d.u8(datagramControl)
             d.u32(sendSeq)
             guard let box = try? AES.GCM.seal(bytes[(bytes.startIndex + off)..<(bytes.startIndex + off + n)], using: key,
-                                              nonce: Self.nonce(sendSeq), authenticating: d.data) else { return }
-            sendSeq += 1
+                                              nonce: Self.nonce(.control, sendSeq), authenticating: d.data) else { return }
             d.data.append(box.ciphertext)
             d.data.append(box.tag)
+            unacked.append((sendSeq, d.data, nowNs()))
+            sendSeq += 1
             let sent = d.data.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
             if sent < 0 && running {
                 // e.g. "No route to host" when macOS denies local network access.
@@ -303,8 +323,67 @@ final class Connection {
         }
     }
 
-    private static func nonce(_ seq: UInt32) -> AES.GCM.Nonce {
+    /// The mouse, unordered: how far it has gone since the session began, so a
+    /// lost datagram is in the next one. In stream pixels.
+    func motion(dx: Double, dy: Double) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        mouseTotal.x += dx
+        mouseTotal.y += dy
+        var m = Writer()
+        m.u8(0)
+        m.data.append(contentsOf: withUnsafeBytes(of: mouseTotal.x.bitPattern.littleEndian) { Array($0) })
+        m.data.append(contentsOf: withUnsafeBytes(of: mouseTotal.y.bitPattern.littleEndian) { Array($0) })
+        sendMouse(m.data)
+    }
+
+    /// The mouse at (x, y) in the video, 0...1: the latest one counts.
+    func position(x: Float, y: Float) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        var m = Writer()
+        m.u8(1)
+        m.f32(x); m.f32(y)
+        sendMouse(m.data)
+    }
+
+    /// Under sendLock.
+    private func sendMouse(_ payload: Data) {
+        guard running, let key = sendKey else { return }
+        var d = Writer()
+        d.u8(datagramMouse)
+        d.u32(mouseSeq)
+        guard let box = try? AES.GCM.seal(payload, using: key, nonce: Self.nonce(.mouse, mouseSeq), authenticating: d.data) else { return }
+        mouseSeq += 1
+        d.data.append(box.ciphertext)
+        d.data.append(box.tag)
+        _ = d.data.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
+        lastMouse = payload
+        mouseRepeated = false
+    }
+
+    /// Every 15 ms: control datagrams not acknowledged in time go again, and the
+    /// mouse's last word once more, as nothing would follow it if it were lost.
+    private func resend() {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        guard running else { return }
+        let now = nowNs()
+        for i in unacked.indices where now - unacked[i].sentNs > Self.resendAfterNs {
+            unacked[i].sentNs = now
+            _ = unacked[i].datagram.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
+        }
+        if !mouseRepeated, let lastMouse {
+            sendMouse(lastMouse)
+            mouseRepeated = true
+        }
+    }
+
+    private enum SeqKind: UInt8 { case control = 0, mouse = 1, ack = 2 }
+
+    private static func nonce(_ kind: SeqKind, _ seq: UInt32) -> AES.GCM.Nonce {
         var n = Data(count: 8)
+        n[0] = kind.rawValue
         withUnsafeBytes(of: seq.bigEndian) { n.append(contentsOf: $0) }
         return try! AES.GCM.Nonce(data: n)
     }
@@ -488,10 +567,20 @@ final class Connection {
         case datagramControl where n > 5 + tagSize:
             let seq = d.u32(1), s = d.startIndex
             guard let key = recvKey,
-                  let box = try? AES.GCM.SealedBox(nonce: Self.nonce(seq), ciphertext: d.subdata(in: s + 5..<s + n - tagSize),
+                  let box = try? AES.GCM.SealedBox(nonce: Self.nonce(.control, seq), ciphertext: d.subdata(in: s + 5..<s + n - tagSize),
                                                    tag: d.subdata(in: s + n - tagSize..<s + n)),
                   let payload = try? AES.GCM.open(box, using: key, authenticating: d.subdata(in: s..<s + 5)) else { return }
             controlDatagram(seq: seq, payload: payload)
+        case datagramAck where n == 5 + 4 + tagSize:
+            let seq = d.u32(1), s = d.startIndex
+            guard let key = recvKey,
+                  let box = try? AES.GCM.SealedBox(nonce: Self.nonce(.ack, seq), ciphertext: d.subdata(in: s + 5..<s + 9),
+                                                   tag: d.subdata(in: s + 9..<s + n)),
+                  let next = try? AES.GCM.open(box, using: key, authenticating: d.subdata(in: s..<s + 5)) else { return }
+            let upTo = Data(next).u32(0)
+            sendLock.lock()
+            unacked.removeAll { $0.seq < upTo }
+            sendLock.unlock()
         case datagramPyroWave where n > 29:
             delegate?.pyrowave(PyroWavePacket(
                 frameId: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)),

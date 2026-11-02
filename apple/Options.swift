@@ -13,7 +13,7 @@ enum PacingMode: Int, CaseIterable {
     var title: String { ["Auto (from the display)", "Low latency", "Manual"][rawValue] }
 }
 
-/// Manual pacing: the host's VRR. A display that can't do VRR always has it off.
+/// Manual pacing: the host's VRR. A display that can't do VRR has it off.
 /// Auto: on where it really happens, in full screen on a capable display (the
 /// host then runs just under the panel's top rate, PanelRate), else off. On: on,
 /// whatever Steam's toggle shows. Steam: left to Steam's toggle.
@@ -234,24 +234,29 @@ struct Pacing {
     init(options: Options, vrr: Bool, capable: Bool) {
         self.vrr = vrr
         let mode: VRRMode
+        var lock: Bool
         switch options.pacingMode {
         case .auto:
-            (phaseLock, hold, vsyncOff) = vrr ? (false, true, false) : (true, false, false)
+            (lock, hold, vsyncOff) = vrr ? (false, true, false) : (true, false, false)
             mode = .auto
         case .lowLatency:
-            // On where it can be, so gamescope doesn't step frames on its vblanks.
-            (phaseLock, hold, vsyncOff) = (false, false, true)
+            (lock, hold, vsyncOff) = (false, false, true)
             mode = .on
         case .manual:
-            (phaseLock, hold, vsyncOff) = (options.phaseLock, options.holdFrames, options.immediateFullScreen)
+            (lock, hold, vsyncOff) = (options.phaseLock, options.holdFrames, options.immediateFullScreen)
             mode = options.vrrMode
         }
         vrrMode = mode
         switch mode {
         case .auto: steamVRR = vrr ? 2 : 1
         case .off: steamVRR = 1
-        case .on: steamVRR = capable ? 2 : 1
+        // Free-running on the host, which is what Low latency is, whatever the display.
+        case .on: steamVRR = capable || options.pacingMode == .lowLatency ? 2 : 1
         case .steam: steamVRR = capable ? 0 : 1
         }
+        // The host never times itself: frames go by the game or by the client's
+        // grid. With neither, gamescope steps on a 60 Hz timer of its own.
+        if steamVRR != 2 { lock = true }
+        phaseLock = lock
     }
 }

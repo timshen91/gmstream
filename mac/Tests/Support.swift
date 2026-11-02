@@ -51,7 +51,26 @@ final class FakeHost {
         while let d = receive(timeout: timeout) {
             if d[0] == datagramHandshake { answerHandshake(d) }
             if d[0] == datagramControl, let recv {
-                let box = try! AES.GCM.SealedBox(nonce: Self.nonce(d.u32(1)), ciphertext: d.subdata(in: 5..<d.count - tagSize),
+                let seq = d.u32(1)
+                if autoAck {
+                    sendAck(next: max(nextControl, seq + 1))
+                    if seq < nextControl { continue } // sent again
+                    nextControl = seq + 1
+                }
+                let box = try! AES.GCM.SealedBox(nonce: Self.nonce(0, seq), ciphertext: d.subdata(in: 5..<d.count - tagSize),
+                                                 tag: d.subdata(in: d.count - tagSize..<d.count))
+                return (seq, try! AES.GCM.open(box, using: recv, authenticating: d.subdata(in: 0..<5)))
+            }
+        }
+        return nil
+    }
+
+    /// The next mouse datagram, opened: its number and payload.
+    func receiveMouse(timeout: Double = 2) -> (seq: UInt32, payload: Data)? {
+        while let d = receive(timeout: timeout) {
+            if d[0] == datagramHandshake { answerHandshake(d) }
+            if d[0] == datagramMouse, let recv {
+                let box = try! AES.GCM.SealedBox(nonce: Self.nonce(1, d.u32(1)), ciphertext: d.subdata(in: 5..<d.count - tagSize),
                                                  tag: d.subdata(in: d.count - tagSize..<d.count))
                 return (d.u32(1), try! AES.GCM.open(box, using: recv, authenticating: d.subdata(in: 0..<5)))
             }
@@ -59,14 +78,33 @@ final class FakeHost {
         return nil
     }
 
+    /// Tells the client which control datagram comes next.
+    func sendAck(next: UInt32) {
+        var w = Writer()
+        w.u8(datagramAck)
+        w.u32(acks)
+        var body = Writer()
+        body.u32(next)
+        let box = try! AES.GCM.seal(body.data, using: sendKey!, nonce: Self.nonce(2, acks), authenticating: w.data)
+        acks += 1
+        w.data.append(box.ciphertext)
+        w.data.append(box.tag)
+        send(w.data)
+    }
+    private var acks: UInt32 = 0
+    /// As the real host does; off to see what happens without acknowledgements.
+    var autoAck = true
+    private var nextControl: UInt32 = 0
+
     /// What a host's key signed last, for checking the client's Auth.
     private(set) var transcript = Data()
     var signingKey = try! Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: 7, count: 32))
     private var sendKey: SymmetricKey?, recv: SymmetricKey?
     private var answered: Data?, lastReply: Data?
 
-    private static func nonce(_ seq: UInt32) -> AES.GCM.Nonce {
+    private static func nonce(_ kind: UInt8, _ seq: UInt32) -> AES.GCM.Nonce {
         var n = Data(count: 8)
+        n[0] = kind
         withUnsafeBytes(of: seq.bigEndian) { n.append(contentsOf: $0) }
         return try! AES.GCM.Nonce(data: n)
     }
@@ -118,7 +156,7 @@ final class FakeHost {
         var w = Writer()
         w.u8(datagramControl)
         w.u32(seq)
-        let box = try! AES.GCM.seal(bytes, using: sendKey!, nonce: Self.nonce(seq), authenticating: w.data)
+        let box = try! AES.GCM.seal(bytes, using: sendKey!, nonce: Self.nonce(0, seq), authenticating: w.data)
         w.data.append(box.ciphertext)
         w.data.append(box.tag)
         send(w.data)

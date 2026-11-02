@@ -1,0 +1,22 @@
+Absolute host motion also sends a delta, so the X master pointer stays relative.
+
+
+--- a/src/wlserver.cpp	2026-11-02 23:57:51
++++ b/src/wlserver.cpp	2026-11-02 23:57:51
+@@ -3386,6 +3386,16 @@
+ 		auto [nWidth, nHeight] = wlserver_get_cursor_bounds();
+ 		tx = clamp( tx, 0.0, nWidth - 0.1 );
+ 		ty = clamp( ty, 0.0, nHeight - 0.1 );
++
++		// As any compositor does, a move is also a delta. Without one, Xwayland
++		// uses its absolute device and the X master pointer takes on absolute
++		// axes, and the raw-only motion of a later lock can't change that. SDL
++		// goes by the master's axes, so a game such as CS2 then takes each delta
++		// for a position and subtracts the one before it.
++		const double dx = tx - wlserver.mouse_surface_cursorx;
++		const double dy = ty - wlserver.mouse_surface_cursory;
++		if ( dx != 0.0 || dy != 0.0 )
++			wlserver_perform_rel_pointer_motion( dx, dy );
+ 
+ 		wlserver_mousewarp( tx, ty, time, false );
+ 	}

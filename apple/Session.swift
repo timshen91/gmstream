@@ -471,7 +471,7 @@ final class Session: ConnectionDelegate {
             }
         case .lowLatency: "Frames show as they come: no phase lock, no fixed delay"
             + (MetalRenderer.canTurnVsyncOff ? ", vsync off in full screen (may tear)" : "")
-            + (pacing.steamVRR == 2 ? "; VRR is on, whatever Steam's toggle shows." : "; VRR is off (this display can't do it).")
+            + "; the game runs free on the host, whatever Steam's toggle shows."
         case .auto: pacing.vrr ? "Variable-refresh display in full screen: fixed delay, no phase lock; Steam's VRR is forced on (the game runs free)."
             : "Fixed refresh (or a window): phase lock, no fixed delay; Steam's VRR is off (its toggle greyed)."
         }
@@ -573,26 +573,32 @@ final class Session: ConnectionDelegate {
         held.removeAll()
     }
 
+    private var lastPosition: (x: Float, y: Float)?
+
     /// The pointer at (x, y) in the video, 0...1 from its top left
     /// (clamped). With the cursor drawn into frames it needs drawing anew.
     func position(x: Double, y: Double) {
         renderer.cursorMoved()
-        var m = Writer()
-        m.f32(Float(min(1, max(0, x)))); m.f32(Float(min(1, max(0, y))))
-        conn?.send(Msg.position, m.data)
+        let at = (x: Float(min(1, max(0, x))), y: Float(min(1, max(0, y))))
+        lastPosition = at
+        conn?.position(x: at.x, y: at.y)
     }
 
     /// Relative motion in stream pixels (pointer locked).
     func motion(dx: Double, dy: Double) {
-        var m = Writer()
-        m.f32(Float(dx)); m.f32(Float(dy))
-        conn?.send(Msg.motion, m.data)
+        conn?.motion(dx: dx, dy: dy)
     }
 
     /// A mouse button (evdev BTN_*). A click while the host wants the
     /// pointer but it is not captured (focus came back) captures it instead.
     func button(_ code: UInt16, down: Bool) {
         if down && wantsCapture && !lockActive { shell?.setPointerLock(true); return }
+        // Buttons are ordered and the mouse isn't: click where the mouse is.
+        if !sendsMotion, let at = lastPosition {
+            var p = Writer()
+            p.f32(at.x); p.f32(at.y)
+            conn?.send(Msg.position, p.data)
+        }
         var m = Writer()
         m.u16(code); m.u8(down ? 1 : 0)
         conn?.send(Msg.button, m.data)

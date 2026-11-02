@@ -8,8 +8,8 @@
 //! ~/.ssh/authorized_keys. The signature covers the fresh keys, so it can't be
 //! replayed or moved to another session.
 //!
-//! Only the control stream is encrypted, which is everything a client sends and
-//! what it is told about the mouse. Video and audio are not.
+//! The control stream, mouse datagrams and acks are encrypted, which is everything
+//! a client sends and what it is told about the mouse. Video and audio are not.
 
 use std::path::Path;
 
@@ -58,8 +58,18 @@ pub struct Keys {
     transcript: [u8; 32],
 }
 
-fn nonce(seq: u32) -> Nonce {
+/// What a sequence number counts: each has its own numbers under one key, and
+/// its own nonces.
+#[derive(Clone, Copy)]
+pub enum Kind {
+    Control = 0,
+    Mouse = 1,
+    Ack = 2,
+}
+
+fn nonce(kind: Kind, seq: u32) -> Nonce {
     let mut n = [0u8; 12];
+    n[0] = kind as u8;
     n[8..].copy_from_slice(&seq.to_be_bytes());
     Nonce::assume_unique_for_key(n)
 }
@@ -67,15 +77,15 @@ fn nonce(seq: u32) -> Nonce {
 impl Keys {
     /// `plain` encrypted, tag appended. A sequence number is used once in each
     /// direction of a session, and the two directions have different keys.
-    pub fn seal(&self, header: &[u8], seq: u32, plain: &[u8]) -> Vec<u8> {
+    pub fn seal(&self, kind: Kind, header: &[u8], seq: u32, plain: &[u8]) -> Vec<u8> {
         let mut out = plain.to_vec();
-        self.send.seal_in_place_append_tag(nonce(seq), Aad::from(header), &mut out).expect("sealing");
+        self.send.seal_in_place_append_tag(nonce(kind, seq), Aad::from(header), &mut out).expect("sealing");
         out
     }
 
-    pub fn open(&self, header: &[u8], seq: u32, sealed: &[u8]) -> Option<Vec<u8>> {
+    pub fn open(&self, kind: Kind, header: &[u8], seq: u32, sealed: &[u8]) -> Option<Vec<u8>> {
         let mut out = sealed.to_vec();
-        let n = self.recv.open_in_place(nonce(seq), Aad::from(header), &mut out).ok()?.len();
+        let n = self.recv.open_in_place(nonce(kind, seq), Aad::from(header), &mut out).ok()?.len();
         out.truncate(n);
         Some(out)
     }
@@ -198,6 +208,12 @@ mod tests {
     }
 
     #[test]
+    fn a_number_of_one_kind_is_a_different_nonce_from_another_s() {
+        assert_ne!(nonce(Kind::Control, 5).as_ref(), nonce(Kind::Mouse, 5).as_ref());
+        assert_ne!(nonce(Kind::Mouse, 5).as_ref(), nonce(Kind::Ack, 5).as_ref());
+    }
+
+    #[test]
     fn each_side_opens_what_the_other_seals_and_nothing_else() {
         let dir = std::env::temp_dir().join(format!("gm-auth-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -207,8 +223,8 @@ mod tests {
         let a = EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap();
         let public = a.compute_public_key().unwrap();
         let (_, keys) = respond(&host, public.as_ref()).unwrap();
-        let sealed = keys.seal(b"h", 7, b"hello");
+        let sealed = keys.seal(Kind::Control, b"h", 7, b"hello");
         assert_eq!(sealed.len(), 5 + TAG_SIZE);
-        assert!(keys.open(b"h", 7, &sealed).is_none(), "the directions have different keys");
+        assert!(keys.open(Kind::Control, b"h", 7, &sealed).is_none(), "the directions have different keys");
     }
 }

@@ -32,7 +32,7 @@ final class WireTests: XCTestCase {
     }
 
     func testMessageIdsMatchTheProtocol() {
-        XCTAssertEqual(protocolVersion, 4)
+        XCTAssertEqual(protocolVersion, 5)
         let client: [UInt8] = [Msg.hello, Msg.configure, Msg.keyframe, Msg.bitrate, Msg.key, Msg.button, Msg.motion,
                                Msg.position, Msg.scroll, Msg.gamepad, Msg.gamepadRemove, Msg.ping, Msg.displayGrid,
                                Msg.vrrPolicy, Msg.touch, Msg.auth]

@@ -6,12 +6,18 @@
 //! session with no control datagram for 10 s ends (clients ping every 500 ms).
 //! Only a datagram sealed with a session's keys touches that session, so a
 //! forged handshake can't end one.
+//!
+//! The mouse has datagrams of its own, so that a lost control datagram can't hold
+//! it up, and nothing waits for them: a motion datagram says how far the mouse has
+//! gone since the start of the session, so one that is lost is in the next, and a
+//! position is simply the latest. The client resends control datagrams until they
+//! are acknowledged.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,10 +25,15 @@ use anyhow::{Context, Result, bail};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::auth::{self, HostKey, Keys};
+use crate::auth::{self, HostKey, Keys, Kind};
+use crate::core;
 
 pub const DATAGRAM_CONTROL: u8 = 3;
 const DATAGRAM_HANDSHAKE: u8 = 6;
+const DATAGRAM_MOUSE: u8 = 7;
+const DATAGRAM_ACK: u8 = 8;
+const MOUSE_MOTION: u8 = 0;
+const MOUSE_POSITION: u8 = 1;
 /// Largest datagram payload we send: fits a 1500-byte Ethernet/Wi-Fi MTU
 /// under IPv6 and UDP headers.
 pub const MAX_DATAGRAM: usize = 1400;
@@ -39,9 +50,50 @@ struct Route {
     next: u32,
     pending: BTreeMap<u32, Vec<u8>>,
     keys: Arc<Keys>,
+    ack_seq: u32,
+    /// The mouse counts once the session has authorized the client.
+    mouse_on: Arc<AtomicBool>,
+    mouse_next: u32,
+    mouse_total: (f64, f64),
 }
 
 impl Route {
+    /// The next control datagram wanted, to the client.
+    fn ack(&mut self, socket: &UdpSocket, addr: SocketAddr) {
+        let seq = self.ack_seq;
+        self.ack_seq += 1;
+        let mut d = vec![DATAGRAM_ACK];
+        d.extend_from_slice(&seq.to_le_bytes());
+        let sealed = self.keys.seal(Kind::Ack, &d, seq, &self.next.to_le_bytes());
+        d.extend_from_slice(&sealed);
+        let _ = socket.try_send_to(&d, addr);
+    }
+
+    /// A mouse datagram's payload, unless a later one has come.
+    fn mouse(&mut self, seq: u32, m: &[u8]) {
+        if seq < self.mouse_next || !self.mouse_on.load(Ordering::Relaxed) {
+            return;
+        }
+        self.mouse_next = seq + 1;
+        match (m.first(), m.len()) {
+            (Some(&MOUSE_MOTION), 17) => {
+                let x = f64::from_le_bytes(m[1..9].try_into().unwrap());
+                let y = f64::from_le_bytes(m[9..17].try_into().unwrap());
+                let (dx, dy) = (x - self.mouse_total.0, y - self.mouse_total.1);
+                self.mouse_total = (x, y);
+                if dx != 0.0 || dy != 0.0 {
+                    core::pointer_motion(dx, dy);
+                }
+            }
+            (Some(&MOUSE_POSITION), 9) => {
+                let x = f32::from_le_bytes(m[1..5].try_into().unwrap());
+                let y = f32::from_le_bytes(m[5..9].try_into().unwrap());
+                core::pointer_position(x as f64, y as f64);
+            }
+            _ => {}
+        }
+    }
+
     /// Takes in a control datagram's payload; false if the session is over.
     fn deliver(&mut self, seq: u32, payload: Vec<u8>) -> bool {
         if seq == self.next {
@@ -75,9 +127,15 @@ pub struct Peer {
     seq: AtomicU32,
     routes: Routes,
     keys: Arc<Keys>,
+    mouse_on: Arc<AtomicBool>,
 }
 
 impl Peer {
+    /// Authorized: the mouse datagrams count from now on.
+    pub fn accept_mouse(&self) {
+        self.mouse_on.store(true, Ordering::Relaxed);
+    }
+
     pub fn keys(&self) -> &Keys {
         &self.keys
     }
@@ -141,7 +199,7 @@ impl Peer {
             let mut d = Vec::with_capacity(CONTROL_HEADER + chunk.len() + auth::TAG_SIZE);
             d.push(DATAGRAM_CONTROL);
             d.extend_from_slice(&seq.to_le_bytes());
-            let sealed = self.keys.seal(&d, seq, chunk);
+            let sealed = self.keys.seal(Kind::Control, &d, seq, chunk);
             d.extend_from_slice(&sealed);
             self.send(&d).await?;
         }
@@ -225,31 +283,52 @@ where
             let _ = socket.try_send_to(&handshakes[&addr].reply, addr);
             continue;
         }
-        if n < CONTROL_HEADER + auth::TAG_SIZE || buf[0] != DATAGRAM_CONTROL {
+        if n < CONTROL_HEADER + auth::TAG_SIZE || (buf[0] != DATAGRAM_CONTROL && buf[0] != DATAGRAM_MOUSE) {
             continue;
         }
         let seq = u32::from_le_bytes(buf[1..5].try_into().unwrap());
         let (header, sealed) = buf[..n].split_at(CONTROL_HEADER);
         let mut map = routes.lock().unwrap();
+        if header[0] == DATAGRAM_MOUSE {
+            if let Some(route) = map.get_mut(&addr) {
+                if let Some(m) = route.keys.open(Kind::Mouse, header, seq, sealed) {
+                    route.mouse(seq, &m);
+                }
+            }
+            continue;
+        }
         if let Some(route) = map.get_mut(&addr) {
-            if let Some(payload) = route.keys.open(header, seq, sealed) {
+            if let Some(payload) = route.keys.open(Kind::Control, header, seq, sealed) {
                 if !route.deliver(seq, payload) {
                     eprintln!("gmstream: {addr}: control datagram {} lost; ending the session", route.next);
                     map.remove(&addr);
+                } else {
+                    route.ack(&socket, addr);
                 }
                 continue;
             }
         }
         // Not the session's, if there is one: the start of the next.
-        let Some(payload) = handshakes.get(&addr).filter(|_| seq == 0).and_then(|h| h.keys.open(header, seq, sealed)) else {
+        let Some(payload) = handshakes.get(&addr).filter(|_| seq == 0).and_then(|h| h.keys.open(Kind::Control, header, seq, sealed)) else {
             continue;
         };
         let keys = handshakes.remove(&addr).unwrap().keys;
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut route = Route { tx, next: 0, pending: BTreeMap::new(), keys: keys.clone() };
+        let mouse_on = Arc::new(AtomicBool::new(false));
+        let mut route = Route {
+            tx,
+            next: 0,
+            pending: BTreeMap::new(),
+            keys: keys.clone(),
+            ack_seq: 0,
+            mouse_on: mouse_on.clone(),
+            mouse_next: 0,
+            mouse_total: (0.0, 0.0),
+        };
         route.deliver(seq, payload);
+        route.ack(&socket, addr);
         map.insert(addr, route);
-        let peer = Arc::new(Peer { socket: socket.clone(), addr, seq: AtomicU32::new(0), routes: routes.clone(), keys });
+        let peer = Arc::new(Peer { socket: socket.clone(), addr, seq: AtomicU32::new(0), routes: routes.clone(), keys, mouse_on });
         let fut = session(peer, Control { rx, buf: Vec::new() });
         let routes = routes.clone();
         tokio::spawn(async move {

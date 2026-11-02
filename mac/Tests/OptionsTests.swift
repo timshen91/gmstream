@@ -176,12 +176,12 @@ final class PacingTests: XCTestCase {
 
     func testLowLatencyTurnsEverythingOff() {
         let on = options(mode: .lowLatency, phaseLock: true, hold: true)
-        for (capable, policy) in [(true, 2), (false, 1)] as [(Bool, UInt8)] {
+        for capable in [true, false] {
             let p = Pacing(options: on, vrr: false, capable: capable)
             XCTAssertFalse(p.phaseLock)
             XCTAssertFalse(p.hold)
             XCTAssertTrue(p.vsyncOff)
-            XCTAssertEqual(p.steamVRR, policy, "on where it can be")
+            XCTAssertEqual(p.steamVRR, 2, "free-running on the host, whatever the display")
         }
     }
 
@@ -199,11 +199,22 @@ final class PacingTests: XCTestCase {
         XCTAssertEqual(policy(.auto, vrr: true, capable: true), 2)
     }
 
+    func testTheHostNeverTimesItself() {
+        for mode in VRRMode.allCases {
+            for capable in [true, false] {
+                for vrr in capable ? [true, false] : [false] {
+                    let p = Pacing(options: options(mode: .manual, phaseLock: false, vrr: mode), vrr: vrr, capable: capable)
+                    XCTAssertTrue(p.phaseLock || p.steamVRR == 2, "\(mode.name) capable \(capable) vrr \(vrr)")
+                }
+            }
+        }
+    }
+
     func testManualTakesTheSettingsAndLeavesSteamAlone() {
         let screen = FakeScreen()
         screen.range = (1.0 / 120, 1.0 / 48)
         let p = Pacing(options: options(mode: .manual, phaseLock: false, hold: true, vsyncOff: true, vrr: .steam), fullScreen: true, screen: screen)
-        XCTAssertFalse(p.phaseLock)
+        XCTAssertTrue(p.phaseLock, "Steam's toggle may be off: not left to the host's own timer")
         XCTAssertTrue(p.hold)
         XCTAssertTrue(p.vsyncOff)
         XCTAssertEqual(p.steamVRR, 0)

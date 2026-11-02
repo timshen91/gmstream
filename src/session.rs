@@ -24,9 +24,9 @@ use crate::transport::{Conn, RecvStream, SendStream};
 use crate::udp;
 
 // Version 2 added the Hello flags byte, version 3 the client's largest
-// datagram, version 4 the handshake and Auth over plain UDP; older web clients
-// are still served.
-pub const PROTOCOL_VERSION: u16 = 4;
+// datagram, version 4 the handshake and Auth over plain UDP, version 5 the mouse
+// datagrams; older web clients are still served.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 // A PyroWave datagram's header (send_pyrowave).
 const PYROWAVE_HEADER: usize = 29;
@@ -584,6 +584,9 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         }
     });
 
+    if let Conn::Udp(udp) = &*conn {
+        udp.accept_mouse();
+    }
     let result = control_loop(&mut recv, &client).await;
 
     writer.abort();

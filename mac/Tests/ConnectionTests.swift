@@ -88,6 +88,36 @@ final class ConnectionTests: XCTestCase {
         XCTAssertEqual(recorder.snapshot.events, ["relative true"])
     }
 
+    func testMotionSaysHowFarTheMouseHasGone() {
+        start()
+        conn.motion(dx: 3, dy: -1)
+        conn.motion(dx: 2.5, dy: 0)
+        let a = host.receiveMouse()!, b = host.receiveMouse()!
+        XCTAssertEqual(a.seq, 0)
+        XCTAssertEqual(b.seq, 1)
+        XCTAssertEqual(b.payload[0], 0)
+        XCTAssertEqual(Double(bitPattern: b.payload.u64(1)), 5.5, "the first is in it, should it be lost")
+        XCTAssertEqual(Double(bitPattern: b.payload.u64(9)), -1)
+        let c = host.receiveMouse()!
+        XCTAssertEqual(c.seq, 2, "the last word goes twice: nothing follows it")
+        XCTAssertEqual(c.payload, b.payload)
+    }
+
+    func testControlIsSentAgainUntilAcknowledged() {
+        start()
+        host.autoAck = false
+        conn.send(Msg.key, Data([1, 2, 3]))
+        let first = host.receiveControl()!
+        let again = host.receiveControl(timeout: 0.5)!
+        XCTAssertEqual(again.seq, first.seq, "sent again")
+        host.sendAck(next: first.seq + 1)
+        var late = 0
+        let deadline = Date().addingTimeInterval(0.1)
+        while Date() < deadline { if host.receiveControl(timeout: 0.05) != nil { late += 1 } }
+        XCTAssertLessThanOrEqual(late, 1, "one may have crossed the acknowledgement")
+        XCTAssertNil(host.receiveControl(timeout: 0.2), "acknowledged: no more")
+    }
+
     func testHelloCarriesTheSessionParameters() {
         let m = start()
         XCTAssertEqual(m[0], Msg.hello)

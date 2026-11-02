@@ -113,6 +113,8 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(session.immediate, "phase lock with no grid yet")
         XCTAssertTrue(session.renderer.layer.displaySyncEnabled)
         options.phaseLock = false
+        options.vrrMode = .on
+        shell.vrrCapable = true
         session.applyPresentMode()
         XCTAssertTrue(session.immediate, "no phase lock: vsync off at once")
         XCTAssertFalse(session.renderer.layer.displaySyncEnabled)
@@ -266,9 +268,13 @@ final class SessionTests: XCTestCase {
     func testPointerPositionsAndScrolling() {
         _ = connect()
         session.position(x: 0.25, y: 1.5)
-        let p = next(Msg.position)!
-        XCTAssertEqual(Float(bitPattern: p.u32(0)), 0.25)
-        XCTAssertEqual(Float(bitPattern: p.u32(4)), 1, "clamped to the video")
+        let p = host.receiveMouse()!.payload
+        XCTAssertEqual(p[0], 1)
+        XCTAssertEqual(Float(bitPattern: p.u32(1)), 0.25)
+        XCTAssertEqual(Float(bitPattern: p.u32(5)), 1, "clamped to the video")
+        session.button(Session.leftButton, down: true)
+        let c = next(Msg.position)!
+        XCTAssertEqual(Float(bitPattern: c.u32(0)), 0.25, "a click goes where the mouse is, in order")
         session.scroll(dx: 0, dy: 100) // one notch down
         let s = next(Msg.scroll)!
         XCTAssertEqual(Float(bitPattern: s.u32(4)), 15, accuracy: 1e-4)

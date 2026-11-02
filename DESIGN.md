@@ -320,13 +320,17 @@ controllers.
   lock on, no hold, Steam's VRR off and its toggle greyed (VrrPolicy 1: the
   grid reported as a fixed refresh, or the stream's rate with no grid). Low
   latency: frames as they come, no phase lock, no hold, vsync off in full screen
-  (may tear; the iPad keeps vsync), and VRR on where the display can do it, so
-  gamescope doesn't step them on its vblanks. Manual: phase lock, hold, vsync off
-  and VRR as set. VRR is Auto, as Auto pacing does it; Off; On, a capable display
+  (may tear; the iPad keeps vsync), and gamescope's VRR on on any display, as
+  that is what lets the game run free on the host; the client just shows frames
+  as they come. Manual: phase lock, hold, vsync off
+  and VRR as set, except that the host never times itself: frames go by the
+  game (VRR) or by the client's grid (phase lock), so with VRR not forced on,
+  phase lock is on. Neither would leave gamescope stepping on its own 60 Hz timer,
+  and Warcraft III then alternated one and two refreshes at 43 fps. VRR is Auto, as Auto pacing does it; Off; On, a capable display
   in a window too, whatever Steam's toggle shows (`adaptive_sync` is set directly;
   the toggle stays and flipping it can undo this: hiding it while VRR runs takes
-  a gamescope change); or Steam, its toggle decides. A display that can't do VRR
-  always has it off. Settings shows what the mode chose.
+  a gamescope change); or Steam, its toggle decides. Apart from Low latency, a
+  display that can't do VRR always has it off. Settings shows what the mode chose.
 - macOS does VRR on the Dell U2725QE in full screen, the way the panel's
   ticks allow: it refreshes on its own fastest ticks (8.3443 ms, 119.84 Hz,
   not the nominal 1/120 s) and only waits for a frame that comes after the
@@ -449,6 +453,15 @@ environment, printing its output.
   input are encrypted; video and audio are not, which costs nothing per frame and
   leaves them readable on the network (PROTOCOL.md, "Plain UDP"). The web client is
   served only with `--web`, as it has no key.
+- The mouse has its own datagrams (protocol version 5). On the ordered control
+  stream one lost datagram held up everything behind it, so a Wi-Fi drop froze the
+  aim. A motion datagram now says how far the mouse has gone since the session
+  began and a position is simply the latest, so neither waits for anything and a
+  lost one is covered by the next. A button stays ordered, with its position sent
+  just before it on the control stream. The control stream lost the mouse's traffic
+  that used to fill the host's 256-datagram limit, so the client now resends
+  unacknowledged control datagrams after 30 ms instead of relying on it. Host →
+  client control datagrams are not resent.
 - gamescope tells a client three things about the mouse, each on its own
   (gamescope patch 0009): the cursor image (or none), whether the game wants
   motion (a lock on its surface, Relative), and where it keeps the cursor
@@ -470,11 +483,9 @@ environment, printing its output.
   gamescope takes in both at all times, but a locked game ignores positions and
   a game reading the cursor's position still sees it move with motion.
 - Confinement setting (`--confine`): Auto keeps our cursor to the game's clip while
-  there is one; None lets it go anywhere, whatever the game asks. Outside a clip,
-  when it leaves the window for another place on a screen the capture ends and the
-  system cursor takes over at that spot, until it comes back in, ours going on
-  from there (past an edge with no screen beyond, as in full screen, it just
-  stops, off the Dock). The capture only starts with the mouse inside the view, in every setting (the
+  there is one; None lets it go anywhere in the view, whatever the game asks. The
+  macOS cursor never moves during a stream: ours stops at the view's edge, and only
+  losing focus ends the capture. The capture only starts with the mouse inside the view, in every setting (the
   title bar stays the system's), and parks the system cursor in the middle of the
   view, hidden: clicks go to its real place, and frozen at an edge that can be the
   title bar (a double click there zooms the window); after
@@ -835,6 +846,12 @@ exists):
    relative, and relative no longer hides the image: a lock on the focused
    surface is relative, Steam's own and filtered app IDs excepted. Positions and
    motion are taken in at all times, not chosen by the lock.
+9. **`0010-absolute-motion-carries-a-delta`.** A position from the host also sends
+   the delta, as compositors do. With positions alone Xwayland uses its absolute
+   device, the X master pointer takes on absolute axes, and raw-only motion under
+   a later lock can't change them. SDL reads XI_RawMotion by the master's axes,
+   so a native game (CS2) took each delta for a position: the camera moved a
+   little and came back. Wine was not affected.
 
 Not a patch: Steam writes the root property `GAMESCOPE_COMPOSITE_FORCE` from
 its Settings → Developer → **Force Composite** toggle at startup, and the

@@ -242,13 +242,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
         CGPoint(x: min(r.maxX, max(r.minX, p.x)), y: min(r.maxY, max(r.minY, p.y)))
     }
 
-    /// Whether a point in the view is on some screen. In full screen past an
-    /// edge with nothing beyond, it isn't: the cursor stays ours, off the Dock.
-    private func isOnScreen(_ p: CGPoint) -> Bool {
-        let s = window.convertPoint(toScreen: view.convert(p, to: nil))
-        return NSScreen.screens.contains { $0.frame.contains(s) }
-    }
-
     /// The system cursor to `p` in the view. Mouse events that are already on
     /// their way still say where it was, and one after it can carry the whole
     /// jump as its delta: until the warp has settled, none of them count.
@@ -377,13 +370,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
             // sum of the motion (AppKit's y points up, a delta's down).
             let c = capturedPoint.value
             let target = CGPoint(x: c.x + e.deltaX, y: c.y - e.deltaY)
-            if !session.confined && !view.bounds.contains(target) && isOnScreen(target) {
-                // It left the window for somewhere the system cursor can be:
-                // that takes over, right there.
-                capturedPoint.value = target
-                setPointerLock(false)
-                return
-            }
             p = session.confined ? clampedToArea(target) : clamped(target, to: view.bounds)
             capturedPoint.value = p
             if session.sendsMotion {
