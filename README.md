@@ -39,10 +39,8 @@ Game Mode on the device's own screen while nobody streams is not done yet.
 
 ## Building
 
-Builds run in containers on a Linux build box (see `build/Containerfile`,
-`gamescope/Containerfile` and DESIGN.md §7). Copy `local.env.example` to
-`local.env`, set your build box and device, then run `./dev-ship.sh`
-(gmstream) or `gamescope/ship.sh` (patched gamescope).
+Builds run in containers on a Linux build box: see `build/Containerfile`,
+`gamescope/Containerfile` and DESIGN.md §7.
 
 ## License
 

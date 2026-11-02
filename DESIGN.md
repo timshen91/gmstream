@@ -771,8 +771,7 @@ builds that package with our patches added to its `source=()` (Valve's
 `prepare()` applies every listed `*.patch`) in the `gamescope-build`
 container: Arch pointed at SteamOS 3.9's own repos (`Containerfile`), so every
 library and glibc match the device and the binary uses the host's shared
-libraries exactly like Valve's. `ship.sh` builds on the build box and copies the binary
-to the test machine.
+libraries exactly like Valve's. The binary is copied to the device.
 
 Patches (all in the nested Wayland backend path stock Game Mode never runs:
 it uses the DRM backend, where gamescope has no window and none of this
@@ -898,41 +897,13 @@ Gamepads are unaffected by the compositor: Steam reads controllers directly
 
 ## 7. Development and test workflow
 
-- **Build host: the build box** (a NixOS box), reached through `build_host` in
-  `local.env` (not checked in; see `local.env.example`). Never build on the
-  NixOS host itself. Image `gmstream-build` (from `build/Containerfile`:
-  Debian trixie + the static C deps in `/opt/gm` + rustup), long-running
-  container `gmstream-dev` with `~/gmstream` mounted at `/src` and a cargo
-  registry volume. Reference checkouts of gamescope and wlroots sources
-  live in the build box `~/gmstream-ref/`.
-- **`./dev-ship.sh`**: tars the sources to the build box (keeping mtimes), runs
-  `cargo build --release` in `gmstream-dev`, copies only the binary to
-  the test machine `~/gmstream/gmstream`.
-- **Test run on the test machine** (host, no container; does not touch Game Mode):
-
-  ```sh
-  cd ~/gmstream
-  ./gmstream -S -s 1920x1080 -r 120 -- gamescope --backend wayland \
-    --force-composition --adaptive-sync -W 1920 -H 1080 -r 120 -- vkcube --wsi xcb
-  ```
-
-  Open `https://steamdeck.local:8443/` in Chrome
-  (accept the self-signed certificate once, or trust
-  `~/.local/state/gmstream/cert.pem`). To keep it running after the ssh
-  session ends, start it with `systemd-run --user --collect` (plain `&` or
-  `setsid` gets killed when the ssh session closes).
-- **Headless probe** (`examples/probe.rs`, `cargo build --release --example
-  probe`): connects like the web client, prints fps, gaps and latency
-  percentiles, audio packet sizes (silence vs sound) and host messages
-  (cursor, pointer lock), and can save the bitstream (`-o`). It can also act:
-  `-k 1,105` taps evdev keys, `-C 0.25,0.25` moves and left-clicks, `-g 15`
-  taps standard-gamepad buttons on a virtual pad, `-x N`/`-X mask` stress
-  bitrate/size/refresh changes. Run it on the test machine against `127.0.0.1:8443`
-  for exact same-clock latencies. It replaces any connected browser.
-- **gamescope:** `gamescope/ship.sh` (build in `gamescope-build` on the build box, copy
-  to `~/gmstream/bin/gamescope`); restart the session to use it.
-- **Browser test without clicking:** `?autostart&log` connects on load and
-  logs the HUD to the console (headless Chrome + DevTools protocol works).
+Builds run in containers on a Linux build box, never on the device: the image in
+`build/Containerfile` (Debian with the static C dependencies and Rust) for gmstream,
+`gamescope/Containerfile` for the patched gamescope (`gamescope/build.sh`). Copy
+the two binaries to the device, as `~/gmstream/gmstream` and
+`~/gmstream/bin/gamescope`, and set `cap_sys_nice=eip` on both (a copy loses it). A
+first install also needs `session/`: see §6.1. Clients: `mac/build.sh`, `mac/test.sh`
+and `ipad/build.sh`, which needs `GM_TEAM`.
 
 ## 8. Lessons from paths we tried and dropped
 
@@ -1219,30 +1190,6 @@ per-stage p50/p90 over 30–60 s; lessons that cost time:
   relative mode → client Pointer Lock) works in Witcher 3 with patch 0005
   (camera and menu cursor); mouse sensitivity is not tuned (deltas are
   macOS-accelerated motion in stream pixels).
-
-## 10. Current state of things on disk
-
-- This directory (`~/frame/gmstream` on the Mac): the source of truth, not
-  in git yet.
-- the build box: image `gmstream-build`, container `gmstream-dev`, `~/gmstream`
-  (synced sources + `target/`), reference checkouts of gamescope 3.16.30.1
-  (Valve's `jupiter-3.9` branch) and wlroots in `~/gmstream-ref/`. The old
-  polaris-vd container, images and directory are removed.
-- the test machine: `~/gmstream/gmstream` (+ `probe`), `~/gmstream/bin/gamescope`
-  (patched), `~/gmstream/session/`, the installed units of §6.1, state in
-  `~/.local/state/gmstream/`. The `vd-dev` build container is still there.
-- the build box also has image `gamescope-build` and `~/gmstream/gamescope/` (cache,
-  `out/`); `~/gmstream-ref/gs-patch` is a scratch worktree of gamescope.
-- Old Polaris setup on the test machine, **disabled but installed**:
-  `polaris.service` and `polaris-config-volume.service` are masked (user
-  units; Quadlet files, images and volumes untouched). The fake-display
-  helper's files under `/etc` are untouched; its plug template and idle
-  timer are static units that only Polaris started, so nothing starts them
-  now (they can't be masked: they live in `/etc/systemd/system` itself).
-  Its `gamescope-session` drop-in only runs the (harmless) unplug on stop.
-- `polaris-quadlet` repo branch `resume-before-capture` (pushed, not
-  merged): Polaris patches 0001/0002 and the fake-display helper.
-  Superseded; keep for reference or delete.
 
 ## 11. Scheduled pacing: one sequence, read two ways
 

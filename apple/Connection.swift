@@ -194,7 +194,7 @@ final class Connection {
 
     /// The host's address: IPv6 and IPv4 asked for at once, the first answer
     /// wins. getaddrinfo with AF_UNSPEC waits for both, and for a .local name
-    /// whose host has no IPv6 on that link (the test machine over a Thunderbolt
+    /// whose host has no IPv6 on that link (a host over a Thunderbolt
     /// bridge) macOS gives up on the AAAA query only after 5 s.
     static func resolve(host: String, port: UInt16) throws -> Data {
         final class Race {

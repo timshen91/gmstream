@@ -114,7 +114,7 @@ final class VideoDecoderTests: XCTestCase {
         XCTAssertFalse(Decoder().decode(frame(1, codec: 9, bits, width: 320, height: 240), timing: timing(present: 1)), "not a codec")
     }
 
-    /// Eight frames from the test machine's encoder (av1_vaapi, as the host runs it),
+    /// Eight frames from a real host's encoder (av1_vaapi, as the host runs it),
     /// asked for 640x360: it pads that to 362 rows. Comes as a muxed stream,
     /// so a temporal delimiter opens each frame.
     func hostAV1() throws -> [Data] {

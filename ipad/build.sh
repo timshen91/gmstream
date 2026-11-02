@@ -15,5 +15,5 @@ pyrowave_checkout build/pyrowave
 xcodegen generate --quiet
 xcodebuild -project GMStream.xcodeproj -scheme GMStream -configuration Release \
 	-destination 'generic/platform=iOS' -derivedDataPath build/dd -allowProvisioningUpdates \
-	DEVELOPMENT_TEAM="${GM_TEAM:-XXXXXXXXXX}" -quiet build
+	DEVELOPMENT_TEAM="${GM_TEAM:?set GM_TEAM to your Apple team ID}" -quiet build
 echo "built build/dd/Build/Products/Release-iphoneos/GMStream.app"
