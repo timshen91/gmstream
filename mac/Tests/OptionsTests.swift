@@ -4,7 +4,7 @@ import XCTest
 /// UserDefaults.standard here is the test runner's own domain, not the app's.
 final class OptionsTests: XCTestCase {
     static let keys = ["host", "port", "codec", "hevc", "mbps", "refresh", "size", "showStats", "immediateFullScreen",
-                       "vividColors", "keepWiFiAwake", "phaseLock", "holdFrames", "pacingMode", "pacingAuto", "vrrMode", "touchscreen", "cursorSetting", "mouseMode", "cursorConfinement"]
+                       "vividColors", "keepWiFiAwake", "phaseLock", "holdFrames", "pacingMode", "pacingAuto", "vrrMode", "hostKeys", "touchscreen", "cursorSetting", "mouseMode", "cursorConfinement"]
 
     override func setUp() { clear() }
     override func tearDown() { clear() }

@@ -18,13 +18,15 @@ use wtransport::quinn::congestion::CubicConfig;
 use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
+use crate::auth::{self, HostKey};
 use crate::core;
 use crate::transport::{Conn, RecvStream, SendStream};
 use crate::udp;
 
 // Version 2 added the Hello flags byte, version 3 the client's largest
-// datagram; version 1 and 2 clients are still served.
-pub const PROTOCOL_VERSION: u16 = 3;
+// datagram, version 4 the handshake and Auth over plain UDP; older web clients
+// are still served.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 // A PyroWave datagram's header (send_pyrowave).
 const PYROWAVE_HEADER: usize = 29;
@@ -49,6 +51,7 @@ const C_PING: u8 = 0x0c;
 const C_DISPLAY_GRID: u8 = 0x0d;
 const C_VRR_POLICY: u8 = 0x0e;
 const C_TOUCH: u8 = 0x0f;
+const C_AUTH: u8 = 0x10;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
@@ -235,18 +238,16 @@ fn server_config(port: u16, identity: Identity) -> ServerConfig {
         .build()
 }
 
-pub async fn serve(port: u16, hash: CertHash) -> Result<()> {
-    // Native clients: plain UDP on the next port.
-    tokio::spawn(async move {
-        let result = udp::serve(port + 1, |peer, control| {
-            session(Arc::new(Conn::Udp(peer.clone())), SendStream::Udp(peer), RecvStream::Udp(control))
-        })
-        .await;
-        if let Err(e) = result {
-            eprintln!("gmstream: UDP: {e:#}");
-        }
-    });
+/// Native clients, on plain UDP.
+pub async fn serve_udp(port: u16, host: HostKey) -> Result<()> {
+    udp::serve(port, host, |peer, control| {
+        session(Arc::new(Conn::Udp(peer.clone())), SendStream::Udp(peer), RecvStream::Udp(control))
+    })
+    .await
+}
 
+/// The web client (--web). Anyone who reaches it can connect: it has no key.
+pub async fn serve_web(port: u16, hash: CertHash) -> Result<()> {
     let identity = new_identity()?;
     *hash.write().unwrap() = identity.certificate_chain().as_slice()[0]
         .hash()
@@ -411,7 +412,17 @@ async fn handle_wt(incoming: IncomingSession) -> Result<()> {
 async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     let peer = conn.remote_address();
 
-    let (ty, body) = read_message(&mut recv).await?;
+    let (mut ty, mut body) = read_message(&mut recv).await?;
+    if let Conn::Udp(udp) = &*conn {
+        if ty != C_AUTH {
+            bail!("{peer}: expected Auth");
+        }
+        if let Err(e) = auth::verify(udp.keys(), &body) {
+            send_error(&mut send, "This device isn't authorized: add its key, from Settings, to ~/.ssh/authorized_keys on the host").await;
+            bail!("{peer}: {e:#}");
+        }
+        (ty, body) = read_message(&mut recv).await?;
+    }
     let mut r = Reader(&body);
     if ty != C_HELLO {
         bail!("{peer}: expected Hello");

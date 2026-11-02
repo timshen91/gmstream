@@ -9,6 +9,7 @@ license = "MIT"
 anyhow = "1"
 libc = "0.2"
 rcgen = "0.14"
+ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 wtransport = { version = "0.7", features = ["quinn"] }

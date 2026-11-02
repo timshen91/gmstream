@@ -296,6 +296,7 @@ dependencies = [
  "cc",
  "libc",
  "rcgen",
+ "ring",
  "tokio",
  "tokio-rustls",
  "wtransport",

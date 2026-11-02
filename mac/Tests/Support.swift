@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 
 /// A frame's timing with host times already in our clock (offset 0).
@@ -44,12 +45,54 @@ final class FakeHost {
         return Data(buf[0..<n])
     }
 
-    /// The next control datagram (type 3), skipping keep-awake ones.
+    /// The next control datagram (type 3), opened, skipping keep-awake ones and
+    /// answering handshakes.
     func receiveControl(timeout: Double = 2) -> (seq: UInt32, payload: Data)? {
         while let d = receive(timeout: timeout) {
-            if d[0] == datagramControl { return (d.u32(1), d.subdata(in: 5..<d.count)) }
+            if d[0] == datagramHandshake { answerHandshake(d) }
+            if d[0] == datagramControl, let recv {
+                let box = try! AES.GCM.SealedBox(nonce: Self.nonce(d.u32(1)), ciphertext: d.subdata(in: 5..<d.count - tagSize),
+                                                 tag: d.subdata(in: d.count - tagSize..<d.count))
+                return (d.u32(1), try! AES.GCM.open(box, using: recv, authenticating: d.subdata(in: 0..<5)))
+            }
         }
         return nil
+    }
+
+    /// What a host's key signed last, for checking the client's Auth.
+    private(set) var transcript = Data()
+    var signingKey = try! Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: 7, count: 32))
+    private var sendKey: SymmetricKey?, recv: SymmetricKey?
+    private var answered: Data?, lastReply: Data?
+
+    private static func nonce(_ seq: UInt32) -> AES.GCM.Nonce {
+        var n = Data(count: 8)
+        withUnsafeBytes(of: seq.bigEndian) { n.append(contentsOf: $0) }
+        return try! AES.GCM.Nonce(data: n)
+    }
+
+    /// As src/auth.rs does.
+    private func answerHandshake(_ d: Data) {
+        let theirs = d.subdata(in: 1..<33)
+        if theirs == answered, let lastReply { return send(lastReply) }
+        answered = theirs
+        let ours = Curve25519.KeyAgreement.PrivateKey()
+        let hostKey = signingKey.publicKey.rawRepresentation
+        var hash = SHA256()
+        for part in [Data("gmstream-udp-1".utf8), theirs, ours.publicKey.rawRepresentation, hostKey] { hash.update(data: part) }
+        transcript = Data(hash.finalize())
+        let shared = try! ours.sharedSecretFromKeyAgreement(with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: theirs))
+        func derive(_ info: String) -> SymmetricKey {
+            shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: transcript, sharedInfo: Data(info.utf8), outputByteCount: 32)
+        }
+        sendKey = derive("h2c")
+        recv = derive("c2h")
+        var reply = Data([datagramHandshake])
+        reply.append(ours.publicKey.rawRepresentation)
+        reply.append(hostKey)
+        reply.append(try! signingKey.signature(for: Data("gmstream host".utf8) + transcript))
+        lastReply = reply
+        send(reply)
     }
 
     func send(_ d: Data) {
@@ -75,7 +118,9 @@ final class FakeHost {
         var w = Writer()
         w.u8(datagramControl)
         w.u32(seq)
-        w.data.append(bytes)
+        let box = try! AES.GCM.seal(bytes, using: sendKey!, nonce: Self.nonce(seq), authenticating: w.data)
+        w.data.append(box.ciphertext)
+        w.data.append(box.tag)
         send(w.data)
     }
 }

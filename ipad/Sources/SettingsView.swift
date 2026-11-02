@@ -72,6 +72,10 @@ struct SettingsView: View {
                            isOn: o.pacingMode == .manual ? $o.holdFrames : .constant(pacing.hold)).disabled(o.pacingMode != .manual)
                 } footer: { Text(o.pacingMode == options.pacingMode ? pacing.note : "") }
                 Section {
+                    Button("Copy line for ~/.ssh/authorized_keys") { UIPasteboard.general.string = Identity.shared.authorizedLine }
+                    Button("Forget host's key") { UserDefaults.standard.removeObject(forKey: "hostKeys") }
+                } header: { Text("This device") }
+                Section {
                     Button("Reconnect") { finish(reconnect: true) }
                 }
             }

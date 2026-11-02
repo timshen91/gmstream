@@ -1,9 +1,11 @@
-//! Plain UDP for native clients (PROTOCOL.md, "Plain UDP"): no encryption,
-//! no retransmission. The control stream's bytes travel in numbered
-//! datagrams that the receiver puts back in order; video and audio use the
-//! same datagrams as WebTransport's datagram mode. A client is its address:
-//! its first control datagram (number 0) starts a session, and a session
-//! with no control datagram for 10 s ends (clients ping every 500 ms).
+//! Plain UDP for native clients (PROTOCOL.md, "Plain UDP"): no retransmission.
+//! The control stream's bytes travel encrypted in numbered datagrams that the
+//! receiver puts back in order (auth.rs); video and audio use the same plain
+//! datagrams as WebTransport's datagram mode. A client is its address: after a
+//! handshake its first control datagram (number 0) starts a session, and a
+//! session with no control datagram for 10 s ends (clients ping every 500 ms).
+//! Only a datagram sealed with a session's keys touches that session, so a
+//! forged handshake can't end one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -17,7 +19,10 @@ use anyhow::{Context, Result, bail};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::auth::{self, HostKey, Keys};
+
 pub const DATAGRAM_CONTROL: u8 = 3;
+const DATAGRAM_HANDSHAKE: u8 = 6;
 /// Largest datagram payload we send: fits a 1500-byte Ethernet/Wi-Fi MTU
 /// under IPv6 and UDP headers.
 pub const MAX_DATAGRAM: usize = 1400;
@@ -26,11 +31,39 @@ const IDLE: Duration = Duration::from_secs(10);
 /// Control datagrams held waiting for a missing earlier one; past this the
 /// missing one is lost and the session ends (the client reconnects).
 const MAX_OUT_OF_ORDER: usize = 256;
+/// Handshakes that haven't gone on to a session.
+const MAX_HANDSHAKES: usize = 64;
 
 struct Route {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     next: u32,
     pending: BTreeMap<u32, Vec<u8>>,
+    keys: Arc<Keys>,
+}
+
+impl Route {
+    /// Takes in a control datagram's payload; false if the session is over.
+    fn deliver(&mut self, seq: u32, payload: Vec<u8>) -> bool {
+        if seq == self.next {
+            let _ = self.tx.send(payload);
+            self.next += 1;
+            while let Some(p) = self.pending.remove(&self.next) {
+                let _ = self.tx.send(p);
+                self.next += 1;
+            }
+        } else if seq > self.next {
+            self.pending.insert(seq, payload);
+            return self.pending.len() <= MAX_OUT_OF_ORDER;
+        }
+        true
+    }
+}
+
+/// A handshake answered, kept to answer it again if the reply was lost.
+struct Handshake {
+    client: Vec<u8>,
+    reply: Vec<u8>,
+    keys: Arc<Keys>,
 }
 
 type Routes = Arc<Mutex<HashMap<SocketAddr, Route>>>;
@@ -41,9 +74,14 @@ pub struct Peer {
     pub addr: SocketAddr,
     seq: AtomicU32,
     routes: Routes,
+    keys: Arc<Keys>,
 }
 
 impl Peer {
+    pub fn keys(&self) -> &Keys {
+        &self.keys
+    }
+
     /// Sends now or drops the datagram if the socket buffer is full.
     pub fn try_send(&self, d: &[u8]) -> Result<()> {
         match self.socket.try_send_to(d, self.addr) {
@@ -98,11 +136,13 @@ impl Peer {
 
     /// Writes bytes of the host → client control stream.
     pub async fn send_control(&self, bytes: &[u8]) -> Result<()> {
-        for chunk in bytes.chunks(MAX_DATAGRAM - CONTROL_HEADER) {
-            let mut d = Vec::with_capacity(CONTROL_HEADER + chunk.len());
+        for chunk in bytes.chunks(MAX_DATAGRAM - CONTROL_HEADER - auth::TAG_SIZE) {
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+            let mut d = Vec::with_capacity(CONTROL_HEADER + chunk.len() + auth::TAG_SIZE);
             d.push(DATAGRAM_CONTROL);
-            d.extend_from_slice(&self.seq.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-            d.extend_from_slice(chunk);
+            d.extend_from_slice(&seq.to_le_bytes());
+            let sealed = self.keys.seal(&d, seq, chunk);
+            d.extend_from_slice(&sealed);
             self.send(&d).await?;
         }
         Ok(())
@@ -148,7 +188,7 @@ fn set_buffer(socket: &std::net::UdpSocket, option: libc::c_int, bytes: libc::c_
     }
 }
 
-pub async fn serve<F, Fut>(port: u16, session: F) -> Result<()>
+pub async fn serve<F, Fut>(port: u16, host: HostKey, session: F) -> Result<()>
 where
     F: Fn(Arc<Peer>, Control) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
@@ -168,50 +208,60 @@ where
     socket.set_nonblocking(true)?;
     let socket = Arc::new(UdpSocket::from_std(socket)?);
     let routes: Routes = Arc::default();
+    let mut handshakes: HashMap<SocketAddr, Handshake> = HashMap::new();
     let mut buf = vec![0u8; 65536];
     loop {
         let (n, addr) = socket.recv_from(&mut buf).await?;
-        if n < CONTROL_HEADER || buf[0] != DATAGRAM_CONTROL {
+        if n >= auth::HANDSHAKE_SIZE && buf[0] == DATAGRAM_HANDSHAKE {
+            let client = &buf[1..33];
+            if !handshakes.get(&addr).is_some_and(|h| h.client == client) {
+                let Ok((body, keys)) = auth::respond(&host, client) else { continue };
+                if handshakes.len() >= MAX_HANDSHAKES {
+                    handshakes.clear();
+                }
+                let reply = [&[DATAGRAM_HANDSHAKE], body.as_slice()].concat();
+                handshakes.insert(addr, Handshake { client: client.to_vec(), reply, keys: Arc::new(keys) });
+            }
+            let _ = socket.try_send_to(&handshakes[&addr].reply, addr);
+            continue;
+        }
+        if n < CONTROL_HEADER + auth::TAG_SIZE || buf[0] != DATAGRAM_CONTROL {
             continue;
         }
         let seq = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-        let payload = buf[CONTROL_HEADER..n].to_vec();
+        let (header, sealed) = buf[..n].split_at(CONTROL_HEADER);
         let mut map = routes.lock().unwrap();
-        if !map.contains_key(&addr) {
-            if seq != 0 {
-                continue; // from a session that already ended
-            }
-            let (tx, rx) = mpsc::unbounded_channel();
-            map.insert(addr, Route { tx, next: 0, pending: BTreeMap::new() });
-            let peer = Arc::new(Peer { socket: socket.clone(), addr, seq: AtomicU32::new(0), routes: routes.clone() });
-            let fut = session(peer, Control { rx, buf: Vec::new() });
-            let routes = routes.clone();
-            tokio::spawn(async move {
-                if let Err(e) = fut.await {
-                    eprintln!("gmstream: session ended: {e:#}");
-                }
-                // Unless the same address has started a new session since.
-                let mut map = routes.lock().unwrap();
-                if map.get(&addr).is_some_and(|r| r.tx.is_closed()) {
+        if let Some(route) = map.get_mut(&addr) {
+            if let Some(payload) = route.keys.open(header, seq, sealed) {
+                if !route.deliver(seq, payload) {
+                    eprintln!("gmstream: {addr}: control datagram {} lost; ending the session", route.next);
                     map.remove(&addr);
                 }
-            });
-        }
-        let route = map.get_mut(&addr).unwrap();
-        if seq == route.next {
-            let _ = route.tx.send(payload);
-            route.next += 1;
-            while let Some(p) = route.pending.remove(&route.next) {
-                let _ = route.tx.send(p);
-                route.next += 1;
+                continue;
             }
-        } else if seq > route.next {
-            route.pending.insert(seq, payload);
-            if route.pending.len() > MAX_OUT_OF_ORDER {
-                eprintln!("gmstream: {addr}: control datagram {} lost; ending the session", route.next);
+        }
+        // Not the session's, if there is one: the start of the next.
+        let Some(payload) = handshakes.get(&addr).filter(|_| seq == 0).and_then(|h| h.keys.open(header, seq, sealed)) else {
+            continue;
+        };
+        let keys = handshakes.remove(&addr).unwrap().keys;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut route = Route { tx, next: 0, pending: BTreeMap::new(), keys: keys.clone() };
+        route.deliver(seq, payload);
+        map.insert(addr, route);
+        let peer = Arc::new(Peer { socket: socket.clone(), addr, seq: AtomicU32::new(0), routes: routes.clone(), keys });
+        let fut = session(peer, Control { rx, buf: Vec::new() });
+        let routes = routes.clone();
+        tokio::spawn(async move {
+            if let Err(e) = fut.await {
+                eprintln!("gmstream: session ended: {e:#}");
+            }
+            // Unless the same address has started a new session since.
+            let mut map = routes.lock().unwrap();
+            if map.get(&addr).is_some_and(|r| r.tx.is_closed()) {
                 map.remove(&addr);
             }
-        }
+        });
     }
 }
 

@@ -4,6 +4,7 @@
 //! and encodes every frame the moment it is presented; this side serves the
 //! web client over HTTPS and talks to it over WebTransport.
 
+mod auth;
 mod core;
 mod session;
 mod transport;
@@ -13,18 +14,21 @@ mod web;
 use std::process::exit;
 use std::sync::{Arc, RwLock};
 
-const USAGE: &str = "usage: gmstream [-p PORT] [-w SOCKET] [-s WIDTHxHEIGHT] [-r HZ] [-S] [-d] [-- command...]
-  -p  HTTPS and WebTransport port (default 8443, TCP and UDP)
+const USAGE: &str = "usage: gmstream [-p PORT] [-w SOCKET] [-s WIDTHxHEIGHT] [-r HZ] [-S] [-d] [--web] [-- command...]
+  -p  HTTPS and WebTransport port (default 8443, TCP and UDP); native clients
+      use the next UDP port
   -w  Wayland socket name in $XDG_RUNTIME_DIR (default: first free wayland-N)
   -s  initial screen size (default 1920x1080)
   -r  initial refresh rate / VRR maximum (default 120)
+  --web  also serve the web client, which any device that reaches it can use
   -S  log delivery statistics every second
   -d  debug logging
 gamescope connects to the socket (WAYLAND_DISPLAY) and may come and go.
 With a command, gmstream runs it with WAYLAND_DISPLAY set and exits with it.";
 
-fn parse_args() -> (u16, core::Config) {
+fn parse_args() -> (u16, bool, core::Config) {
     let mut port = 8443;
+    let mut web = false;
     let mut config = core::Config {
         width: 1920,
         height: 1080,
@@ -54,6 +58,7 @@ fn parse_args() -> (u16, core::Config) {
             }
             "-S" => config.stats = true,
             "-d" => config.debug = true,
+            "--web" => web = true,
             "-w" => config.socket = Some(args.next().unwrap_or_else(|| bad())),
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -65,11 +70,11 @@ fn parse_args() -> (u16, core::Config) {
             _ => bad(),
         }
     }
-    (port, config)
+    (port, web, config)
 }
 
 fn main() {
-    let (port, config) = parse_args();
+    let (port, serve_web, config) = parse_args();
 
     // The compositor takes these through signalfd, which only works if no
     // thread can receive them: block them before any thread exists.
@@ -94,26 +99,35 @@ fn main() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let hash: session::CertHash = Arc::new(RwLock::new(String::from("[]")));
-    {
-        let hash = hash.clone();
-        runtime.spawn(async move {
-            if let Err(e) = session::serve(port, hash).await {
-                eprintln!("gmstream: WebTransport: {e:#}");
-                exit(1);
-            }
-        });
-    }
-    {
-        let hash = hash.clone();
+    let host_key = auth::HostKey::load(&dir).unwrap_or_else(|e| {
+        eprintln!("gmstream: {e:#}");
+        exit(1);
+    });
+    runtime.spawn(async move {
+        if let Err(e) = session::serve_udp(port + 1, host_key).await {
+            eprintln!("gmstream: UDP: {e:#}");
+            exit(1);
+        }
+    });
+    if serve_web {
+        let hash: session::CertHash = Arc::new(RwLock::new(String::from("[]")));
+        {
+            let hash = hash.clone();
+            runtime.spawn(async move {
+                if let Err(e) = session::serve_web(port, hash).await {
+                    eprintln!("gmstream: WebTransport: {e:#}");
+                    exit(1);
+                }
+            });
+        }
         runtime.spawn(async move {
             if let Err(e) = web::serve(port, dir, hash).await {
                 eprintln!("gmstream: HTTPS: {e:#}");
                 exit(1);
             }
         });
+        eprintln!("gmstream: open https://{}.local:{port}/", web::hostname());
     }
-    eprintln!("gmstream: open https://{}.local:{port}/", web::hostname());
 
     // The compositor thread can end up blocked inside the GPU driver (seen
     // with Mesa's VA-API: a spin while holding its lock). Nothing recovers

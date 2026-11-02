@@ -31,6 +31,8 @@ final class SettingsWindow: NSObject {
     private let hold = NSButton(checkboxWithTitle: "Even out network jitter (fixed delay after the host)", target: nil, action: nil)
     private let pacingMode = NSPopUpButton()
     private let vrrMode = NSPopUpButton()
+    private let copyKey = NSButton(title: "Copy line for ~/.ssh/authorized_keys", target: nil, action: nil)
+    private let forgetHost = NSButton(title: "Forget host's key", target: nil, action: nil)
     private let pacingNote = NSTextField(wrappingLabelWithString: "")
     private static let refreshRates = [30, 60, 90, 120, 144, 165, 240]
     private static let codecs: [(name: String, id: UInt8)] =
@@ -43,6 +45,10 @@ final class SettingsWindow: NSObject {
         window.title = "GMStream Settings"
         window.isReleasedWhenClosed = false
 
+        copyKey.target = self
+        copyKey.action = #selector(copyDeviceKey)
+        forgetHost.target = self
+        forgetHost.action = #selector(forgetHostKey)
         codec.addItems(withTitles: Self.codecs.map(\.name))
         cursorMode.addItems(withTitles: CursorMode.allCases.map(\.title))
         mouseMode.addItems(withTitles: MouseMode.allCases.map(\.title))
@@ -95,6 +101,8 @@ final class SettingsWindow: NSObject {
             row("Cursor:", cursorMode, nil),
             row("Mouse:", mouseMode, nil),
             row("Confinement:", confinement, nil),
+            [NSTextField(labelWithString: "This device:"), copyKey],
+            [NSGridCell.emptyContentView, forgetHost],
         ])
         grid.rowSpacing = 10
         grid.columnSpacing = 8
@@ -146,6 +154,16 @@ final class SettingsWindow: NSObject {
         vrrMode.selectItem(at: now.vrr.rawValue)
         for control in [pacing, hold, immediate, vrrMode] as [NSControl] { control.isEnabled = options.pacingMode == .manual }
         pacingNote.stringValue = now.note
+    }
+
+    @objc private func copyDeviceKey() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(Identity.shared.authorizedLine, forType: .string)
+    }
+
+    @objc private func forgetHostKey() {
+        UserDefaults.standard.removeObject(forKey: "hostKeys")
+        onChange(.connection)
     }
 
     @objc private func changed(_ sender: NSControl) {

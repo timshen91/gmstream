@@ -442,6 +442,13 @@ environment, printing its output.
   (`--force-client-cursor`); Hide never. A cursor the game paints itself (Ender
   Lilies) is game pixels: it stays in the video, trailing ours by the stream's
   latency if both show.
+- Who may connect: a device makes an Ed25519 key on first run and shows the line
+  for the host's `~/.ssh/authorized_keys` in Settings, with
+  `restrict,command="/bin/false"` so that ssh gives it no shell. It works offline,
+  needs no account, and the host reads the file at each connection. Control and
+  input are encrypted; video and audio are not, which costs nothing per frame and
+  leaves them readable on the network (PROTOCOL.md, "Plain UDP"). The web client is
+  served only with `--web`, as it has no key.
 - gamescope tells a client three things about the mouse, each on its own
   (gamescope patch 0009): the cursor image (or none), whether the game wants
   motion (a lock on its surface, Relative), and where it keeps the cursor

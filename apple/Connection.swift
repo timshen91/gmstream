@@ -1,7 +1,10 @@
 // The gmstream protocol over plain UDP (PROTOCOL.md, "Plain UDP"): control
 // messages as a byte stream in numbered datagrams, video as fragmented
-// frames, audio datagrams (ignored for now). No encryption, no retransmission.
+// frames, audio datagrams. No retransmission. The control stream is encrypted,
+// after a handshake that identifies both ends (src/auth.rs); video and audio are
+// not.
 
+import CryptoKit
 import Foundation
 
 enum Msg {
@@ -9,16 +12,19 @@ enum Msg {
     static let hello: UInt8 = 0x01, configure: UInt8 = 0x02, keyframe: UInt8 = 0x03, bitrate: UInt8 = 0x04,
         key: UInt8 = 0x05, button: UInt8 = 0x06, motion: UInt8 = 0x07, position: UInt8 = 0x08,
         scroll: UInt8 = 0x09, gamepad: UInt8 = 0x0a, gamepadRemove: UInt8 = 0x0b, ping: UInt8 = 0x0c, displayGrid: UInt8 = 0x0d,
-        vrrPolicy: UInt8 = 0x0e, touch: UInt8 = 0x0f
+        vrrPolicy: UInt8 = 0x0e, touch: UInt8 = 0x0f, auth: UInt8 = 0x10
     // Host → client.
     static let helloAck: UInt8 = 0x81, cursor: UInt8 = 0x82, relative: UInt8 = 0x83,
         rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86, cursorClip: UInt8 = 0x87
 }
 
-let protocolVersion: UInt16 = 3
+let protocolVersion: UInt16 = 4
 let datagramAudio: UInt8 = 1, datagramVideo: UInt8 = 2, datagramControl: UInt8 = 3, datagramPyroWave: UInt8 = 4,
     datagramAwake: UInt8 = 5
 let maxDatagram = 1400
+let datagramHandshake: UInt8 = 6
+let handshakeSize = 129 // padded, so a forged request gets back no more than it sent
+let tagSize = 16
 
 /// Little-endian message building.
 struct Writer {
@@ -75,6 +81,11 @@ final class Connection {
     private let fd: Int32
     private let sendLock = NSLock()
     private var sendSeq: UInt32 = 0
+    private let hostName: String
+    private let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+    private var sendKey: SymmetricKey? // under sendLock
+    private var recvKey: SymmetricKey? // receive thread only
+    private var unsent: [Data] = []    // control bytes before the keys, under sendLock
     private var running = true
     private var started = false
     private var awakeTimer: DispatchSourceTimer? // under sendLock
@@ -96,6 +107,7 @@ final class Connection {
 
     /// Blocks while the name resolves (see resolve), so not on the main thread.
     init(host: String, port: UInt16) throws {
+        hostName = host
         var addr = try Self.resolve(host: host, port: port)
         let family = addr.withUnsafeBytes { Int32($0.load(as: sockaddr.self).sa_family) }
         fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
@@ -240,6 +252,7 @@ final class Connection {
         w.u16(UInt16(linkMaxDatagram))
         started = true
         send(Msg.hello, w.data)
+        sendHandshake()
         let thread = Thread { [weak self] in self?.receiveLoop() }
         thread.qualityOfService = .userInteractive
         thread.name = "gmstream-net"
@@ -263,14 +276,23 @@ final class Connection {
         sendLock.lock()
         defer { sendLock.unlock() }
         guard running else { return } // the socket is closed (or about to be)
+        guard let key = sendKey else { return unsent.append(m.data) }
+        transmit(m.data, key)
+    }
+
+    /// Control stream bytes, sealed. Under sendLock.
+    private func transmit(_ bytes: Data, _ key: SymmetricKey) {
         var off = 0
-        while off < m.data.count {
-            let n = min(maxDatagram - 5, m.data.count - off)
+        while off < bytes.count {
+            let n = min(maxDatagram - 5 - tagSize, bytes.count - off)
             var d = Writer()
             d.u8(datagramControl)
             d.u32(sendSeq)
+            guard let box = try? AES.GCM.seal(bytes[(bytes.startIndex + off)..<(bytes.startIndex + off + n)], using: key,
+                                              nonce: Self.nonce(sendSeq), authenticating: d.data) else { return }
             sendSeq += 1
-            d.data.append(m.data[off..<off + n])
+            d.data.append(box.ciphertext)
+            d.data.append(box.tag)
             let sent = d.data.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
             if sent < 0 && running {
                 // e.g. "No route to host" when macOS denies local network access.
@@ -279,6 +301,62 @@ final class Connection {
             }
             off += n
         }
+    }
+
+    private static func nonce(_ seq: UInt32) -> AES.GCM.Nonce {
+        var n = Data(count: 8)
+        withUnsafeBytes(of: seq.bigEndian) { n.append(contentsOf: $0) }
+        return try! AES.GCM.Nonce(data: n)
+    }
+
+    /// Our half of the key exchange (src/auth.rs), again until it is answered.
+    private func sendHandshake() {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        guard running, sendKey == nil else { return }
+        var d = Data([datagramHandshake])
+        d.append(ephemeral.publicKey.rawRepresentation)
+        d.append(Data(count: handshakeSize - d.count))
+        _ = d.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
+    }
+
+    /// The host's half: its keys, then Auth and whatever was waiting.
+    private func handshakeReply(_ d: Data) {
+        guard recvKey == nil else { return }
+        let s = d.startIndex
+        let theirs = d.subdata(in: s + 1..<s + 33), hostKey = d.subdata(in: s + 33..<s + 65), signature = d.subdata(in: s + 65..<s + 129)
+        var hash = SHA256()
+        hash.update(data: Data("gmstream-udp-1".utf8))
+        hash.update(data: ephemeral.publicKey.rawRepresentation)
+        hash.update(data: theirs)
+        hash.update(data: hostKey)
+        let transcript = Data(hash.finalize())
+        guard let host = try? Curve25519.Signing.PublicKey(rawRepresentation: hostKey),
+              host.isValidSignature(signature, for: Data("gmstream host".utf8) + transcript),
+              let peer = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: theirs),
+              let shared = try? ephemeral.sharedSecretFromKeyAgreement(with: peer) else { return }
+        guard Identity.hostKeyMatches(host: hostName, key: hostKey) else {
+            let reason = "\(hostName)'s key has changed. If that's expected, forget the host in Settings."
+            return DispatchQueue.main.async { self.delegate?.closed(reason: reason) }
+        }
+        func derive(_ info: String) -> SymmetricKey {
+            shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: transcript, sharedInfo: Data(info.utf8), outputByteCount: 32)
+        }
+        recvKey = derive("h2c")
+        let key = derive("c2h")
+        var auth = Writer()
+        auth.u8(Msg.auth)
+        auth.u32(96)
+        auth.data.append(Identity.shared.key.publicKey.rawRepresentation)
+        guard let mine = try? Identity.shared.key.signature(for: Data("gmstream client".utf8) + transcript) else { return }
+        auth.data.append(mine)
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        guard running else { return }
+        sendKey = key
+        transmit(auth.data, key)
+        for bytes in unsent { transmit(bytes, key) }
+        unsent = []
     }
 
     /// Keeps this Mac's Wi-Fi out of power save: a 1-byte datagram 60 times
@@ -310,6 +388,7 @@ final class Connection {
 
     /// Also the keepalive: the host ends a session after 10 s of silence.
     func ping() {
+        sendHandshake() // lost, if nothing has come back
         var w = Writer()
         w.u64(nowNs() / 1000)
         send(Msg.ping, w.data)
@@ -404,8 +483,15 @@ final class Connection {
         switch d[0] {
         case datagramVideo where n > 9:
             videoFragment(id: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)), part: d.subdata(in: 9..<n))
-        case datagramControl where n > 5:
-            controlDatagram(seq: d.u32(1), payload: d.subdata(in: 5..<n))
+        case datagramHandshake where n >= handshakeSize:
+            handshakeReply(d)
+        case datagramControl where n > 5 + tagSize:
+            let seq = d.u32(1), s = d.startIndex
+            guard let key = recvKey,
+                  let box = try? AES.GCM.SealedBox(nonce: Self.nonce(seq), ciphertext: d.subdata(in: s + 5..<s + n - tagSize),
+                                                   tag: d.subdata(in: s + n - tagSize..<s + n)),
+                  let payload = try? AES.GCM.open(box, using: key, authenticating: d.subdata(in: s..<s + 5)) else { return }
+            controlDatagram(seq: seq, payload: payload)
         case datagramPyroWave where n > 29:
             delegate?.pyrowave(PyroWavePacket(
                 frameId: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)),

@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 
 /// The plain UDP transport (PROTOCOL.md, "Plain UDP") against a fake host on
@@ -24,8 +25,10 @@ final class ConnectionTests: XCTestCase {
     @discardableResult
     func start() -> Data {
         conn.start(width: 1280, height: 720, refreshMhz: 60_000, kbps: 40_000, codecMask: 0b1011, preferred: 3)
+        let auth = host.receiveControl()!
+        XCTAssertEqual(auth.seq, 0)
+        XCTAssertEqual(auth.payload[0], Msg.auth)
         let hello = host.receiveControl()!
-        XCTAssertEqual(hello.seq, 0)
         _ = host.receiveControl() // ping
         return hello.payload
     }
@@ -42,6 +45,47 @@ final class ConnectionTests: XCTestCase {
     func waitUntil(timeout: Double = 2, _ done: () -> Bool) {
         let deadline = Date().addingTimeInterval(timeout)
         while !done() && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    }
+
+    func testAuthSignsTheExchangeWithThisDevicesKey() {
+        conn.start(width: 1280, height: 720, refreshMhz: 60_000, kbps: 40_000, codecMask: 0b1011, preferred: 3)
+        let m = host.receiveControl()!.payload
+        XCTAssertEqual(Int(m.u32(1)), 96)
+        let public_ = m.subdata(in: 5..<37), signature = m.subdata(in: 37..<101)
+        XCTAssertEqual(public_, Identity.shared.key.publicKey.rawRepresentation)
+        let key = try! Curve25519.Signing.PublicKey(rawRepresentation: public_)
+        XCTAssertTrue(key.isValidSignature(signature, for: Data("gmstream client".utf8) + host.transcript))
+    }
+
+    func testAChangedHostKeyIsRefused() {
+        start()
+        UserDefaults.standard.removeObject(forKey: "hostKeys")
+        let other = FakeHost()
+        defer { UserDefaults.standard.removeObject(forKey: "hostKeys") }
+        XCTAssertTrue(Identity.hostKeyMatches(host: "127.0.0.1", key: host.signingKey.publicKey.rawRepresentation))
+        other.signingKey = Curve25519.Signing.PrivateKey()
+        let c = try! Connection(host: "127.0.0.1", port: other.port)
+        let r = Recorder()
+        c.delegate = r
+        c.start(width: 1280, height: 720, refreshMhz: 60_000, kbps: 40_000, codecMask: 0b1011, preferred: 3)
+        XCTAssertNil(other.receiveControl(timeout: 0.3), "no Auth, no Hello")
+        let deadline = Date().addingTimeInterval(2)
+        while r.snapshot.events.isEmpty && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        XCTAssertTrue(r.snapshot.events.first?.contains("key has changed") == true, "\(r.snapshot.events)")
+        c.stop()
+    }
+
+    func testAForgedControlDatagramIsDropped() {
+        start()
+        var forged = Writer()
+        forged.u8(datagramControl)
+        forged.u32(0)
+        forged.data.append(FakeHost.message(Msg.error, Data("forged".utf8)))
+        forged.data.append(Data(count: tagSize))
+        host.send(forged.data)
+        host.sendControl(FakeHost.message(Msg.relative, Data([1])), seq: 0)
+        waitForEvents(1)
+        XCTAssertEqual(recorder.snapshot.events, ["relative true"])
     }
 
     func testHelloCarriesTheSessionParameters() {
@@ -62,10 +106,11 @@ final class ConnectionTests: XCTestCase {
 
     func testStartPingsWithOurClock() {
         conn.start(width: 64, height: 64, refreshMhz: 60_000, kbps: 1000, codecMask: 1, preferred: 0)
-        _ = host.receiveControl()
+        _ = host.receiveControl() // Auth
+        _ = host.receiveControl() // Hello
         let before = nowNs() / 1000
         let ping = host.receiveControl()!
-        XCTAssertEqual(ping.seq, 1)
+        XCTAssertEqual(ping.seq, 2)
         XCTAssertEqual(ping.payload[0], Msg.ping)
         XCTAssertEqual(ping.payload.u32(1), 8)
         let t = ping.payload.u64(5)
@@ -74,16 +119,17 @@ final class ConnectionTests: XCTestCase {
     }
 
     func testLongMessagesAreSplitIntoNumberedDatagrams() {
+        start() // Auth, Hello, Ping: 0, 1, 2
         let payload = Data((0..<3000).map { UInt8($0 & 0xff) })
         conn.send(Msg.gamepad, payload)
         var seqs: [UInt32] = []
         var bytes = Data()
         while bytes.count < 5 + payload.count, let c = host.receiveControl() {
-            XCTAssertLessThanOrEqual(c.payload.count + 5, maxDatagram)
+            XCTAssertLessThanOrEqual(c.payload.count + 5 + tagSize, maxDatagram)
             seqs.append(c.seq)
             bytes.append(c.payload)
         }
-        XCTAssertEqual(seqs, [0, 1, 2])
+        XCTAssertEqual(seqs, [3, 4, 5])
         XCTAssertEqual(bytes, FakeHost.message(Msg.gamepad, payload))
     }
 
@@ -200,7 +246,8 @@ final class ConnectionTests: XCTestCase {
 
     func testPongGivesTheHostClock() {
         conn.start(width: 64, height: 64, refreshMhz: 60_000, kbps: 1000, codecMask: 1, preferred: 0)
-        _ = host.receiveControl()
+        _ = host.receiveControl() // Auth
+        _ = host.receiveControl() // Hello
         let ping = host.receiveControl()!
         XCTAssertNil(conn.toHost(localNs: 1))
         let t0 = ping.payload.u64(5)

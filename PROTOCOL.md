@@ -15,9 +15,10 @@ All integers are little-endian. `f32` is IEEE 754 single precision.
 - `GET /config.json` → `{"port": 8443, "certHash": [32 bytes]}`: the SHA-256
   of the WebTransport certificate, for `serverCertificateHashes`. That
   certificate is self-signed, valid for 13 days, and rotated weekly.
-- There is no authentication: anyone who can reach the port can connect
-  (and take over from the current client). Version 1 and 2 clients sent a
-  token after the Hello fields; the host ignores any such trailing bytes.
+- The web client is served only with `--web`, and has no authentication: anyone
+  who can reach the port can connect (and take over from the current client).
+  Version 1 and 2 clients sent a token after the Hello fields; the host ignores
+  any such trailing bytes.
 
 ## Control stream
 
@@ -171,15 +172,39 @@ lowest-RTT exchange and uses it to show capture→display latency.
 ## Plain UDP
 
 For native clients, on UDP port 8444 (the WebTransport port + 1). No
-encryption, no authentication, no retransmission: it assumes a clean LAN.
-Every datagram starts with a type byte:
+retransmission: it assumes a clean LAN. The control stream is encrypted and the
+client must be authorized; video and audio are plain. Every datagram starts with a
+type byte:
 
 | type | contents |
 |---|---|
 | 1 | audio, as above |
 | 2 | video fragment, as in datagram mode above (always used over plain UDP; the Hello flags are ignored) |
-| 3 | control: `u32 sequence` then bytes of the control stream |
+| 3 | control: `u32 sequence` then bytes of the control stream, sealed (below) |
 | 5 | keep-awake (client → host): no payload; the host drops it |
+| 6 | handshake (below) |
+
+A session starts with a handshake. Client → host: type 6, an ephemeral X25519
+public key, then zeros up to 129 bytes in all (so a forged request gets back no
+more than it sent), repeated until answered. Host → client: type 6, its ephemeral
+key (32), its long-term Ed25519 public key (32), and its signature (64) over
+"gmstream host" + T, where T is the SHA-256 of "gmstream-udp-1", the client's
+ephemeral key, the host's ephemeral key and the host's long-term key. The host
+answers a repeat with the same reply. The client remembers the host's long-term key
+and refuses a different one, as ssh does.
+
+Both sides take HKDF-SHA256 of the X25519 secret with T as salt: 32 bytes with info
+"c2h" and 32 with info "h2c", AES-256-GCM keys for each direction. A control
+datagram is sealed with its 5-byte header as additional data and 8 zero bytes then
+the big-endian sequence number as nonce, the 16-byte tag last, so its payload is
+at most 1379 bytes. A datagram that doesn't open is dropped.
+
+The first control message is `Auth` (0x10): the client's Ed25519 public key (32)
+and its signature (64) over "gmstream client" + T. That key must be in the host
+user's `~/.ssh/authorized_keys` as `ssh-ed25519`, with or without options; if it
+isn't, or the signature is wrong, the host sends `Error` and ends the session.
+`Hello` follows. A client's line uses
+`restrict,command="/bin/false"`, so ssh itself gives that key no shell.
 
 The control stream (the same messages as over WebTransport, both
 directions) is cut into type-3 datagrams numbered from 0 in each direction;
@@ -188,8 +213,8 @@ control datagram never carries more than 1400 bytes, so nothing is fragmented
 by IP; PyroWave datagrams follow `max_datagram` (above).
 
 A client is identified by its address and port. Its control datagram 0
-(which starts with `Hello`) begins a session; a later session from another
-address replaces it, as over WebTransport. The host ends a session after
+(which starts with `Auth`), sealed with the handshake's keys, begins a session; a
+later session from another address replaces it, as over WebTransport. The host ends a session after
 10 s without a control datagram from the client, so clients send `Ping`
 every 500 ms. A lost control datagram stalls the stream behind it; once 256
 later ones are waiting, the host ends the session and the client reconnects.
