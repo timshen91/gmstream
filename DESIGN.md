@@ -1737,6 +1737,25 @@ DPB slots have to take turns (encoding into the slot being referenced hangs
 it), and tile spacing has to be spelled out, since this driver reports no
 settable std syntax flags and so will not take `uniform_tile_spacing_flag`.
 
+**Claim no coding tool the encoder does not apply.** The sequence header first
+said `enable_intra_edge_filter = 1`. The encoder does not apply that filter to
+its own reconstruction, so every intra block inside an inter frame decoded a
+little differently from the reference the encoder had predicted from, and the
+reference chain carried the error forward for as long as the session lasted:
+colour casts and rainbow confetti spreading over a minute or two, worst where
+the most blocks are coded. It survives nothing: not a keyframe (which clears it
+until it rebuilds), and no amount of looking at a short clip, because at two
+seconds there is nothing to see. The giveaway was that it got *worse* at a
+finer q index, which is backwards for ordinary quantization loss.
+
+Found by encoding seventy seconds with FFmpeg's own `av1_vulkan` on the same
+device and measuring it against the source: 56.2 dB at frame 100, 53.2 dB at
+frame 4150, so the driver was fine and the fault was ours. Diffing our sequence
+header against FFmpeg's left four candidates, and switching them one at a time
+named this one. CDEF is off for the same reason -- nothing sets strengths for
+it -- and `order_hint_bits_minus_1` is 7, because `order_hint` carries a whole
+byte of frame id and a seven-bit field cannot hold it.
+
 **What it took to read gamescope's buffer.** The first build encoded garbage:
 a recognisable picture shredded into compression blocks. gamescope's buffer is
 DCC — AMD's colour compression, the default for anything the GPU renders into,

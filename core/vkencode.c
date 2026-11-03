@@ -254,7 +254,8 @@ struct gm_vkencode {
 
 	bool debug;
 	FILE *dump; // GM_AV1_DUMP: 120 frames of bitstream, to look at
-	unsigned dumped, dump_from; // GM_AV1_DUMP_FROM: the first frame to take
+	unsigned dumped, dump_from, dump_frames; // GM_AV1_DUMP_FROM: the first
+	// frame to take; GM_AV1_DUMP_FRAMES: how many (120)
 };
 
 /* ---- the profile ---------------------------------------------------------- */
@@ -984,14 +985,23 @@ static bool session_open(struct gm_vkencode *vk, int width, int height,
 	}
 
 	StdVideoAV1ColorConfig color_config = color_config_for(ten, hdr_session(vk));
+	// Which coding tools the sequence header claims. The intra edge filter
+	// must stay off: this encoder does not apply it to its own reconstruction,
+	// so claiming it made every intra block inside an inter frame decode a
+	// little differently from the reference the encoder predicted from, and
+	// the reference chain carried that error forward. It showed as colour
+	// casts and confetti growing over a minute or two, fastest at a fine q
+	// index, where the most blocks are coded. CDEF is off for the same reason
+	// -- we never set strengths for it, so there is nothing to claim. This is
+	// what FFmpeg's Vulkan AV1 encoder does, which does not drift here.
 	StdVideoAV1SequenceHeader seq = {
-		.flags = { .enable_order_hint = 1, .enable_cdef = 1,
-			.enable_intra_edge_filter = 1 },
+		.flags = { .enable_order_hint = 1 },
 		.seq_profile = STD_VIDEO_AV1_PROFILE_MAIN,
 		.frame_width_bits_minus_1 = 15, .frame_height_bits_minus_1 = 15,
 		.max_frame_width_minus_1 = (uint16_t)(w - 1),
 		.max_frame_height_minus_1 = (uint16_t)(h - 1),
-		.order_hint_bits_minus_1 = 6, .pColorConfig = &color_config };
+		// Eight bits, because order_hint below is a whole byte of frame id.
+		.order_hint_bits_minus_1 = 7, .pColorConfig = &color_config };
 	VkVideoEncodeAV1SessionParametersCreateInfoKHR av1_params = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR,
 		.pStdSequenceHeader = &seq };
@@ -1533,7 +1543,7 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 		sent_last = gm_now_ns();
 	}
 
-	if (vk->dump != NULL && vk->dumped < 120 && frame_id >= vk->dump_from) {
+	if (vk->dump != NULL && vk->dumped < vk->dump_frames && frame_id >= vk->dump_from) {
 		fwrite(prefix, 1, prefix_len, vk->dump);
 		for (unsigned j = 0; j < size; j++) {
 			fputc(vk->bs_map[j], vk->dump);
@@ -1655,6 +1665,8 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 		vk->tile_bytes = (unsigned)atoi(tb);
 	}
 	vk->debug = getenv("GM_DEBUG_CHUNKS") != NULL;
+	const char *nf = getenv("GM_AV1_DUMP_FRAMES");
+	vk->dump_frames = nf != NULL ? (unsigned)atoi(nf) : 120;
 	const char *from = getenv("GM_AV1_DUMP_FROM");
 	vk->dump_from = from != NULL ? (unsigned)atoi(from) : 0;
 	const char *dump = getenv("GM_AV1_DUMP");
