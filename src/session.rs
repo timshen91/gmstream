@@ -34,6 +34,8 @@ const PYROWAVE_HEADER: usize = 29;
 // Hello flags.
 const HELLO_ONE_VIDEO_STREAM: u8 = 1;
 const HELLO_VIDEO_DATAGRAMS: u8 = 2;
+const HELLO_VIDEO_CHUNKS: u8 = 4;
+const HELLO_HDR: u8 = 8;
 
 // Client → host control messages.
 const C_HELLO: u8 = 0x01;
@@ -57,6 +59,7 @@ const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
 const H_RELATIVE: u8 = 0x83;
 const H_CURSOR_CLIP: u8 = 0x87;
+const H_ENCODE_FORMAT: u8 = 0x88;
 const H_RUMBLE: u8 = 0x84;
 const H_PONG: u8 = 0x85;
 const H_ERROR: u8 = 0x86;
@@ -65,6 +68,9 @@ const DATAGRAM_AUDIO: u8 = 1;
 const DATAGRAM_VIDEO: u8 = 2;
 const VIDEO_FRAGMENT_HEADER: usize = 9;
 const DATAGRAM_PYROWAVE: u8 = 4;
+const DATAGRAM_VIDEO_CHUNK: u8 = 9;
+const VIDEO_CHUNK_HEADER: usize = 43;
+const CODEC_AV1: u8 = 2;
 const CODEC_PYROWAVE: u8 = 3;
 const VIDEO_HEADER: usize = 32;
 // A frame that has not reached the client by then is abandoned; the client
@@ -82,6 +88,8 @@ fn message(ty: u8, payload: &[u8]) -> Vec<u8> {
 struct Client {
     conn: Arc<Conn>,
     video: mpsc::Sender<(u32, Vec<u8>)>,
+    /// Pieces of frames, ready to send; a frame is ~150 of them.
+    chunks: mpsc::Sender<Vec<u8>>,
     ctrl: mpsc::UnboundedSender<Vec<u8>>,
     audio_seq: AtomicU32,
     stats: Arc<VideoStats>,
@@ -159,6 +167,41 @@ impl core::Sink for Hub {
         }
     }
 
+    /// One piece of a frame, as the encoder writes it (PROTOCOL.md, type 9).
+    /// Called on the encoder thread, so it only queues: the chunk task sends.
+    fn video_chunk(&self, c: &core::VideoChunk) {
+        let Some(client) = self.client() else { return };
+        let data = c.data();
+        let mut d = Vec::with_capacity(VIDEO_CHUNK_HEADER + data.len());
+        d.push(DATAGRAM_VIDEO_CHUNK);
+        d.extend_from_slice(&c.frame_id.to_le_bytes());
+        d.extend_from_slice(&c.index.to_le_bytes());
+        d.extend_from_slice(&c.count.to_le_bytes());
+        d.extend_from_slice(&c.offset.to_le_bytes());
+        d.extend_from_slice(&c.total.to_le_bytes());
+        d.push(c.keyframe as u8 | (c.last as u8) << 1);
+        d.push(c.codec as u8);
+        d.extend_from_slice(&c.width.to_le_bytes());
+        d.extend_from_slice(&c.height.to_le_bytes());
+        d.extend_from_slice(&c.slot_ns.to_le_bytes());
+        d.extend_from_slice(&c.encoded_ns.to_le_bytes());
+        // How much of the sending happened before the bitstream was finished:
+        // the client takes the network's share from the first piece, not from
+        // the end of the encode.
+        let overlap = c.encoded_ns.saturating_sub(c.first_ns).min(u32::MAX as u64) as u32;
+        d.extend_from_slice(&(if c.first_ns > 0 { overlap } else { 0 }).to_le_bytes());
+        d.extend_from_slice(data);
+        if c.last {
+            client.stats.encoded.fetch_add(1, Ordering::Relaxed);
+        }
+        if client.chunks.try_send(d).is_err() {
+            // The network side is behind: this frame is incomplete, so the
+            // client needs a fresh one to decode from.
+            client.stats.queue_full.fetch_add(1, Ordering::Relaxed);
+            core::request_keyframe();
+        }
+    }
+
     fn audio(&self, opus: &[u8], pts_ns: u64) {
         let Some(c) = self.client() else { return };
         let mut d = Vec::with_capacity(13 + opus.len());
@@ -197,6 +240,11 @@ impl core::Sink for Hub {
         p.extend_from_slice(&weak.to_le_bytes());
         p.extend_from_slice(&duration_ms.to_le_bytes());
         self.control(message(H_RUMBLE, &p));
+    }
+
+    fn encode_format(&self, text: &str) {
+        eprintln!("gmstream: encoding from {text}");
+        self.control(message(H_ENCODE_FORMAT, text.as_bytes()));
     }
 }
 
@@ -433,6 +481,8 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     let flags = if version >= 2 { r.u8()? } else { 0 };
     let client_max_datagram = if version >= 3 { r.u16()? as usize } else { 0 };
     let datagrams = conn.is_udp() || flags & HELLO_VIDEO_DATAGRAMS != 0;
+    let wants_chunks = flags & HELLO_VIDEO_CHUNKS != 0;
+    let wants_hdr = flags & HELLO_HDR != 0;
     let one_stream = !datagrams && flags & HELLO_ONE_VIDEO_STREAM != 0;
     if !(1..=PROTOCOL_VERSION).contains(&version) {
         send_error(&mut send, "Protocol version mismatch; reload the page").await;
@@ -448,18 +498,31 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         bail!("{peer}: no common codec (client {mask:#x}, host {:#x})", core::supported_codecs());
     };
     let kbps = kbps.clamp(1000, 500_000);
-    // Plain UDP: PyroWave packets as large as both ends' links carry (each
-    // datagram has a fixed cost; see core/pyrowave.c). 0: the core's default.
-    let packet = match (conn.is_udp(), udp::route_max_datagram(peer)) {
-        (true, Some(host_max)) if client_max_datagram > 0 && codec == CODEC_PYROWAVE => {
-            client_max_datagram.min(host_max).saturating_sub(PYROWAVE_HEADER)
+    // A frame in pieces as the encoder writes it (core/vastream.c): AV1 only,
+    // and only for a client that asked, since the pieces are a different
+    // datagram.
+    let chunked = wants_chunks && codec == CODEC_AV1;
+    // The largest datagram this link carries unfragmented, so a piece of a
+    // frame or a PyroWave packet fills one (each datagram has a fixed cost;
+    // see core/pyrowave.c). 0: the core's default.
+    let link_max = match (conn.is_udp(), udp::route_max_datagram(peer)) {
+        (true, Some(host_max)) if client_max_datagram > 0 => Some(client_max_datagram.min(host_max)),
+        (false, _) => conn.max_datagram_size(),
+        _ => None,
+    };
+    let packet = match (chunked, link_max) {
+        (true, Some(max)) => max.saturating_sub(VIDEO_CHUNK_HEADER),
+        (false, Some(max)) if codec == CODEC_PYROWAVE && conn.is_udp() => {
+            max.saturating_sub(PYROWAVE_HEADER)
         }
         _ => 0,
     };
 
     let (vtx, mut vrx) = mpsc::channel::<(u32, Vec<u8>)>(4);
+    // Deep enough for a keyframe, which is a few thousand pieces.
+    let (chtx, mut chrx) = mpsc::channel::<Vec<u8>>(8192);
     let (ctx, mut crx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let client = Arc::new(Client { conn: conn.clone(), video: vtx, ctrl: ctx, audio_seq: AtomicU32::new(0), stats: Arc::default() });
+    let client = Arc::new(Client { conn: conn.clone(), video: vtx, chunks: chtx, ctrl: ctx, audio_seq: AtomicU32::new(0), stats: Arc::default() });
     // HelloAck goes first; the core's cursor and lock state follow it.
     let _ = client.ctrl.send(message(H_HELLO_ACK, &[codec]));
     if let Some(old) = HUB.replace(client.clone()) {
@@ -490,12 +553,44 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
             String::new()
         }
     );
-    core::stream_start(codec, width, height, refresh, kbps, packet);
+    if chunked {
+        eprintln!("gmstream: client {n} takes frames in pieces, {packet}-byte chunks");
+    }
+    if wants_hdr {
+        eprintln!("gmstream: client {n} can show HDR10");
+    }
+    core::stream_start(
+        codec,
+        width,
+        height,
+        refresh,
+        kbps,
+        packet,
+        (if chunked { core::STREAM_CHUNKED } else { 0 })
+            | (if wants_hdr { core::STREAM_HDR } else { 0 }),
+    );
 
     let writer = tokio::spawn(async move {
         while let Some(m) = crx.recv().await {
             if send.write_all(&m).await.is_err() {
                 break;
+            }
+        }
+    });
+    // Pieces of frames go out as they are queued, as many at a time as are
+    // waiting (one sendmmsg over plain UDP).
+    let chunk_conn = conn.clone();
+    let chunker = tokio::spawn(async move {
+        while let Some(first) = chrx.recv().await {
+            let mut batch = vec![first];
+            while batch.len() < 64 {
+                match chrx.try_recv() {
+                    Ok(d) => batch.push(d),
+                    Err(_) => break,
+                }
+            }
+            if chunk_conn.send_datagrams_wait(batch).await.is_err() {
+                return;
             }
         }
     });
@@ -591,6 +686,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
 
     writer.abort();
     video.abort();
+    chunker.abort();
     monitor.abort();
     if HUB.remove(&client) {
         core::stream_stop();

@@ -15,7 +15,8 @@ enum Msg {
         vrrPolicy: UInt8 = 0x0e, touch: UInt8 = 0x0f, auth: UInt8 = 0x10
     // Host → client.
     static let helloAck: UInt8 = 0x81, cursor: UInt8 = 0x82, relative: UInt8 = 0x83,
-        rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86, cursorClip: UInt8 = 0x87
+        rumble: UInt8 = 0x84, pong: UInt8 = 0x85, error: UInt8 = 0x86, cursorClip: UInt8 = 0x87,
+        encodeFormat: UInt8 = 0x88
 }
 
 let protocolVersion: UInt16 = 5
@@ -24,6 +25,9 @@ let datagramAudio: UInt8 = 1, datagramVideo: UInt8 = 2, datagramControl: UInt8 =
 let maxDatagram = 1400
 let datagramHandshake: UInt8 = 6
 let datagramMouse: UInt8 = 7, datagramAck: UInt8 = 8
+/// A piece of a frame, sent while the host is still encoding the rest.
+let datagramVideoChunk: UInt8 = 9
+let videoChunkHeader = 43
 let handshakeSize = 129 // padded, so a forged request gets back no more than it sent
 let tagSize = 16
 
@@ -48,6 +52,54 @@ extension Data {
 /// Monotonic nanoseconds on this machine.
 func nowNs() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
 
+/// A frame gathered from the pieces the host sends while it encodes it
+/// (PROTOCOL.md, Video chunks). The pieces carry where their bytes go, so the
+/// frame ends up byte for byte as the encoder produced it; the host sends the
+/// few bytes it had to go back and change in later pieces, which is why they
+/// are laid down in index order.
+private final class ChunkedFrame {
+    var parts: [(offset: Int, data: Data)?] = []
+    var got = 0
+    var count = 0 // only the last piece knows it
+    var total = 0
+    var key = false
+    var codec: UInt8 = 0
+    var width = 0, height = 0
+    var slotNs: UInt64 = 0, encodedNs: UInt64 = 0
+    var overlapNs: UInt64 = 0 // sent before the bitstream was finished (host)
+    var firstNs: UInt64 = 0 // when its first datagram reached the kernel
+
+    func put(index: Int, offset: Int, data: Data) {
+        if index >= parts.count {
+            parts.append(contentsOf: [(offset: Int, data: Data)?](repeating: nil,
+                                                                  count: index + 1 - parts.count))
+        }
+        guard parts[index] == nil else { return }
+        parts[index] = (offset, data)
+        got += 1
+    }
+
+    var whole: Bool { count > 0 && got >= count }
+
+    /// The frame's bitstream, pieces laid down in index order.
+    func bitstream() -> Data {
+        var out = Data(count: total)
+        out.withUnsafeMutableBytes { raw in
+            guard let dst = raw.baseAddress else { return }
+            for part in parts {
+                guard let p = part, p.offset < total else { continue }
+                let n = min(p.data.count, total - p.offset)
+                p.data.withUnsafeBytes { src in
+                    if let from = src.baseAddress {
+                        memcpy(dst + p.offset, from, n)
+                    }
+                }
+            }
+        }
+        return out
+    }
+}
+
 /// One encoded frame as the host sent it (PROTOCOL.md, Video).
 struct Frame {
     let id: UInt32
@@ -57,6 +109,14 @@ struct Frame {
     let slotNs: UInt64, encodedNs: UInt64
     let bitstream: Data
     let receivedNs: UInt64
+    /// When its first datagram arrived. With a frame sent in pieces as the
+    /// host encodes it, that is well before the frame was finished, and
+    /// receivedNs - firstNs is how long it took to arrive.
+    var firstNs: UInt64 = 0
+    /// How long before the bitstream was finished the host sent this frame's
+    /// first piece (its own clock). The network's share of the latency runs
+    /// from there, so this much of it happened during the encode.
+    var overlapNs: UInt64 = 0
 }
 
 protocol ConnectionDelegate: AnyObject {
@@ -74,6 +134,8 @@ protocol ConnectionDelegate: AnyObject {
     /// Where the game keeps the cursor, in stream pixels; nil: nowhere in particular.
     func cursorClip(_ clip: CGRect?)
     func rumble(index: Int, strong: UInt16, weak: UInt16, ms: Int)
+    /// What the host's encoder takes in, in words, for the stats line.
+    func encodeFormat(_ text: String)
     func closed(reason: String)
 }
 
@@ -104,7 +166,9 @@ final class Connection {
     private var controlBuffer = Data()
 
     // Video reassembly (network thread only).
-    private var fragments: [UInt32: (parts: [Data?], got: Int)] = [:]
+    private var fragments: [UInt32: (parts: [Data?], got: Int, first: UInt64)] = [:]
+    // Frames the host sends in pieces while it encodes them (type 9).
+    private var chunked: [UInt32: ChunkedFrame] = [:]
 
     // Clock: host CLOCK_MONOTONIC ns minus ours, from the fastest ping.
     private let clockLock = NSLock()
@@ -256,7 +320,11 @@ final class Connection {
         w.u16(UInt16(width)); w.u16(UInt16(height))
         w.u32(refreshMhz); w.u32(kbps)
         w.u8(codecMask); w.u8(preferred)
-        w.u8(0) // flags: plain UDP always sends video as datagrams
+        // Plain UDP always sends video as datagrams; bit 2 asks for each frame
+        // in pieces as the host encodes it, bit 3 says this client can show
+        // HDR10. The second is a capability, not a request: whether the
+        // session is HDR stays SteamOS's setting.
+        w.u8((options.streamFrames ? 4 : 0) | (canShowHDR() ? 8 : 0))
         w.u16(UInt16(linkMaxDatagram))
         started = true
         send(Msg.hello, w.data)
@@ -471,7 +539,12 @@ final class Connection {
         var w = Writer()
         w.u64(nowNs() / 1000)
         send(Msg.ping, w.data)
-        if nowNs() - lastHeard > 5_000_000_000 {
+        // lastHeard is written on the network thread. Read it once, and only
+        // subtract when it really is in the past: the receive thread can set
+        // it between the two reads, and an unsigned underflow traps (it did,
+        // twice, as EXC_BREAKPOINT in here).
+        let last = lastHeard, now = nowNs()
+        if now > last, now - last > 5_000_000_000 {
             DispatchQueue.main.async { self.delegate?.closed(reason: "No packets from the host for 5 s") }
         }
     }
@@ -554,14 +627,18 @@ final class Connection {
             let t = arrived > 0 ? arrived : lastHeard
             let kind = d[0]
             let id = n >= 5 ? d.u32(1) : 0
-            let frag = (kind == datagramVideo || kind == datagramPyroWave) && n >= 9
+            let frag = (kind == datagramVideo || kind == datagramPyroWave ||
+                        kind == datagramVideoChunk) && n >= 9
             let host: UInt64 = kind == datagramAudio && n >= 13 ? d.u64(5) : kind == datagramPyroWave && n > 29 ? d.u64(21) : 0
             trace.record(t: t, aux: lastHeard &- t, kind: kind, size: n, id: id,
                          index: frag ? Int(d.u16(5)) : 0, count: frag ? Int(d.u16(7)) : 0, host: host)
         }
         switch d[0] {
         case datagramVideo where n > 9:
-            videoFragment(id: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)), part: d.subdata(in: 9..<n))
+            videoFragment(id: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)),
+                          part: d.subdata(in: 9..<n), arrived: arrived > 0 ? arrived : lastHeard)
+        case datagramVideoChunk where n > videoChunkHeader:
+            videoChunk(d, n: n, arrived: arrived > 0 ? arrived : lastHeard)
         case datagramHandshake where n >= handshakeSize:
             handshakeReply(d)
         case datagramControl where n > 5 + tagSize:
@@ -593,8 +670,48 @@ final class Connection {
         }
     }
 
-    private func videoFragment(id: UInt32, index: Int, count: Int, part: Data) {
-        var f = fragments[id] ?? (parts: [Data?](repeating: nil, count: count), got: 0)
+    /// One piece of a frame the host is still encoding (PROTOCOL.md, type 9).
+    private func videoChunk(_ d: Data, n: Int, arrived: UInt64) {
+        let id = d.u32(1)
+        let f = chunked[id] ?? {
+            let f = ChunkedFrame()
+            f.firstNs = arrived
+            chunked[id] = f
+            // Pieces of the newest few frames only; an incomplete one is lost.
+            if chunked.count > 4, let oldest = chunked.keys.min() { chunked[oldest] = nil }
+            return f
+        }()
+        let flags = d[d.startIndex + 17]
+        f.codec = d[d.startIndex + 18]
+        f.width = Int(d.u16(19))
+        f.height = Int(d.u16(21))
+        f.slotNs = d.u64(23)
+        if flags & 2 != 0 { // the last piece: now we know how many, and the rest
+            f.key = flags & 1 != 0
+            f.count = Int(d.u16(7))
+            f.total = Int(d.u32(13))
+            f.encodedNs = d.u64(31)
+            // How much of the sending happened while the frame was still
+            // being encoded.
+            f.overlapNs = UInt64(d.u32(39))
+        }
+        f.put(index: Int(d.u16(5)), offset: Int(d.u32(9)),
+              data: d.subdata(in: videoChunkHeader..<n))
+        guard f.whole, f.total > 0 else { return }
+        chunked[id] = nil
+        let frame = Frame(id: id, key: f.key, codec: f.codec, width: f.width,
+                          height: f.height, slotNs: f.slotNs, encodedNs: f.encodedNs,
+                          // The last piece's kernel arrival, not the time we
+                          // got around to reading it: that lag is this
+                          // client's, and the "read" stage shows it.
+                          bitstream: f.bitstream(), receivedNs: arrived, firstNs: f.firstNs,
+                          overlapNs: f.overlapNs)
+        delegate?.received(frame: frame)
+    }
+
+    private func videoFragment(id: UInt32, index: Int, count: Int, part: Data,
+                               arrived: UInt64) {
+        var f = fragments[id] ?? (parts: [Data?](repeating: nil, count: count), got: 0, first: arrived)
         guard index < f.parts.count, f.parts[index] == nil else { return }
         f.parts[index] = part
         f.got += 1
@@ -610,7 +727,8 @@ final class Connection {
         let frame = Frame(id: data.u32(0), key: data[4] & 1 != 0, codec: data[5],
                           width: Int(data.u16(6)), height: Int(data.u16(8)),
                           slotNs: data.u64(12), encodedNs: data.u64(20),
-                          bitstream: data.subdata(in: 32..<data.count), receivedNs: nowNs())
+                          bitstream: data.subdata(in: 32..<data.count), receivedNs: arrived,
+                          firstNs: f.first)
         delegate?.received(frame: frame)
     }
 
@@ -672,6 +790,9 @@ final class Connection {
         case Msg.rumble where body.count >= 7:
             let (i, s, w, ms) = (Int(body[body.startIndex]), body.u16(1), body.u16(3), Int(body.u16(5)))
             DispatchQueue.main.async { self.delegate?.rumble(index: i, strong: s, weak: w, ms: ms) }
+        case Msg.encodeFormat:
+            let text = String(decoding: body, as: UTF8.self)
+            DispatchQueue.main.async { self.delegate?.encodeFormat(text) }
         case Msg.error:
             let text = String(decoding: body, as: UTF8.self)
             DispatchQueue.main.async { self.delegate?.closed(reason: text) }

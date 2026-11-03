@@ -157,6 +157,14 @@ trixie (glibc 2.41), older than SteamOS's glibc (2.43), so it runs there.
   a newer one replaces it.
 - The VA-API quality level makes no measurable difference on radeonsi
   (tested 1–31: 4.5–5.1 ms at 2560x1600), so it is left at the default.
+- **AV1 on the Vulkan video encode queue (`core/vkencode.c`):** gamescope's
+  frame is encoded where it lies, with no copy and no conversion pass, and
+  nothing on the CPU waits for the GPU. This is the AV1 path; the VA-API one
+  below is the reference (`GM_AV1_VAAPI`). See §12.4.
+- **AV1 in pieces (`core/vastream.c`):** for a client that asks, the frame is
+  encoded in four tile groups and each piece of the bitstream goes out as the
+  GPU writes it, so most of the frame is on the wire before the encode is
+  finished. The bytes are the encoder's own, byte for byte. See §12.
 
 ### 3.3 Audio (`core/audio.c`)
 
@@ -1553,3 +1561,261 @@ which is what `libfaketime` does and what the phrase literally means. It is
 exact, and it desynchronizes audio, networking and everything else that
 compares against real time, so it is not a general answer - but it is the
 measurement tool for finding out how large `e[n]` really is in a given game.
+
+## 12. Streamable AV1: a frame on the wire before it is encoded
+
+**Goal.** Each stage used to wait for the one before: a whole frame was encoded,
+then sent, then decoded. Now the host sends each piece of a frame's bitstream as
+the GPU writes it, so most of a frame is on the wire before the encoder has
+finished it. The bytes are the encoder's own, from the same single encode call,
+byte for byte: nothing is re-encoded, re-packed or reconstructed.
+
+### 12.1 What the hardware will and will not do
+
+VA-API says a frame's bitstream is ready only when the whole frame is: one fence
+and one feedback buffer per picture, and mapping the coded buffer waits for the
+GPU. Mesa's `radeon_enc_get_feedback` reads the length from a feedback buffer the
+firmware writes at the end, and its segments separate the headers from the
+bitstream, not tile from tile. There is no per-tile completion to wait on, and
+`vlVaAcquireBufferHandle` refuses to export a coded buffer, so it cannot be
+mapped behind the driver's back either.
+
+Three facts make it work anyway, all of them measured on this machine (AMD
+Radeon 8060S, strix_halo, Mesa 26.1.2; `tools/obuwatch` is the experiment, and
+`tools/caps` what the encoder reports):
+
+- The coded buffer's BO is created once and reused (`picture_av1_enc.c`:
+  `if (!coded_buf->derived_surface.resource)`), so a mapping taken while the
+  buffer was idle stays a live view of it. It is `PIPE_USAGE_STAGING`, and the
+  CPU sees the GPU's writes as they happen.
+- VCN fills it in order, in blocks of 384 bytes. At 2940x1846 and ~200 kB a
+  frame, the first bytes appear 0.4 ms after the picture is submitted and the
+  last at 4.3 ms.
+- It does come back and change a few bytes it had already written: about nine in
+  the frame header, and the three bytes of each tile group's OBU header and
+  size, once that tile group's length is known. Nothing else, in any run.
+
+`tiles`/`tile_groups` on `av1_vaapi` is what makes the pieces worth having: each
+tile group becomes its own OBU, so the bitstream has real cut points. At
+2940x1846, `1x4` with four tile groups costs nothing measurable - 193-196 kB a
+frame either way, and encode time 4.05 ms against 4.28 ms with one tile - and the
+tile groups finish at 0.53, 2.00, 2.78, 3.55 and 4.05 ms. Eight tile rows cost
+about 1 ms of encode time, so four is the default.
+
+### 12.2 How it is built (`core/vastream.c`)
+
+One coded buffer is kept for the encoder's lifetime and its mapping held. Before
+each picture is submitted the buffer is pre-filled with a position-keyed pattern,
+so where the pattern resumes is exactly how far the GPU has written, and nothing
+unwritten is ever sent (thirty-two bytes of agreement is proof; by chance it
+would take 2^256). While FFmpeg waits for the frame, whole chunks of what has
+appeared go out. The first 128 bytes are held back, because the frame header is
+patched after the fact.
+
+What makes it exact is the last step rather than any assumption about the GPU: a
+copy is kept of every byte as it was sent, and when FFmpeg hands back the frame
+that copy is compared with it. The handful of bytes that changed go out again in
+later pieces, then the held-back start, which is the frame's last piece. The
+client lays pieces down in index order, so the later ones win. That holds however
+the GPU behaves - if it ever patched something else, the comparison would catch
+it and send that too.
+
+It needs no patch to FFmpeg or Mesa: `build.rs` passes `--wrap` for the five
+libva calls involved, so FFmpeg's own calls are redirected into `vastream.c`,
+and the polling happens inside the wait FFmpeg already does
+(`vaSyncBuffer` in short steps), on the encoder thread, with no extra thread and
+nothing to race against.
+
+The pattern covers twice the largest recent frame (at least 256 kB, at most
+2 MB), laid down after the previous frame while the encoder thread is idle. A
+keyframe larger than that streams only its first part early, which costs that
+one frame's overlap and nothing else. `GM_CHUNK_PREFILL` forces a small window,
+which is how that path is tested.
+
+The protocol is in PROTOCOL.md ("Video chunks", datagram type 9); a client asks
+for it with Hello flag bit 2, and the Mac and iPad apps have it as a setting
+("Take AV1 frames as the host encodes them", `--whole-frames` to turn it off, so
+the two can be compared on the same content). Anything else - the web client,
+H.264, HEVC, PyroWave - gets whole frames as before, and so does the first frame
+of a session, before the buffer's mapping is known.
+
+### 12.3 Measured
+
+Bit-identical, by hash. `GM_DEBUG_CHUNKS` logs each frame's size and FNV-1a hash
+on the host; `probe -H` logs what it put back together. Over thousands of frames,
+including 31 keyframes and through 30 size changes, every hash matched and no
+AV1 bitstream failed to chain its OBUs - also with `GM_CHUNK_PREFILL=20000`,
+where only 19 kB of each 105 kB frame is sent early and the rest afterwards.
+
+Per frame on the host, 2940x1846 at ~105 kB (`GM_DEBUG_CHUNKS`): the first piece
+leaves 1.2-3.0 ms after the picture is submitted, the bitstream is done at 8.7 ms,
+80-86 pieces, 99.5% of the frame sent before it was finished, and 3-9 bytes
+re-sent.
+
+End to end, Mac over the hotspot, 2940x1846 at ~54 Mb/s, 60 Hz, vkmark's
+`desktop` scene, whole frames against pieces (two alternating 16 s runs each):
+
+| | whole frames | in pieces |
+|---|---|---|
+| encoded → received | 4.89, 5.02 ms | 2.63, 2.67 ms |
+| present → received | 13.92, 14.05 ms | 11.78, 11.82 ms |
+
+With the real client decoding and showing the frames, same content at ~70 Mb/s
+(p50 / p99 / max): network 4.4 / 6.5 / 7.6 → 3.1 / 5.3 / 6.6, total
+35.1 / 42.7 / 43.9 → 33.7 / 40.8 / 42.1. The stats overlay's new `early` row is
+the overlap itself: how long before the host finished a frame its first bytes
+were already here, −1.9 ms with whole frames (a whole frame cannot start arriving
+until it is finished) against +1.2 ms with pieces.
+
+The gain is larger without the decoder in the way (2.3 ms against 1.3 ms),
+because the client reads datagrams and submits frames to VideoToolbox on the same
+thread, so the read lag is added to both. Taking decode off the network thread is
+the next thing worth doing, and it is a client matter, not an encoder one.
+
+### 12.4 The Vulkan encoder (`core/vkencode.c`)
+
+VA-API cannot express what this needs: it has no device-side wait, so a thread
+has to sleep through a GPU round trip before the encode starts, and it wants
+NV12, so gamescope's frame has to be blitted and converted first. Vulkan's
+video encode queue has both. For AV1 the encoder is now `core/vkencode.c`;
+`encode.c` (VA-API, through FFmpeg) stays as the reference and runs instead
+when `GM_AV1_VAAPI` is set.
+
+What it does per frame:
+
+- The compositor thread exports the rendering fence from gamescope's dma-buf
+  and hands it over; the encode submission waits on it **on the device**, so
+  VCN starts the instant the frame is drawn and no thread waits for the GPU.
+- The frame is encoded **from gamescope's buffer** (see the correction below:
+  it has to be copied into an image the encoder can read first). The encoder does
+  the RGB→YCbCr conversion itself (`VK_VALVE_video_encode_rgb_conversion`,
+  VCN's EFC), so the blit and the NV12 pool are gone. gamescope composites at
+  ten bits whenever we offer it a ten-bit format (`GetPreferredOutputFormat`
+  in its Wayland backend), and an eight-bit AV1 profile will only take
+  eight-bit input, so the session follows the buffer: a ten-bit composite is
+  encoded as ten-bit AV1. The client reads the depth from the sequence header
+  when it builds VideoToolbox's `av1C`, so the stream describes itself.
+- The bitstream lands in **our own pages**, imported with
+  `VK_EXT_external_memory_host`, so watching the GPU fill it is an ordinary
+  cached read — no `--wrap` of libva, no driver internals. The pattern,
+  frontier and shadow-compare of §12.2 are the same, and still make the bytes
+  exact.
+- The **temporal delimiter and the sequence header are ours to write** (the
+  encode operation emits only the frame OBU, and the sequence header comes from
+  `vkGetEncodedVideoSessionParametersKHR`). Both are known before the encode,
+  so they are the frame's first piece: 0.03 ms after submission, against the
+  VA-API path's hold-everything-back-128-bytes.
+- **Tiles per frame, from the frame's budget.** Tiles cost bits, so a keyframe
+  (four times the budget) gets many and a small inter frame gets one or two —
+  `GM_AV1_TILE_BYTES` sets the bytes per tile (48 KiB). Sizing them from the
+  *last* frame's size runs away: tiles make frames bigger, which asks for more
+  tiles, and it pins itself to the maximum within a second.
+- **Rate control is off; the q index is picked per frame** (`next_q`), which
+  bounds the bytes per *frame* rather than the bits per second: it is one
+  frame's transmit time that shows up as latency. About 58 q indices halve the
+  bytes, so the controller steps a third of the measured error each frame and
+  settles in two or three. CBR hangs the encode ring on this hardware, every
+  time, after a handful of frames (`ring vcn_unified_0 timeout`; the kernel
+  resets it and recovers), and VBR ignores the bitrate (25 Mb/s and 100 Mb/s
+  both gave 59). `GM_AV1_Q` pins a q index, `GM_AV1_RC=vbr` hands rate control
+  back to the hardware.
+- **The quantizer only changes when the rate-control command is re-issued.**
+  `constantQIndex` reaches the encoder on the frame that follows
+  `vkCmdControlVideoCodingKHR` and on no other: without that command the
+  quantizer stays latched at whatever the session started with, and every
+  later q is ignored. Measured at 1080p on one unchanging picture, with the q
+  index sweeping 1..255: frames stuck at 74 kB when the session had begun at
+  q 1, at 1.2 kB when it had begun at q 255. So the command goes out again
+  whenever q changes. This was worth a factor of sixty and it is why the
+  stream used to ignore the client's bitrate — the controller's q did nothing,
+  and a client asking for 10 Mb/s got 130-250. The runs that looked right were
+  the ones whose latched q happened to suit the content, which is how it hid:
+  a pinned-q sweep behaves perfectly, because a pinned q never changes.
+
+Two more things the hardware demands, both found by hanging the ring: the two
+DPB slots have to take turns (encoding into the slot being referenced hangs
+it), and tile spacing has to be spelled out, since this driver reports no
+settable std syntax flags and so will not take `uniform_tile_spacing_flag`.
+
+**What it took to read gamescope's buffer.** The first build encoded garbage:
+a recognisable picture shredded into compression blocks. gamescope's buffer is
+DCC — AMD's colour compression, the default for anything the GPU renders into,
+two planes, pixels plus metadata — and the encode block reads such a surface
+as raw bytes. Nothing else here notices: the 3D engine decompresses as it
+samples (PyroWave), so does a VA-API blit, and the display engine scans it
+out. Noise does not compress, which is also why frames stayed at 90 kB
+whatever the q index said.
+
+Vulkan is no help in finding this. `vkGetPhysicalDeviceVideoFormatPropertiesKHR`
+says DRM-modifier tiling is a supported encode input;
+`VkDrmFormatModifierPropertiesList2EXT` says **no** modifier carries
+`VIDEO_ENCODE_INPUT`, including linear; and `vkCreateImage` with
+`VIDEO_ENCODE_SRC` on gamescope's modifier succeeds. All three cannot be
+right. The experiment settles it: with DCC off, encoding straight from the
+dma-buf works, so the per-modifier query is simply wrong here.
+
+The fix is in the compositor, and it is the same lever panel mode already
+pulls. `create_linux_dmabuf` narrows what we advertise: gamescope picks its
+buffer's modifier from that list, so dropping the compressed modifiers
+(`encodable_modifier`: AMD's modifier with the DCC bit set) makes it
+composite into something the encoder can read where it lies. Ninety modifiers
+go unadvertised; gamescope settles on `0x200000018601b04`, one plane, and the
+picture is correct. Only the buffer it shares with us loses DCC — its own
+internal render targets keep it, which `RADV_DEBUG=nodcc` would not have
+managed.
+
+The same list sets the bit depth. gamescope composites at ten bits whenever it
+is offered a ten-bit format, so the ten-bit formats are not advertised either
+(`GM_10BIT` puts them back, for HDR or to measure); everything is then eight
+bits from the composite to the client's texture, with no conversion anywhere.
+
+**And the colour range matters more than the depth.** The client asks
+VideoToolbox for eight-bit video-range NV12, so a full-range stream makes it
+convert every frame on the way out of the decoder: decode 4.7 ms against
+1.7 ms for the same content in video range, at 2560x1600, and the cost does
+not move with the bitrate (4.7 ms at 1 Mb/s too) or with the depth. So the
+encoder asks VCN for narrow range and says so in the sequence header.
+
+Measured on the device, same scene and settings for both (1920x1080 at 60 Hz,
+vkmark's `desktop`, over loopback so the network is out of it):
+
+| | VA-API | Vulkan |
+| --- | --- | --- |
+| commit → bitstream done, p50 / p99 | 3.82 / 4.05 ms | **1.77 / 1.85 ms** |
+| commit → received, p50 / p99 | 3.98 / 4.18 ms | **1.88 / 2.00 ms** |
+
+601 frames each, no gaps, no malformed bitstreams, and every frame's hash the
+same on both ends. On the Mac at 2560x1600 over Wi-Fi the host stage is 3.7 ms
+against 4.3, and decode 1.7 against 1.6 — the advantage narrows with
+resolution, because what the VA-API path wastes (one GPU round trip, FFmpeg)
+is roughly fixed while the encode itself scales.
+
+### 12.5 Not done
+
+- **Decoding as it arrives.** VideoToolbox takes whole frames, so the pieces only
+  overlap the network today. The tile groups are there for it; what is missing is
+  a decoder that can start on tile 0, which is the GPU AV1 decoder below.
+- **Loss of one piece still loses the frame**, as before. Tiles make it possible
+  to lose only a tile, but a decoder that accepts a frame with a tile missing has
+  to conceal it, which VideoToolbox will not do.
+- **A GPU compute AV1 encoder.** Motion search, transform, quantization and
+  reconstruction parallelize in compute shaders. Entropy coding is serial within
+  a tile, so tiles set the parallelism and the granularity of streaming. An
+  intra-only or low-delay-P subset is enough, and the output must be legal AV1.
+  Budget: well under today's encode time at 2940x1846, on a GPU the game is also
+  using. PyroWave shows both what compute encoding costs and how it contends with
+  the game. Worth it only if the hardware encoder's own time becomes the problem.
+- **A GPU AV1 decoder on the client.** Metal compute for reconstruction and CPU
+  threads per tile for entropy decoding, handling only what our encoder emits.
+  This is what would make decode overlap possible. Weigh power on a MacBook and
+  iPad against the hardware decoder.
+- **A fresh baseline on a real game.** Everything above is vkmark's `desktop`
+  scene on a second gmstream instance (`systemd-run --user --unit gmtest`), which
+  does not disturb the session. The numbers §12 started from (Warcraft III's
+  menu, 100 Mb/s: encode 9.9 / 12.4, network 4.7 / 12.0, decode 2.9 / 3.9,
+  display 3.6 / 10.0, total 21.5 / 34.9) have not been re-taken with this in
+  place.
+
+PyroWave may still be the cheaper answer at high bitrate: it already sends
+independently decodable packets as they are produced. Compare against it before
+going further.

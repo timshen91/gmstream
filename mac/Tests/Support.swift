@@ -187,6 +187,7 @@ final class Recorder: ConnectionDelegate {
     func relative(_ on: Bool) { record("relative \(on)") }
     func cursorClip(_ clip: CGRect?) { record("cursorClip \(clip.map { "\($0)" } ?? "none")") }
     func rumble(index: Int, strong: UInt16, weak: UInt16, ms: Int) { record("rumble \(index) \(strong) \(weak) \(ms)") }
+    func encodeFormat(_ text: String) {}
     func closed(reason: String) { record("closed \(reason)") }
 
     var snapshot: (events: [String], frames: [Frame], packets: [PyroWavePacket], audio: [Data]) {

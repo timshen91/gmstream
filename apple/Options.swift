@@ -1,6 +1,44 @@
 // The client's settings, and the pacing they (or the display) choose.
 
 import Foundation
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
+
+/// Whether this device can show HDR10, and the user has not turned it off.
+/// Both platforms report the headroom the panel could give beyond SDR white;
+/// 1.0 means it has none. Any attached screen counts: the window can be
+/// moved, and the host only needs to know whether HDR is worth sending.
+///
+/// Asked once, on the main thread (`primeHDRCapable`), because the Hello that
+/// carries it is written on the connection's thread and the screen list is
+/// AppKit's.
+private var hdrCapable: Bool?
+
+/// Asks the screens again. The headroom a display reports follows the
+/// system's HDR setting, not just the panel, so this is read fresh for each
+/// connection rather than remembered.
+func primeHDRCapable() {
+    #if os(macOS)
+    let best = NSScreen.screens
+        .map { $0.maximumPotentialExtendedDynamicRangeColorComponentValue }.max() ?? 1
+    NSLog("gmstream: HDR %@ (most headroom any screen offers: %.2f)",
+          best > 1.05 ? "available" : "off", best)
+    hdrCapable = best > 1.05
+    #else
+    if #available(iOS 16.0, *) {
+        hdrCapable = UIScreen.main.potentialEDRHeadroom > 1.05
+    } else {
+        hdrCapable = false
+    }
+    #endif
+}
+
+func canShowHDR() -> Bool {
+    options.hdr && hdrCapable == true
+}
 
 /// This launch's settings; the Settings window (or sheet) changes and saves them.
 var options = Options(Array(CommandLine.arguments.dropFirst()))
@@ -77,6 +115,10 @@ struct Options {
     // A tiny datagram to the host 60 times a second, so this Mac's Wi-Fi
     // doesn't doze while only receiving (Connection.keepAwake).
     var keepWiFiAwake = true
+    // Take each frame in pieces as the host's encoder writes it, so it is on
+    // the wire before it is finished (AV1 only; core/vastream.c). Off: the
+    // host sends whole frames, as before.
+    var streamFrames = true
     // Manual pacing. Phase lock (Phase.swift): gamescope produces frames on this display's
     // refresh grid. Off: an empty grid, so gamescope paces itself and frames
     // are shown as they arrive (as on a variable-refresh display).
@@ -94,6 +136,9 @@ struct Options {
     var confinement = Confinement.auto
     var layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:] // measuring
     var bgra = false // decoder output BGRA instead of NV12 (measuring)
+    // Tell the host this client can show HDR10, when the display it is on can
+    // (--no-hdr says it cannot, for measuring or to keep a stream SDR).
+    var hdr = true
     var probe: Double?
 
     init(_ args: [String]) {
@@ -109,6 +154,8 @@ struct Options {
         immediateFullScreen = d.bool(forKey: "immediateFullScreen")
         vividColors = d.bool(forKey: "vividColors")
         if d.object(forKey: "keepWiFiAwake") != nil { keepWiFiAwake = d.bool(forKey: "keepWiFiAwake") }
+        if d.object(forKey: "streamFrames") != nil { streamFrames = d.bool(forKey: "streamFrames") }
+        if d.object(forKey: "hdr") != nil { hdr = d.bool(forKey: "hdr") }
         if d.object(forKey: "phaseLock") != nil { phaseLock = d.bool(forKey: "phaseLock") }
         holdFrames = d.bool(forKey: "holdFrames")
         if d.object(forKey: "pacingMode") != nil {
@@ -133,6 +180,7 @@ struct Options {
             case "--size": size = Options.parseSize(it.next() ?? "")
             case "--probe": probe = Double(it.next() ?? "")
             case "--bgra": bgra = true
+            case "--no-hdr": hdr = false
             case "--stats-log": statsLog = true
             case "--hide-stats": showStats = false
             case "--fullscreen": fullScreen = true
@@ -141,6 +189,7 @@ struct Options {
             case "--no-vsync": immediateFullScreen = true; pacingMode = .manual
             case "--vivid": vividColors = true
             case "--no-keep-awake": keepWiFiAwake = false
+            case "--whole-frames": streamFrames = false
             case "--no-phase": phaseLock = false
             case "--hold": holdFrames = true; pacingMode = .manual
             case "--no-hold": holdFrames = false; pacingMode = .manual
@@ -198,6 +247,7 @@ struct Options {
         d.set(immediateFullScreen, forKey: "immediateFullScreen")
         d.set(vividColors, forKey: "vividColors")
         d.set(keepWiFiAwake, forKey: "keepWiFiAwake")
+        d.set(streamFrames, forKey: "streamFrames")
         d.set(phaseLock, forKey: "phaseLock")
         d.set(holdFrames, forKey: "holdFrames")
         d.set(pacingMode.rawValue, forKey: "pacingMode")

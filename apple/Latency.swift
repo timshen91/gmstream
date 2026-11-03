@@ -44,7 +44,19 @@ final class StageStats {
     // "spacing": per frame, |interval between presentations − interval
     // between gamescope presents|; 0 keeps the host's frame spacing exactly.
     // It measures the result whatever the pacing mode, phase lock or not.
-    static let stages = ["encode", "network", "decode", "hold", "render", "to \(systemName)", "display", "total", "spacing"]
+    // "network": from the host sending the frame's first byte to its last
+    // byte arriving here, so it is the whole of the network's share however
+    // the frame was sent.
+    // "read": from the last byte arriving in the kernel to the frame being
+    // handed to the decoder — this client's own lag, which used to hide
+    // inside "network" because the frame was stamped when we got round to
+    // it rather than when it arrived.
+    // "overlap": the part of that which happened while the frame was still
+    // being encoded, as a credit — a frame sent in pieces is already on the
+    // wire before the encoder has finished, and that time is counted once,
+    // in "encode". It is 0 for a frame sent whole, which cannot start
+    // arriving until it is finished. The column adds up to "to \(systemName)".
+    static let stages = ["encode", "network", "overlap", "read", "decode", "hold", "render", "to \(systemName)", "display", "total", "spacing"]
     static let window: UInt64 = 5_000_000_000
 
     struct Row {
@@ -61,10 +73,15 @@ final class StageStats {
     /// left out.
     func add(_ t: FrameTiming) {
         let ms = { (a: UInt64?, b: UInt64) -> Double? in a.map { Double(Int64(b) - Int64($0)) / 1e6 } }
+        let overlap = Double(t.overlapNs) / 1e6
         var values: [Double?] = [
             Double(t.encodeNs) / 1e6,
-            ms(t.encodedLocal, t.received),
-            ms(t.received, t.decoded),
+            // From the first byte out, which is `overlap` before the encode
+            // ended, to the last byte in.
+            ms(t.encodedLocal, t.received).map { $0 + overlap },
+            -overlap,
+            t.decodeStart > 0 ? ms(t.received, t.decodeStart) : nil,
+            ms(t.decodeStart > 0 ? t.decodeStart : t.received, t.decoded),
             ms(t.decoded, t.released),
             ms(t.released, t.submitted),
             ms(t.presentLocal, t.submitted),

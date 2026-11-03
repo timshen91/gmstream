@@ -41,6 +41,32 @@ struct gm_video_packet {
 	enum gm_codec codec;
 };
 
+// One piece of a frame's bitstream, sent while the rest is still being
+// encoded (DESIGN.md §12). The pieces of a frame carry its id and arrive in
+// `index` order; the client lays each at `offset` in a `total`-byte buffer and
+// has the whole frame, byte for byte as the encoder produced it, once it has
+// all `count` of them. `count`, `total` and `encoded_ns` are only known in the
+// last piece, and are 0 before it.
+struct gm_video_chunk {
+	const uint8_t *data;
+	size_t len;
+	uint32_t frame_id;
+	uint32_t offset;
+	uint32_t total;
+	uint16_t index, count;
+	uint64_t slot_ns;
+	uint64_t encoded_ns;
+	// When this frame's first piece went out. The network's share of the
+	// latency starts there, not at the end of the encode: with a frame sent
+	// in pieces, most of it is on the wire before the encode finishes. Only
+	// the frame's last piece carries it.
+	uint64_t first_ns;
+	uint16_t width, height;
+	bool keyframe;
+	bool last;
+	enum gm_codec codec;
+};
+
 struct gm_cursor {
 	const uint8_t *rgba; // straight alpha, width*height*4; NULL: hidden
 	uint16_t width, height;
@@ -50,6 +76,9 @@ struct gm_cursor {
 struct gm_callbacks {
 	void *ctx;
 	void (*video)(void *ctx, const struct gm_video_packet *packet);
+	// A frame in pieces, as the encoder writes it. A frame comes either as
+	// pieces or whole, never both. NULL: the client cannot take pieces.
+	void (*video_chunk)(void *ctx, const struct gm_video_chunk *chunk);
 	void (*audio)(void *ctx, const uint8_t *opus, size_t len, uint64_t pts_ns);
 	void (*cursor)(void *ctx, const struct gm_cursor *cursor);
 	// Each from gamescope's pointer constraint, and independent of each other and
@@ -60,6 +89,10 @@ struct gm_callbacks {
 		uint16_t bottom);
 	void (*rumble)(void *ctx, uint8_t pad, uint16_t strong, uint16_t weak,
 		uint16_t duration_ms);
+	// What the encoder is taking in, in words, whenever it changes (the
+	// buffer gamescope hands over and what the encoder makes of it). For the
+	// client's stats line; nothing depends on the wording.
+	void (*encode_format)(void *ctx, const char *text);
 };
 
 // Blocks until the child exits or gm_quit() is called. Returns an exit code.
@@ -71,11 +104,25 @@ uint64_t gm_now_ns(void);
 // (updated twice a second); 0 before gm_run starts it. For a watchdog.
 uint64_t gm_heartbeat_ns(void);
 
+// What a stream does beyond encoding every frame.
+enum gm_stream_flags {
+	// Send each frame in pieces as the encoder writes it, through
+	// gm_callbacks.video_chunk, instead of whole (AV1 only).
+	GM_STREAM_CHUNKED = 1 << 0,
+	// The client can show HDR10 (PQ, BT.2020, ten-bit). This says what the
+	// client is able to display, not what it wants: whether the session is
+	// HDR at all stays SteamOS's decision (Steam's display setting, which
+	// drives gamescope's hdr_enabled). The host only needs to know not to
+	// send HDR to a client that cannot show it.
+	GM_STREAM_HDR = 1 << 1,
+};
+
 // Streaming. Start resizes the screen to the client's mode and encodes every
-// frame from then on until stop. `packet_bytes`: the most PyroWave payload
-// per datagram (0: the default, which fits a WebTransport datagram).
+// frame from then on until stop. `packet_bytes`: the most PyroWave or video
+// chunk payload per datagram (0: the default, which fits a WebTransport
+// datagram). `flags`: enum gm_stream_flags.
 void gm_stream_start(enum gm_codec codec, int width, int height,
-	int refresh_mhz, int bitrate_kbps, int packet_bytes);
+	int refresh_mhz, int bitrate_kbps, int packet_bytes, int flags);
 void gm_stream_configure(int width, int height, int refresh_mhz);
 void gm_stream_stop(void);
 // The client's display refresh grid in host CLOCK_MONOTONIC ns: a vblank and

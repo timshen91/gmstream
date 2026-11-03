@@ -1,6 +1,9 @@
 #!/bin/sh
 # Builds GMStream.app (native macOS client) with the Command Line Tools'
-# swiftc and clang; no Xcode project. Output: mac/build/GMStream.app
+# swiftc and clang; no Xcode project. Output: mac/build/GMStream.app, which
+# is also installed to ~/Applications so it can be launched like any other
+# app. Both copies carry the same designated requirement (the bundle id), so
+# they share the Local Network permission.
 # Sources: ../apple (shared with the iPad app) and Sources (the AppKit app).
 #
 #   ./build.sh && open build/GMStream.app --args steamdeck.local
@@ -30,3 +33,11 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -o "$app/Contents/MacOS
 # survive rebuilds instead of following each build's code hash.
 codesign --force --sign - -r='designated => identifier "io.github.timshen91.gmstream"' "$app"
 echo "built $app"
+
+# Install it, so it is in Spotlight and the Dock like any other app. ditto
+# keeps the bundle's signature and extended attributes; a plain cp does not.
+installed=$HOME/Applications/GMStream.app
+mkdir -p "$HOME/Applications"
+rm -rf "$installed"
+ditto "$app" "$installed"
+echo "installed $installed"

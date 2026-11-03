@@ -33,6 +33,33 @@ impl VideoPacket {
     }
 }
 
+/// One piece of a frame's bitstream (core/gm.h).
+#[repr(C)]
+pub struct VideoChunk {
+    data: *const u8,
+    len: usize,
+    pub frame_id: u32,
+    pub offset: u32,
+    pub total: u32,
+    pub index: u16,
+    pub count: u16,
+    pub slot_ns: u64,
+    pub encoded_ns: u64,
+    /// When the frame's first piece went out (last piece only).
+    pub first_ns: u64,
+    pub width: u16,
+    pub height: u16,
+    pub keyframe: bool,
+    pub last: bool,
+    pub codec: c_int,
+}
+
+impl VideoChunk {
+    pub fn data(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
 #[repr(C)]
 pub struct Cursor {
     rgba: *const u8,
@@ -57,11 +84,13 @@ impl Cursor {
 struct GmCallbacks {
     ctx: *mut c_void,
     video: extern "C" fn(*mut c_void, *const VideoPacket),
+    video_chunk: extern "C" fn(*mut c_void, *const VideoChunk),
     audio: extern "C" fn(*mut c_void, *const u8, usize, u64),
     cursor: extern "C" fn(*mut c_void, *const Cursor),
     relative: extern "C" fn(*mut c_void, bool),
     cursor_clip: extern "C" fn(*mut c_void, u16, u16, u16, u16),
     rumble: extern "C" fn(*mut c_void, u8, u16, u16, u16),
+    encode_format: extern "C" fn(*mut c_void, *const std::os::raw::c_char),
 }
 
 #[repr(C)]
@@ -80,7 +109,15 @@ unsafe extern "C" {
     fn gm_run(config: *const GmConfig, cb: *const GmCallbacks) -> c_int;
     fn gm_now_ns() -> u64;
     fn gm_heartbeat_ns() -> u64;
-    fn gm_stream_start(codec: c_int, width: c_int, height: c_int, refresh: c_int, kbps: c_int, packet: c_int);
+    fn gm_stream_start(
+        codec: c_int,
+        width: c_int,
+        height: c_int,
+        refresh: c_int,
+        kbps: c_int,
+        packet: c_int,
+        flags: c_int,
+    );
     fn gm_stream_configure(width: c_int, height: c_int, refresh: c_int);
     fn gm_stream_stop();
     fn gm_request_keyframe();
@@ -101,11 +138,13 @@ unsafe extern "C" {
 /// What the core calls back into; implemented by the session hub.
 pub trait Sink: Sync + 'static {
     fn video(&self, packet: &VideoPacket);
+    fn video_chunk(&self, chunk: &VideoChunk);
     fn audio(&self, opus: &[u8], pts_ns: u64);
     fn cursor(&self, cursor: &Cursor);
     fn relative(&self, relative: bool);
     fn cursor_clip(&self, clip: [u16; 4]);
     fn rumble(&self, pad: u8, strong: u16, weak: u16, duration_ms: u16);
+    fn encode_format(&self, text: &str);
 }
 
 static mut SINK: Option<&'static dyn Sink> = None;
@@ -117,6 +156,9 @@ fn sink() -> &'static dyn Sink {
 
 extern "C" fn on_video(_: *mut c_void, p: *const VideoPacket) {
     sink().video(unsafe { &*p });
+}
+extern "C" fn on_video_chunk(_: *mut c_void, c: *const VideoChunk) {
+    sink().video_chunk(unsafe { &*c });
 }
 extern "C" fn on_audio(_: *mut c_void, data: *const u8, len: usize, pts: u64) {
     sink().audio(unsafe { std::slice::from_raw_parts(data, len) }, pts);
@@ -132,6 +174,16 @@ extern "C" fn on_cursor_clip(_: *mut c_void, left: u16, top: u16, right: u16, bo
 }
 extern "C" fn on_rumble(_: *mut c_void, pad: u8, strong: u16, weak: u16, ms: u16) {
     sink().rumble(pad, strong, weak, ms);
+}
+extern "C" fn on_encode_format(_: *mut c_void, text: *const std::os::raw::c_char) {
+    if text.is_null() {
+        return;
+    }
+    // The core owns the string only for this call.
+    let text = unsafe { std::ffi::CStr::from_ptr(text) };
+    if let Ok(text) = text.to_str() {
+        sink().encode_format(text);
+    }
 }
 
 pub struct Config {
@@ -167,10 +219,12 @@ pub fn run(config: &Config, sink: &'static dyn Sink) -> i32 {
     let cb = GmCallbacks {
         ctx: ptr::null_mut(),
         video: on_video,
+        video_chunk: on_video_chunk,
         audio: on_audio,
         cursor: on_cursor,
         relative: on_relative,
         cursor_clip: on_cursor_clip,
+        encode_format: on_encode_format,
         rumble: on_rumble,
     };
     unsafe { gm_run(&c, &cb) }
@@ -182,8 +236,21 @@ pub fn now_ns() -> u64 {
 pub fn heartbeat_ns() -> u64 {
     unsafe { gm_heartbeat_ns() }
 }
-/// `packet`: the most PyroWave payload per datagram (0: the default).
-pub fn stream_start(codec: u8, width: u16, height: u16, refresh_mhz: u32, kbps: u32, packet: usize) {
+/// Send each frame in pieces as the encoder writes it (AV1 only).
+pub const STREAM_CHUNKED: u32 = 1 << 0;
+pub const STREAM_HDR: u32 = 1 << 1;
+
+/// `packet`: the most PyroWave or video chunk payload per datagram (0: the
+/// default). `flags`: STREAM_* above.
+pub fn stream_start(
+    codec: u8,
+    width: u16,
+    height: u16,
+    refresh_mhz: u32,
+    kbps: u32,
+    packet: usize,
+    flags: u32,
+) {
     unsafe {
         gm_stream_start(
             codec as c_int,
@@ -192,6 +259,7 @@ pub fn stream_start(codec: u8, width: u16, height: u16, refresh_mhz: u32, kbps: 
             refresh_mhz as c_int,
             kbps as c_int,
             packet as c_int,
+            flags as c_int,
         )
     }
 }

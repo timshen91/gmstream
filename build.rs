@@ -95,6 +95,13 @@ fn main() {
     sources.sort();
     build.files(&sources).compile("gmcore");
 
+    // core/vastream.c watches the VA-API coded buffer while the GPU writes a
+    // frame's bitstream into it, which means seeing the calls FFmpeg makes.
+    // Redirecting them here keeps both libraries unpatched.
+    for f in ["vaCreateBuffer", "vaDestroyBuffer", "vaMapBuffer", "vaEndPicture", "vaSyncBuffer"] {
+        println!("cargo:rustc-link-arg=-Wl,--wrap={f}");
+    }
+
     // Static archives in one group so their order does not matter; the
     // host libraries after it.
     println!("cargo:rustc-link-arg=-Wl,--start-group");

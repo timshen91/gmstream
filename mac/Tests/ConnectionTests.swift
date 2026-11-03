@@ -130,7 +130,7 @@ final class ConnectionTests: XCTestCase {
         XCTAssertEqual(p.u32(10), 40_000)
         XCTAssertEqual(p[14], 0b1011)
         XCTAssertEqual(p[15], 3)
-        XCTAssertEqual(p[16], 0, "plain UDP sends no video flags")
+        XCTAssertEqual(p[16], 4, "plain UDP sends video as datagrams; bit 2 asks for frames in pieces")
         XCTAssertGreaterThanOrEqual(Int(p.u16(17)), maxDatagram, "max_datagram: at least the control size, from the link's MTU")
     }
 
@@ -250,6 +250,124 @@ final class ConnectionTests: XCTestCase {
         waitUntil { !recorder.snapshot.frames.isEmpty }
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         XCTAssertEqual(recorder.snapshot.frames.map(\.id), [9])
+    }
+
+    /// One piece of a frame the host is still encoding (PROTOCOL.md, type 9).
+    func videoChunk(id: UInt32, index: Int, offset: Int, _ part: Data,
+                    last: Bool = false, count: Int = 0, total: Int = 0,
+                    key: Bool = false, overlapNs: UInt32 = 0) -> Data {
+        var w = Writer()
+        w.u8(datagramVideoChunk)
+        w.u32(id)
+        w.u16(UInt16(index)); w.u16(UInt16(last ? count : 0))
+        w.u32(UInt32(offset)); w.u32(UInt32(last ? total : 0))
+        // Only the last piece carries the keyframe bit: until the encoder
+        // hands the frame back the host does not know.
+        w.u8((key && last ? 1 : 0) | (last ? 2 : 0))
+        w.u8(2) // AV1
+        w.u16(640); w.u16(360)
+        w.u64(111_000); w.u64(last ? 222_000 : 0)
+        // How much of the sending happened before the bitstream was finished.
+        w.u32(last ? overlapNs : 0)
+        XCTAssertEqual(w.data.count, videoChunkHeader)
+        return w.data + part
+    }
+
+    /// The last piece says how much of the sending happened before the
+    /// bitstream was finished, so the client can count the network's share
+    /// from the first byte out rather than from the end of the encode.
+    func testLastChunkCarriesTheOverlap() {
+        start()
+        let part = Data(repeating: 7, count: 16)
+        host.send(videoChunk(id: 3, index: 0, offset: 0, part))
+        host.send(videoChunk(id: 3, index: 1, offset: 16, part, last: true, count: 2,
+                             total: 32, overlapNs: 4_250_000))
+        waitUntil { !recorder.snapshot.frames.isEmpty }
+        let frame = recorder.snapshot.frames[0]
+        XCTAssertEqual(frame.overlapNs, 4_250_000)
+        XCTAssertEqual(frame.bitstream.count, 32)
+    }
+
+    func testChunksMakeTheFrameTheEncoderProduced() {
+        start()
+        // As the host sends it: whole chunks of what the GPU had written, then
+        // the bytes it went back and changed, then the held-back start.
+        let bitstream = Data((0..<2500).map { UInt8(($0 * 11 + 3) & 0xff) })
+        var ds: [Data] = []
+        var index = 0
+        for offset in stride(from: 128, to: 2176, by: 512) {
+            // What the GPU had written at the time, with the OBU size fields
+            // it had not filled in yet.
+            var early = bitstream.subdata(in: offset..<offset + 512)
+            early[early.startIndex] = 0
+            early[early.startIndex + 1] = 0
+            ds.append(videoChunk(id: 3, index: index, offset: offset, early))
+            index += 1
+        }
+        for offset in stride(from: 128, to: 2176, by: 512) {
+            ds.append(videoChunk(id: 3, index: index, offset: offset,
+                                 bitstream.subdata(in: offset..<offset + 2)))
+            index += 1
+        }
+        ds.append(videoChunk(id: 3, index: index, offset: 2176,
+                             bitstream.subdata(in: 2176..<2500)))
+        index += 1
+        ds.append(videoChunk(id: 3, index: index, offset: 0,
+                             bitstream.subdata(in: 0..<128),
+                             last: true, count: index + 1, total: 2500, key: true))
+        for d in ds { host.send(d) }
+        waitUntil { !recorder.snapshot.frames.isEmpty }
+        let frames = recorder.snapshot.frames
+        XCTAssertEqual(frames.count, 1)
+        XCTAssertEqual(frames[0].id, 3)
+        XCTAssertTrue(frames[0].key)
+        XCTAssertEqual(frames[0].codec, 2)
+        XCTAssertEqual(frames[0].width, 640)
+        XCTAssertEqual(frames[0].height, 360)
+        XCTAssertEqual(frames[0].slotNs, 111_000)
+        XCTAssertEqual(frames[0].encodedNs, 222_000)
+        XCTAssertEqual(frames[0].bitstream, bitstream, "byte for byte what the encoder produced")
+    }
+
+    func testAChunkThatRanPastTheEndOfTheFrameIsTrimmed() {
+        start()
+        // The GPU writes in blocks, so the last whole chunk can carry padding
+        // past the end of the bitstream.
+        let bitstream = Data((0..<300).map { UInt8($0 & 0xff) })
+        host.send(videoChunk(id: 4, index: 0, offset: 128,
+                             bitstream.subdata(in: 128..<300) + Data(repeating: 0xee, count: 84)))
+        host.send(videoChunk(id: 4, index: 1, offset: 0, bitstream.subdata(in: 0..<128),
+                             last: true, count: 2, total: 300))
+        waitUntil { !recorder.snapshot.frames.isEmpty }
+        XCTAssertEqual(recorder.snapshot.frames.first?.bitstream, bitstream)
+    }
+
+    func testChunksArriveInAnyOrderAndLaterOnesWin() {
+        start()
+        let bitstream = Data((0..<256).map { UInt8($0) })
+        let last = videoChunk(id: 5, index: 2, offset: 0, bitstream.subdata(in: 0..<128),
+                              last: true, count: 3, total: 256)
+        let fixup = videoChunk(id: 5, index: 1, offset: 128, bitstream.subdata(in: 128..<130))
+        let early = videoChunk(id: 5, index: 0, offset: 128,
+                               Data([0, 0]) + bitstream.subdata(in: 130..<256))
+        for d in [last, fixup, early] { host.send(d) }
+        waitUntil { !recorder.snapshot.frames.isEmpty }
+        XCTAssertEqual(recorder.snapshot.frames.first?.bitstream, bitstream,
+                       "the fixup is at a higher index, so it is laid down after")
+    }
+
+    func testAFrameMissingAChunkIsNeverDelivered() {
+        start()
+        let bitstream = Data((0..<600).map { UInt8($0 & 0xff) })
+        host.send(videoChunk(id: 6, index: 0, offset: 128, bitstream.subdata(in: 128..<400)))
+        // Index 1 (400..<600) never arrives.
+        host.send(videoChunk(id: 6, index: 2, offset: 0, bitstream.subdata(in: 0..<128),
+                             last: true, count: 3, total: 600))
+        host.send(videoChunk(id: 7, index: 0, offset: 0, bitstream.subdata(in: 0..<128),
+                             last: true, count: 1, total: 128))
+        waitUntil { !recorder.snapshot.frames.isEmpty }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(recorder.snapshot.frames.map(\.id), [7])
     }
 
     func testAudioAndPyroWaveDatagrams() {

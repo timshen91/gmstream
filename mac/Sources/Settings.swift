@@ -24,6 +24,7 @@ final class SettingsWindow: NSObject {
     private let immediate = NSButton(checkboxWithTitle: "Vsync off in full screen (may tear)", target: nil, action: nil)
     private let vivid = NSButton(checkboxWithTitle: "Vivid colors (display's full gamut, as on Windows)", target: nil, action: nil)
     private let awake = NSButton(checkboxWithTitle: "Keep Wi-Fi awake (60 tiny packets/s to the host)", target: nil, action: nil)
+    private let streamFrames = NSButton(checkboxWithTitle: "Take AV1 frames as the host encodes them", target: nil, action: nil)
     private let cursorMode = NSPopUpButton()
     private let mouseMode = NSPopUpButton()
     private let confinement = NSPopUpButton()
@@ -65,7 +66,7 @@ final class SettingsWindow: NSObject {
             field.target = self
             field.action = #selector(changed(_:))
         }
-        for control in [codec, refresh, stats, immediate, pacingMode, vrrMode, pacing, hold, vivid, awake, cursorMode, mouseMode, confinement] as [NSControl] {
+        for control in [codec, refresh, stats, immediate, pacingMode, vrrMode, pacing, hold, vivid, awake, streamFrames, cursorMode, mouseMode, confinement] as [NSControl] {
             control.target = self
             control.action = #selector(changed(_:))
         }
@@ -98,6 +99,7 @@ final class SettingsWindow: NSObject {
             row("VRR:", vrrMode, nil),
             [NSGridCell.emptyContentView, vivid],
             [NSGridCell.emptyContentView, awake],
+            [NSGridCell.emptyContentView, streamFrames],
             row("Cursor:", cursorMode, nil),
             row("Mouse:", mouseMode, nil),
             row("Confinement:", confinement, nil),
@@ -143,6 +145,7 @@ final class SettingsWindow: NSObject {
         stats.state = options.showStats ? .on : .off
         vivid.state = options.vividColors ? .on : .off
         awake.state = options.keepWiFiAwake ? .on : .off
+        streamFrames.state = options.streamFrames ? .on : .off
         cursorMode.selectItem(at: options.cursorMode.rawValue)
         mouseMode.selectItem(at: options.mouseMode.rawValue)
         confinement.selectItem(at: options.confinement.rawValue)
@@ -214,6 +217,10 @@ final class SettingsWindow: NSObject {
         case awake:
             options.keepWiFiAwake = awake.state == .on
             change = .keepAwake
+        case streamFrames:
+            // The host is told in Hello, so the stream starts over.
+            options.streamFrames = streamFrames.state == .on
+            change = .connection
         case cursorMode:
             options.cursorMode = CursorMode(rawValue: cursorMode.indexOfSelectedItem) ?? .auto
             change = .cursor

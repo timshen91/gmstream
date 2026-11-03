@@ -11,6 +11,12 @@
 //
 // The worker holds at most one pending frame; a newer frame replaces it
 // (counted as dropped). Nothing on the compositor thread waits for the GPU.
+//
+// For AV1, a client that takes pieces gets each frame as the GPU writes it
+// (vastream.c): the encoder is told to split the frame into tile groups, and
+// each piece of the bitstream goes out while the rest is still being encoded,
+// so the frame is on the wire before it is finished. The bytes are the
+// encoder's own, from the same single encode call.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -77,6 +83,7 @@ struct gm_encoder {
 	struct job pending;
 	enum gm_codec codec;
 	int bitrate_kbps, refresh_mhz;
+	int stream_flags;
 	unsigned settings_gen; // bumped whenever the encoder must be reopened
 	bool keyframe;
 	unsigned stats_encoded, stats_dropped;
@@ -84,7 +91,12 @@ struct gm_encoder {
 
 	// PyroWave runs instead of VA-API while it is the session's codec.
 	struct gm_pyrowave *pw;
-	bool pw_active; // compositor thread
+	// So does the Vulkan AV1 encoder, for AV1 (vkencode.c). The VA-API path
+	// below stays as the reference: GM_AV1_VAAPI picks it instead.
+	struct gm_vkencode *vk;
+	unsigned vk_frames, vk_chunks, vk_patched;
+	double vk_first_ms;
+	bool pw_active, vk_active; // compositor thread
 
 	// Worker thread only. Frame ids run on across encoder sessions so the
 	// client can tell a gap from a restart.
@@ -346,6 +358,10 @@ void encoder_submit(struct gm_encoder *enc, struct wlr_buffer *buffer,
 		pyrowave_submit(enc->pw, buffer, width, height, slot_ns);
 		return;
 	}
+	if (enc->vk_active) {
+		vkencode_submit(enc->vk, buffer, width, height, slot_ns);
+		return;
+	}
 	pthread_mutex_lock(&enc->lock);
 	bool active = enc->active;
 	pthread_mutex_unlock(&enc->lock);
@@ -439,6 +455,15 @@ static bool session_open(struct gm_encoder *enc, struct session *s,
 			break;
 		case GM_CODEC_AV1:
 			ctx->profile = AV_PROFILE_AV1_MAIN;
+			if (vastream_enabled()) {
+				// Tile groups are the frame's cut points: each is its own OBU,
+				// so a piece of the bitstream is a piece of the picture. Four
+				// rows cost nothing measurable in bytes or in encode time.
+				const char *tiles = getenv("GM_AV1_TILES");
+				const char *groups = getenv("GM_AV1_TILE_GROUPS");
+				av_opt_set(ctx->priv_data, "tiles", tiles ? tiles : "1x4", 0);
+				av_opt_set(ctx->priv_data, "tile_groups", groups ? groups : "4", 0);
+			}
 			break;
 		case GM_CODEC_PYROWAVE:
 			break; // not a VA-API codec (pyrowave.c)
@@ -474,32 +499,50 @@ static void encode_one(struct gm_encoder *enc, struct session *s,
 		frame->pict_type = AV_PICTURE_TYPE_I;
 		frame->flags |= AV_FRAME_FLAG_KEY;
 	}
+	// The id is taken before the frame is encoded, so the pieces of it that
+	// go out during the encode can carry it.
+	uint32_t frame_id = enc->next_frame_id++;
+	vastream_begin(frame_id, job->slot_ns, (uint16_t)s->ctx->width,
+		(uint16_t)s->ctx->height, s->codec);
 	uint64_t start = gm_now_ns();
 	int ret = avcodec_send_frame(s->ctx, frame);
 	if (ret < 0) {
 		wlr_log(WLR_ERROR, "avcodec_send_frame: %s", av_err2str(ret));
+		vastream_end(NULL, 0, 0, false);
 		return;
 	}
+	bool first = true;
 	while ((ret = avcodec_receive_packet(s->ctx, s->packet)) == 0) {
 		uint64_t done = gm_now_ns();
-		struct gm_video_packet out = {
-			.data = s->packet->data,
-			.len = (size_t)s->packet->size,
-			.frame_id = enc->next_frame_id++,
-			.slot_ns = (uint64_t)s->packet->pts * 1000,
-			.encoded_ns = done,
-			.width = (uint16_t)s->ctx->width,
-			.height = (uint16_t)s->ctx->height,
-			.keyframe = (s->packet->flags & AV_PKT_FLAG_KEY) != 0,
-			.codec = s->codec,
-		};
-		enc->cb->video(enc->cb->ctx, &out);
+		// Only the first packet is the frame the pieces belong to; a second
+		// one (there is none without reordering) is sent whole.
+		bool key = (s->packet->flags & AV_PKT_FLAG_KEY) != 0;
+		bool streamed = first && vastream_end(s->packet->data,
+			(size_t)s->packet->size, done, key);
+		if (!streamed) {
+			struct gm_video_packet out = {
+				.data = s->packet->data,
+				.len = (size_t)s->packet->size,
+				.frame_id = first ? frame_id : enc->next_frame_id++,
+				.slot_ns = (uint64_t)s->packet->pts * 1000,
+				.encoded_ns = done,
+				.width = (uint16_t)s->ctx->width,
+				.height = (uint16_t)s->ctx->height,
+				.keyframe = key,
+				.codec = s->codec,
+			};
+			enc->cb->video(enc->cb->ctx, &out);
+		}
+		first = false;
 		av_packet_unref(s->packet);
 
 		pthread_mutex_lock(&enc->lock);
 		enc->stats_encoded++;
 		enc->stats_encode_ns += done - start;
 		pthread_mutex_unlock(&enc->lock);
+	}
+	if (first) {
+		vastream_end(NULL, 0, 0, false); // no packet: nothing to finish
 	}
 	if (ret != AVERROR(EAGAIN)) {
 		wlr_log(WLR_ERROR, "avcodec_receive_packet: %s", av_err2str(ret));
@@ -634,6 +677,12 @@ struct gm_encoder *encoder_create(int drm_fd, const struct gm_callbacks *cb) {
 	if (enc->pw != NULL) {
 		enc->supported |= 1u << GM_CODEC_PYROWAVE;
 	}
+	if (getenv("GM_AV1_VAAPI") == NULL) {
+		enc->vk = vkencode_create(cb);
+	}
+	if (enc->vk != NULL) {
+		enc->supported |= 1u << GM_CODEC_AV1;
+	}
 
 	pthread_mutex_init(&enc->lock, NULL);
 	pthread_cond_init(&enc->cond, NULL);
@@ -662,6 +711,7 @@ void encoder_destroy(struct gm_encoder *enc) {
 	pthread_mutex_unlock(&enc->lock);
 	pthread_join(enc->thread, NULL);
 	av_frame_free(&enc->pending.frame);
+	vkencode_destroy(enc->vk);
 	pyrowave_destroy(enc->pw);
 
 	struct import *imp, *tmp;
@@ -686,7 +736,29 @@ uint32_t encoder_supported_codecs(struct gm_encoder *enc) {
 }
 
 void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
-		int bitrate_kbps, int refresh_mhz, int packet_bytes) {
+		int bitrate_kbps, int refresh_mhz, int packet_bytes, int flags) {
+	// Pieces of a frame are an AV1 thing: it is the only codec whose
+	// bitstream the GPU writes into a buffer we can watch.
+	bool vk_av1 = codec == GM_CODEC_AV1 && enc->vk != NULL;
+	vastream_configure(enc->cb, codec == GM_CODEC_AV1 && !vk_av1 &&
+		(flags & GM_STREAM_CHUNKED) != 0, (unsigned)packet_bytes);
+	enc->vk_active = vk_av1;
+	if (vk_av1) {
+		vkencode_start(enc->vk, bitrate_kbps, refresh_mhz, packet_bytes, flags);
+		if (enc->pw != NULL) {
+			pyrowave_stop(enc->pw);
+		}
+		enc->pw_active = false;
+		pthread_mutex_lock(&enc->lock);
+		enc->active = false; // the VA-API worker closes its session
+		av_frame_free(&enc->pending.frame);
+		pthread_cond_signal(&enc->cond);
+		pthread_mutex_unlock(&enc->lock);
+		return;
+	}
+	if (enc->vk != NULL) {
+		vkencode_stop(enc->vk);
+	}
 	enc->pw_active = codec == GM_CODEC_PYROWAVE && enc->pw != NULL;
 	if (enc->pw_active) {
 		pyrowave_start(enc->pw, bitrate_kbps, refresh_mhz, packet_bytes);
@@ -705,15 +777,20 @@ void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 	enc->codec = codec;
 	enc->bitrate_kbps = bitrate_kbps;
 	enc->refresh_mhz = refresh_mhz;
+	enc->stream_flags = flags;
 	enc->settings_gen++;
 	pthread_mutex_unlock(&enc->lock);
 }
 
 void encoder_stop(struct gm_encoder *enc) {
+	vastream_configure(enc->cb, false, 0);
 	if (enc->pw != NULL) {
 		pyrowave_stop(enc->pw);
 	}
-	enc->pw_active = false;
+	if (enc->vk != NULL) {
+		vkencode_stop(enc->vk);
+	}
+	enc->pw_active = enc->vk_active = false;
 	pthread_mutex_lock(&enc->lock);
 	enc->active = false;
 	av_frame_free(&enc->pending.frame);
@@ -724,6 +801,9 @@ void encoder_stop(struct gm_encoder *enc) {
 void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps) {
 	if (enc->pw != NULL) {
 		pyrowave_set_rate(enc->pw, bitrate_kbps, 0);
+	}
+	if (enc->vk != NULL) {
+		vkencode_set_rate(enc->vk, bitrate_kbps, 0);
 	}
 	pthread_mutex_lock(&enc->lock);
 	if (enc->bitrate_kbps != bitrate_kbps) {
@@ -737,6 +817,9 @@ void encoder_set_refresh(struct gm_encoder *enc, int refresh_mhz) {
 	if (enc->pw != NULL) {
 		pyrowave_set_rate(enc->pw, 0, refresh_mhz);
 	}
+	if (enc->vk != NULL) {
+		vkencode_set_rate(enc->vk, 0, refresh_mhz);
+	}
 	pthread_mutex_lock(&enc->lock);
 	if (enc->refresh_mhz != refresh_mhz) {
 		enc->refresh_mhz = refresh_mhz;
@@ -746,6 +829,9 @@ void encoder_set_refresh(struct gm_encoder *enc, int refresh_mhz) {
 }
 
 void encoder_request_keyframe(struct gm_encoder *enc) {
+	if (enc->vk != NULL) {
+		vkencode_request_keyframe(enc->vk);
+	}
 	pthread_mutex_lock(&enc->lock);
 	enc->keyframe = true;
 	pthread_mutex_unlock(&enc->lock);
@@ -766,9 +852,39 @@ void encoder_take_stats(struct gm_encoder *enc, unsigned *encoded,
 		*encoded = enc->stats_encoded;
 		*dropped = enc->stats_dropped;
 	}
+	if (enc->vk != NULL) {
+		// The chunk counters are kept for encoder_take_chunk_stats, which the
+		// stats line reads right after this one.
+		unsigned ve, vd;
+		uint64_t vns;
+		vkencode_take_stats(enc->vk, &ve, &vd, &vns, &enc->vk_chunks,
+			&enc->vk_patched, &enc->vk_first_ms);
+		enc->vk_frames = ve;
+		enc->stats_encoded += ve;
+		enc->stats_dropped += vd;
+		enc->stats_encode_ns += vns;
+		*encoded = enc->stats_encoded;
+		*dropped = enc->stats_dropped;
+	}
 	*avg_encode_ms = enc->stats_encoded > 0 ?
 		(double)enc->stats_encode_ns / enc->stats_encoded / 1e6 : 0;
 	enc->stats_encoded = enc->stats_dropped = 0;
 	enc->stats_encode_ns = 0;
 	pthread_mutex_unlock(&enc->lock);
+}
+
+void encoder_take_chunk_stats(struct gm_encoder *enc, unsigned *frames,
+		unsigned *chunks, unsigned *patched, double *first_ms, double *last_ms) {
+	vastream_take_stats(frames, chunks, patched, first_ms, last_ms);
+	if (enc->vk_frames > 0) {
+		// The Vulkan encoder's own pieces: it has no separate "bitstream done"
+		// figure, since the encode time in the line above is exactly that.
+		*frames = enc->vk_frames;
+		*chunks = enc->vk_chunks;
+		*patched = enc->vk_patched;
+		*first_ms = enc->vk_first_ms;
+		*last_ms = 0;
+		enc->vk_frames = enc->vk_chunks = enc->vk_patched = 0;
+		enc->vk_first_ms = 0;
+	}
 }

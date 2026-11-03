@@ -21,6 +21,14 @@ final class FrameTiming {
     let presentLocal: UInt64?     // the same, in ours
     let encodedLocal: UInt64?     // bitstream ready
     let received: UInt64          // last fragment arrived
+    /// When the frame's first datagram reached the kernel. A frame the host
+    /// sends in pieces as it encodes it starts arriving before it is
+    /// finished, so this is earlier than encodedLocal; a whole frame cannot
+    /// start arriving until it is finished, so it is later.
+    let firstReceived: UInt64
+    /// How long before the bitstream was finished the host sent the frame's
+    /// first piece. Nothing for a frame sent whole.
+    let overlapNs: UInt64
     var decodeStart: UInt64 = 0
     var decoded: UInt64 = 0
     var released: UInt64 = 0      // left the hold (= taken to draw, without one)
@@ -29,16 +37,21 @@ final class FrameTiming {
     var drawn: UInt64 = 0         // the GPU finished drawing it (GM_DEBUG_FLIP)
     var presented: UInt64 = 0     // on screen
 
-    init(slotNs: UInt64, encodedNs: UInt64, received: UInt64, toLocal: (UInt64) -> UInt64?) {
+    init(slotNs: UInt64, encodedNs: UInt64, received: UInt64,
+         firstReceived: UInt64 = 0, overlapNs: UInt64 = 0,
+         toLocal: (UInt64) -> UInt64?) {
+        self.overlapNs = overlapNs
         encodeNs = encodedNs &- slotNs
         presentHost = slotNs
         presentLocal = toLocal(slotNs)
         encodedLocal = toLocal(encodedNs)
         self.received = received
+        self.firstReceived = firstReceived
     }
 
     convenience init(frame f: Frame, toLocal: (UInt64) -> UInt64?) {
-        self.init(slotNs: f.slotNs, encodedNs: f.encodedNs, received: f.receivedNs, toLocal: toLocal)
+        self.init(slotNs: f.slotNs, encodedNs: f.encodedNs, received: f.receivedNs,
+                  firstReceived: f.firstNs, overlapNs: f.overlapNs, toLocal: toLocal)
     }
 
     /// Measuring (GM_DEBUG_FRAMES): one line per frame shown ("shown") or
@@ -46,7 +59,7 @@ final class FrameTiming {
     static let debug = getenv("GM_DEBUG_FRAMES") != nil
     static let debugFlip = getenv("GM_DEBUG_FLIP") != nil
     func log(_ what: String) {
-        FileHandle.standardError.write("frame \(what) \(presentLocal ?? 0) \(encodedLocal ?? 0) \(received) \(decodeStart) \(decoded) \(submitted) \(presented) \(released) \(presentHost)\n".data(using: .utf8)!)
+        FileHandle.standardError.write("frame \(what) \(presentLocal ?? 0) \(encodedLocal ?? 0) \(received) \(decodeStart) \(decoded) \(submitted) \(presented) \(released) \(presentHost) \(firstReceived)\n".data(using: .utf8)!)
     }
 }
 
@@ -82,8 +95,55 @@ final class Decoder {
     /// BGRA (an extra conversion pass in VideoToolbox).
     var yuv = true
 
+    /// The stream is HDR10 (PQ), from the sequence header. It decides the
+    /// whole of what this client asks for: ten-bit output and an HDR layer
+    /// for HDR, eight-bit for everything else, whatever depth the host
+    /// happens to be sending. Asking for the other one only buys a
+    /// conversion inside VideoToolbox (about 3 ms a frame at 4K), and for
+    /// SDR there is nothing in the extra bits to show.
+    private(set) var hdr = false
+
     /// This device decodes AV1 in hardware (M3 and later).
     static let hasAV1 = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+
+    /// What this decoder is being fed and what it is asked to give back, for
+    /// the stats line: the two have to agree or VideoToolbox converts.
+    private(set) var inputSummary = "no stream"
+
+    private func summarize(_ codec: Codec, _ config: AV1Config?) {
+        let stream = switch codec {
+        case .h264: "H.264 8-bit"
+        case .hevc: "HEVC 8-bit"
+        case .av1: config.map { "AV1 \($0.tenBit ? 10 : 8)-bit \($0.transfer == 16 ? "PQ" : "BT.709")" }
+            ?? "AV1"
+        }
+        let out = hdr ? "10-bit NV12" : yuv ? "8-bit NV12" : "BGRA"
+        inputSummary = "\(stream) → \(out)"
+    }
+
+    /// Measuring (GM_DEBUG_HDR): the ten-bit planes' range, once, which says
+    /// whether the decoder leaves the bits high or low in each 16-bit word.
+    static let debugHDR = getenv("GM_DEBUG_HDR") != nil
+    private var loggedRange = false
+
+    func logRange(_ b: CVPixelBuffer) {
+        guard Self.debugHDR, !loggedRange else { return }
+        loggedRange = true
+        CVPixelBufferLockBaseAddress(b, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(b, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(b, 0) else { return }
+        let w = CVPixelBufferGetWidthOfPlane(b, 0), h = CVPixelBufferGetHeightOfPlane(b, 0)
+        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(b, 0)
+        var lo = UInt16.max, hi = UInt16.min
+        for y in stride(from: 0, to: h, by: 8) {
+            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt16.self)
+            for x in stride(from: 0, to: w, by: 8) {
+                lo = min(lo, row[x]); hi = max(hi, row[x])
+            }
+        }
+        NSLog("gmstream: luma 16-bit words %u..%u (format %@)", lo, hi,
+              String(format: "%08x", CVPixelBufferGetPixelFormatType(b)))
+    }
 
     /// Called with each decoded image and how many of its rows to show (on
     /// the decoder's thread). The host's AV1 encoder (AMD VCN) pads some
@@ -110,7 +170,10 @@ final class Decoder {
         let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: buffer, flags: [], infoFlagsOut: nil) {
             [weak self] status, _, image, _, _ in
             timing.decoded = nowNs()
-            if status == noErr, let image { self?.onDecoded(image, frame.height, timing) }
+            if status == noErr, let image {
+                self?.logRange(image)
+                self?.onDecoded(image, frame.height, timing)
+            }
         }
         if status == kVTInvalidSessionErr {
             VTDecompressionSessionInvalidate(session)
@@ -157,7 +220,12 @@ final class Decoder {
 
     private func makeSession(_ format: CMVideoFormatDescription) -> VTDecompressionSession? {
         let spec = [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true] as CFDictionary
-        let attrs = [kCVPixelBufferPixelFormatTypeKey: yuv ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA,
+        // Ten-bit with HDR, eight-bit without. Never the host's depth: this
+        // is what the client can use.
+        let pixelFormat = hdr ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            : yuv ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            : kCVPixelFormatType_32BGRA
+        let attrs = [kCVPixelBufferPixelFormatTypeKey: pixelFormat,
                      kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary
         var s: VTDecompressionSession?
         guard VTDecompressionSessionCreate(allocator: nil, formatDescription: format, decoderSpecification: spec,
@@ -191,6 +259,8 @@ final class Decoder {
         var format: CMVideoFormatDescription?
         if codec == .av1 {
             guard let config = AV1Config(sequenceHeader: params[0]) else { return nil }
+            hdr = config.transfer == 16 // SMPTE ST 2084, i.e. HDR10
+            summarize(codec, config)
             let atoms = ["av1C": config.av1C] as CFDictionary
             let extensions = [kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms] as CFDictionary
             let status = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_AV1,
@@ -246,6 +316,18 @@ final class MetalRenderer {
     private let yuvPipeline: MTLRenderPipelineState  // NV12
     private let planarPipeline: MTLRenderPipelineState // PyroWave: Y, Cb, Cr
     private let overlayPipeline: MTLRenderPipelineState // premultiplied, blended
+    // HDR10: the layer becomes ten-bit PQ, and a pipeline's attachment format
+    // has to match the layer's, so these are built the first time one arrives.
+    private let library: MTLLibrary
+    private var hdrPipeline: MTLRenderPipelineState?
+    private var hdrOverlayPipeline: MTLRenderPipelineState?
+    private var hdrOn = false
+    /// Set from the decoder thread; applied on the render thread, where the
+    /// layer belongs.
+    var wantsHDR = false
+    /// Ten bits sampled from a 16-bit texture: 1 if the decoder leaves them
+    /// in the high bits, 64 if in the low ones (GM_HDR_SCALE overrides).
+    private let hdrScale: Float = Float(ProcessInfo.processInfo.environment["GM_HDR_SCALE"].flatMap { Float($0) } ?? 1)
     private var cache: CVMetalTextureCache?
     private let cond = NSCondition()
     // Decoded frames not drawn yet: at most one without a hold.
@@ -304,6 +386,18 @@ final class MetalRenderer {
             float u = cb.sample(s, in.uv).r - 0.5, v = cr.sample(s, in.uv).r - 0.5;
             return float4(l + 1.5748 * v, l - 0.1873 * u - 0.4681 * v, l + 1.8556 * u, 1);
         }
+        // HDR10: ten-bit NV12, BT.2020 limited range, PQ. The values stay
+        // PQ-encoded — the layer is tagged PQ, so macOS maps them to the
+        // display's headroom itself.
+        fragment float4 fsHdr(V in [[stage_in]], texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],
+                              constant float &scale [[buffer(0)]]) {
+            constexpr sampler s(filter::linear);
+            float y = (luma.sample(s, in.uv).r * scale - 64.0 / 1023.0) * (1023.0 / 876.0);
+            float2 c = (chroma.sample(s, in.uv).rg * scale - 512.0 / 1023.0) * (1023.0 / 896.0);
+            return float4(y + 1.4746 * c.y,
+                          y - 0.16455 * c.x - 0.57135 * c.y,
+                          y + 1.8814 * c.x, 1);
+        }
         // NV12, BT.709 limited range (what the host encodes).
         fragment float4 fsYuv(V in [[stage_in]], texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]]) {
             constexpr sampler s(filter::linear);
@@ -346,6 +440,7 @@ final class MetalRenderer {
         self.yuvPipeline = yuvPipeline
         self.planarPipeline = planarPipeline
         self.overlayPipeline = overlayPipeline
+        self.library = library
         CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
         layer.device = device
         layer.pixelFormat = .bgra8Unorm
@@ -530,6 +625,7 @@ final class MetalRenderer {
     }
 
     private func renderOne() {
+        applyHDR(wantsHDR)
         // May wait for a free drawable (display refresh)...
         guard let drawable = layer.nextDrawable() else { return }
         // ...during which a frame may have come in that is not due yet (the
@@ -562,6 +658,38 @@ final class MetalRenderer {
         draw(image, timing, drawable)
     }
 
+    /// Puts the layer into (or out of) HDR10. Render thread only, and never
+    /// while a drawable is outstanding.
+    private func applyHDR(_ on: Bool) {
+        if on == hdrOn {
+            return
+        }
+        if on && hdrPipeline == nil {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = library.makeFunction(name: "vs")
+            desc.fragmentFunction = library.makeFunction(name: "fsHdr")
+            desc.colorAttachments[0].pixelFormat = .bgr10a2Unorm
+            hdrPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+            desc.fragmentFunction = library.makeFunction(name: "fsOverlay")
+            desc.colorAttachments[0].isBlendingEnabled = true
+            desc.colorAttachments[0].sourceRGBBlendFactor = .one
+            desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            hdrOverlayPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+            if hdrPipeline == nil || hdrOverlayPipeline == nil {
+                return
+            }
+        }
+        hdrOn = on
+        layer.pixelFormat = on ? .bgr10a2Unorm : .bgra8Unorm
+        #if os(macOS)
+        layer.colorspace = on ? CGColorSpace(name: CGColorSpace.itur_2100_PQ) : nil
+        layer.wantsExtendedDynamicRangeContent = on
+        #endif
+        NSLog("gmstream: %@", on ? "HDR10 layer (ten-bit PQ)" : "SDR layer")
+    }
+
     /// Draws `image` (nil: black) and the overlay; `timing` nil for a repaint.
     private func draw(_ image: DecodedImage?, _ timing: FrameTiming?, _ drawable: CAMetalDrawable) {
         let w: Int, h: Int
@@ -579,10 +707,13 @@ final class MetalRenderer {
             w = CVPixelBufferGetWidth(buffer); h = CVPixelBufferGetHeight(buffer)
             if height > 0 && height < h { shown = height }
             let yuv = CVPixelBufferGetPlaneCount(buffer) == 2
+            let ten = CVPixelBufferGetPixelFormatType(buffer) ==
+                kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             // Metal views of the decoder's buffer (no copy): one BGRA plane, or
-            // NV12's luma and half-size interleaved chroma.
+            // NV12's luma and half-size interleaved chroma, eight or ten bit.
             let planes: [(MTLPixelFormat, Int, Int)] = yuv
-                ? [(.r8Unorm, w, h), (.rg8Unorm, CVPixelBufferGetWidthOfPlane(buffer, 1), CVPixelBufferGetHeightOfPlane(buffer, 1))]
+                ? [(ten ? .r16Unorm : .r8Unorm, w, h),
+                   (ten ? .rg16Unorm : .rg8Unorm, CVPixelBufferGetWidthOfPlane(buffer, 1), CVPixelBufferGetHeightOfPlane(buffer, 1))]
                 : [(.bgra8Unorm, w, h)]
             for (i, (format, pw, ph)) in planes.enumerated() {
                 var t: CVMetalTexture?
@@ -592,7 +723,8 @@ final class MetalRenderer {
             }
             textures = cvTextures.compactMap(CVMetalTextureGetTexture)
             guard textures.count == planes.count else { return }
-            pipeline = yuv ? yuvPipeline : self.pipeline
+            pipeline = ten && hdrOn ? (hdrPipeline ?? yuvPipeline)
+                : yuv ? yuvPipeline : self.pipeline
         }
         guard let cb = drawQueue.makeCommandBuffer() else { return }
         let pass = MTLRenderPassDescriptor()
@@ -613,6 +745,8 @@ final class MetalRenderer {
                 enc.setScissorRect(MTLScissorRect(x: Int(x), y: Int(y), width: Int(vw.rounded()), height: Int(vh.rounded())))
             }
             enc.setRenderPipelineState(pipeline)
+            var scale = hdrScale
+            enc.setFragmentBytes(&scale, length: MemoryLayout<Float>.size, index: 0)
             for (i, t) in textures.enumerated() { enc.setFragmentTexture(t, index: i) }
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         }
@@ -641,7 +775,7 @@ final class MetalRenderer {
             if x1 > x0 && y1 > y0 {
                 enc.setViewport(MTLViewport(originX: x, originY: y, width: cw, height: ch, znear: 0, zfar: 1))
                 enc.setScissorRect(MTLScissorRect(x: Int(x0), y: Int(y0), width: Int(x1 - x0), height: Int(y1 - y0)))
-                enc.setRenderPipelineState(overlayPipeline)
+                enc.setRenderPipelineState(hdrOn ? (hdrOverlayPipeline ?? overlayPipeline) : overlayPipeline)
                 enc.setFragmentTexture(cursor.texture, index: 0)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
@@ -652,7 +786,7 @@ final class MetalRenderer {
             if ow > 0 && oh > 0 {
                 enc.setViewport(MTLViewport(originX: x, originY: inset, width: Double(overlay.width), height: Double(overlay.height), znear: 0, zfar: 1))
                 enc.setScissorRect(MTLScissorRect(x: Int(x), y: Int(inset), width: Int(ow), height: Int(oh)))
-                enc.setRenderPipelineState(overlayPipeline)
+                enc.setRenderPipelineState(hdrOn ? (hdrOverlayPipeline ?? overlayPipeline) : overlayPipeline)
                 enc.setFragmentTexture(overlay, index: 0)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }

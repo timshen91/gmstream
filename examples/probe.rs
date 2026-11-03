@@ -2,7 +2,7 @@
 //! audio for a while, prints timing statistics and writes the bitstream.
 //! Run it on the host itself to get exact latencies (same clock).
 //!
-//!   probe [-1 FLAGS (Hello flags: 1 one video stream, 2 video datagrams)] [-C X,Y (click)] [-k KEYS] [-g PAD_BUTTONS] [-x N (stress reconfiguration)] [-m 0 (no pointer motion)] [-c h264|hevc|av1|pyrowave] [-s WxH] [-r HZ] [-b KBPS] [-v 0|1|2 (VrrPolicy)] [-t SECONDS] [-o FILE] HOST:PORT
+//!   probe [-H (print each frame's hash)] [-1 FLAGS (Hello flags: 1 one video stream, 2 video datagrams, 4 frames in pieces as the host encodes them)] [-C X,Y (click)] [-k KEYS] [-g PAD_BUTTONS] [-x N (stress reconfiguration)] [-m 0 (no pointer motion)] [-c h264|hevc|av1|pyrowave] [-s WxH] [-r HZ] [-b KBPS] [-v 0|1|2 (VrrPolicy)] [-t SECONDS] [-o FILE] HOST:PORT
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -21,6 +21,47 @@ fn message(ty: u8, payload: &[u8]) -> Vec<u8> {
     m.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     m.extend_from_slice(payload);
     m
+}
+
+/// FNV-1a, to compare with the host's hash of the frame it encoded.
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in data {
+        h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Whether `data` is a chain of AV1 OBUs that ends exactly at its last byte.
+fn av1_obus_tile(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i < data.len() {
+        let header = data[i];
+        if header & 0x80 != 0 {
+            return false; // the forbidden bit
+        }
+        let mut p = i + if header & 0x04 != 0 { 2 } else { 1 };
+        let mut size = data.len().saturating_sub(p);
+        if header & 0x02 != 0 {
+            size = 0;
+            for shift in 0..8 {
+                if p >= data.len() {
+                    return false;
+                }
+                size |= ((data[p] & 0x7f) as usize) << (7 * shift);
+                let more = data[p] & 0x80 != 0;
+                p += 1;
+                if !more {
+                    break;
+                }
+            }
+        }
+        if p + size > data.len() {
+            return false;
+        }
+        i = p + size;
+    }
+    i == data.len() && !data.is_empty()
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -81,6 +122,9 @@ async fn main() -> Result<()> {
     };
     // -g BUTTONS: tap these standard-gamepad buttons on pad 0, 600 ms apart.
     let pad_buttons: Vec<u32> = opt("-g", "").split(',').filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect();
+    // -H: print each frame's size and FNV-1a hash, to check against the
+    // host's own (core/vastream.c, GM_DEBUG_CHUNKS).
+    let hashes = args.iter().position(|a| a == "-H").map(|i| args.remove(i)).is_some();
     let [addr] = &args[..] else { bail!("usage: probe [opts] HOST:PORT") };
 
     let config = ClientConfig::builder().with_bind_default().with_no_cert_validation().build();
@@ -222,7 +266,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, u64)>();
+    // (frame, when its last datagram arrived, when its first one did)
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, u64, u64)>();
     let audio = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let audio_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let audio_loud = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -232,6 +277,18 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             // Datagram video: frame id → (pieces, pieces received).
             let mut frames: std::collections::HashMap<u32, (Vec<Option<Vec<u8>>>, usize)> = Default::default();
+            // Frames the host sends in pieces while it encodes them
+            // (PROTOCOL.md, type 9): id → what has arrived.
+            #[derive(Default)]
+            struct Chunked {
+                parts: Vec<Option<(usize, Vec<u8>)>>,
+                got: usize,
+                count: usize,
+                total: usize,
+                head: [u8; 32],
+                first_ns: u64,
+            }
+            let mut chunked: std::collections::HashMap<u32, Chunked> = Default::default();
             while let Ok(d) = conn.receive_datagram().await {
                 let p = d.payload();
                 if p.len() > 9 && p[0] == 2 {
@@ -249,7 +306,59 @@ async fn main() -> Result<()> {
                     }
                     if *got == parts.len() {
                         let (parts, _) = frames.remove(&id).unwrap();
-                        let _ = tx.send((parts.into_iter().flatten().flatten().collect(), now_ns()));
+                        let now = now_ns();
+                        let _ = tx.send((parts.into_iter().flatten().flatten().collect(), now, now));
+                    }
+                    continue;
+                }
+                // A piece of a frame, with where its bytes go. The host sends
+                // the few bytes it had to change in later pieces, so they are
+                // laid down in index order.
+                if p.len() > 43 && p[0] == 9 {
+                    let id = u32::from_le_bytes(p[1..5].try_into().unwrap());
+                    let index = u16::from_le_bytes(p[5..7].try_into().unwrap()) as usize;
+                    let offset = u32::from_le_bytes(p[9..13].try_into().unwrap()) as usize;
+                    if chunked.len() > 8 {
+                        let oldest = *chunked.keys().min().unwrap();
+                        chunked.remove(&oldest);
+                    }
+                    let f = chunked.entry(id).or_insert_with(|| Chunked {
+                        first_ns: now_ns(),
+                        ..Default::default()
+                    });
+                    // The stream path's 32-byte frame header, from the fields
+                    // every piece carries.
+                    f.head[0..4].copy_from_slice(&p[1..5]);
+                    f.head[5] = p[18];
+                    f.head[6..10].copy_from_slice(&p[19..23]);
+                    f.head[12..20].copy_from_slice(&p[23..31]);
+                    if p[17] & 2 != 0 {
+                        f.head[4] = p[17] & 1; // only the last piece knows
+                        f.count = u16::from_le_bytes(p[7..9].try_into().unwrap()) as usize;
+                        f.total = u32::from_le_bytes(p[13..17].try_into().unwrap()) as usize;
+                        f.head[20..28].copy_from_slice(&p[31..39]);
+                    }
+                    if index >= f.parts.len() {
+                        f.parts.resize(index + 1, None);
+                    }
+                    if f.parts[index].is_none() {
+                        f.parts[index] = Some((offset, p[43..].to_vec()));
+                        f.got += 1;
+                    }
+                    if f.count > 0 && f.got >= f.count {
+                        let f = chunked.remove(&id).unwrap();
+                        let mut bits = vec![0u8; f.total];
+                        for part in f.parts.iter().flatten() {
+                            let (at, data) = part;
+                            if *at >= f.total {
+                                continue;
+                            }
+                            let n = data.len().min(f.total - at);
+                            bits[*at..at + n].copy_from_slice(&data[..n]);
+                        }
+                        let mut whole = f.head.to_vec();
+                        whole.extend_from_slice(&bits);
+                        let _ = tx.send((whole, now_ns(), f.first_ns));
                     }
                     continue;
                 }
@@ -278,7 +387,8 @@ async fn main() -> Result<()> {
                         f[6..10].copy_from_slice(&p[9..13]);
                         f[12..28].copy_from_slice(&p[13..29]);
                         f.extend(parts.into_iter().flatten().flatten());
-                        let _ = tx.send((f, now_ns()));
+                        let now = now_ns();
+                        let _ = tx.send((f, now, now));
                     }
                     continue;
                 }
@@ -310,7 +420,8 @@ async fn main() -> Result<()> {
                 if s.read_exact(&mut data).await.is_err() {
                     return;
                 }
-                let _ = tx.send((data, now_ns()));
+                let now = now_ns();
+                let _ = tx.send((data, now, now));
             }
         }
         while let Ok(mut s) = c2.accept_uni().await {
@@ -321,7 +432,8 @@ async fn main() -> Result<()> {
                 while let Ok(Some(n)) = s.read(&mut buf).await {
                     data.extend_from_slice(&buf[..n]);
                 }
-                let _ = tx.send((data, now_ns()));
+                let now = now_ns();
+                let _ = tx.send((data, now, now));
             });
         }
     });
@@ -329,10 +441,15 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let (mut frames, mut keys, mut bytes, mut gaps) = (0u64, 0u64, 0u64, 0u64);
     let (mut enc, mut net, mut total) = (Vec::new(), Vec::new(), Vec::new());
+    // How long a frame took to arrive (first datagram to last) and when its
+    // first byte got here, relative to the bitstream being finished: with a
+    // frame sent in pieces, the first bytes come well before it is done.
+    let (mut spread, mut lead) = (Vec::new(), Vec::new());
+    let mut malformed = 0u64;
     let mut last_id: Option<u32> = None;
     let mut dims = (0, 0);
     while start.elapsed() < Duration::from_secs(secs) {
-        let Ok(Some((d, recv_ns))) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await else {
+        let Ok(Some((d, recv_ns, first_ns))) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await else {
             continue;
         };
         if d.len() < 32 {
@@ -355,6 +472,17 @@ async fn main() -> Result<()> {
         enc.push((encoded.saturating_sub(slot)) as f64 / 1e6);
         net.push((recv_ns.saturating_sub(encoded)) as f64 / 1e6);
         total.push((recv_ns.saturating_sub(slot)) as f64 / 1e6);
+        spread.push((recv_ns.saturating_sub(first_ns)) as f64 / 1e6);
+        lead.push((encoded as f64 - first_ns as f64) / 1e6);
+        // The pieces must put the encoder's own bitstream back together. A
+        // wrong, missing or stale byte almost always breaks the chain of OBU
+        // sizes, which has to end exactly at the last byte.
+        if d[5] == 2 && !av1_obus_tile(&d[32..]) {
+            malformed += 1;
+        }
+        if hashes {
+            println!("frame {id} {} bytes hash {:016x}", d.len() - 32, fnv1a(&d[32..]));
+        }
         if let Some(f) = file.as_mut() {
             f.write_all(&d[32..])?;
         }
@@ -381,6 +509,16 @@ async fn main() -> Result<()> {
         pct(&mut total, 0.5),
         pct(&mut total, 0.99)
     );
+    println!(
+        "first→last piece p50 {:.2} ms  p99 {:.2} ms; first piece arrived {:.2} ms \
+         before the bitstream was finished (p50)",
+        pct(&mut spread, 0.5),
+        pct(&mut spread, 0.99),
+        pct(&mut lead, 0.5)
+    );
+    if frames > 0 {
+        println!("AV1 bitstreams whose OBUs do not chain: {malformed} of {frames}");
+    }
     for m in host_msgs.lock().unwrap().iter() {
         println!("host: {m}");
     }

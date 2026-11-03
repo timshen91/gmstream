@@ -51,6 +51,7 @@ final class Probe: ConnectionDelegate {
     func relative(_ on: Bool) {}
     func cursorClip(_ clip: CGRect?) {}
     func rumble(index: Int, strong: UInt16, weak: UInt16, ms: Int) {}
+    func encodeFormat(_ text: String) {}
     func closed(reason: String) { print("closed: \(reason)"); exit(1) }
 }
 

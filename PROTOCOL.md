@@ -54,7 +54,14 @@ Unknown types are skipped.
 | 0x0d | DisplayGrid | `u64 anchor_ns, u32 interval_ns`: the client display's refresh grid in host CLOCK_MONOTONIC (a vblank and the interval), shifted by the client to set where frames land. The host then reports gamescope's frames as presented on that grid (still as a VRR-capable display, so Steam's VRR toggle stays available; with it off, gamescope paces to the grid). Native clients send it every 500 ms; it is cleared when a stream starts, and by an interval of 0 (a client on a variable-refresh display, which shows frames as they arrive). |
 
 `Hello` must be first. Hello flags: bit 0 = one video stream, bit 1 = video
-datagrams (see Video; if both are set, datagrams win).
+datagrams (see Video; if both are set, datagrams win), bit 2 = video chunks
+(AV1 only; see "Video chunks" below), bit 3 = the client can show HDR10 (PQ,
+BT.2020, ten-bit). Bit 3 states what the client is able to display, not what
+it wants: whether the session is HDR at all is the host's own setting (on
+SteamOS, Steam's display setting, which drives gamescope). The host sends an
+HDR stream only when both agree, and an eight-bit BT.709 one otherwise, so a
+client that cannot show HDR is never made to convert a ten-bit stream it
+has no use for.
 `max_datagram`: the largest UDP payload the client's link carries unfragmented (its interface MTU minus the IP and UDP headers); 0 = unknown. Version 1 clients (no flags byte) and version 2 clients (no `max_datagram`) are still accepted. Codec ids: 0 = H.264, 1 = HEVC, 2 = AV1, 3 = PyroWave (see below); the mask has
 bit `1 << id` set for each codec the client can decode. Gamepad buttons follow
 the W3C standard mapping (bit i = `buttons[i]`, 0..16); stick y is positive
@@ -71,6 +78,7 @@ key repeat itself.
 | 0x84 | Rumble | `u8 index, u16 strong, u16 weak, u16 duration_ms`; duration 0: stop |
 | 0x85 | Pong | `u64 client_time_us (echoed), u64 host_time_ns (CLOCK_MONOTONIC)` |
 | 0x86 | Error | UTF-8 text; the host closes the session after it |
+| 0x88 | EncodeFormat | UTF-8 text: what the encoder is taking in and what it makes of it (e.g. `XB30 10-bit BT.2020, no copy → AV1 10-bit PQ`), sent whenever it changes. For the client's stats line only; the wording is not part of the protocol. |
 | 0x87 | CursorClip | `u16 left, top, right, bottom` in stream pixels: where the game keeps the cursor, while it has the mouse; all 0: nowhere in particular |
 
 The cursor is drawn by the client (gamescope gives it to its host as a
@@ -123,6 +131,51 @@ handling (below) skips to a keyframe.
 The client decodes frames in `frame_id` order; when a frame is missing and a later one has arrived, it waits 30 ms,
 then drops to the next keyframe and sends `KeyframeRequest`. A size or codec
 change always starts with a keyframe.
+
+## Video chunks
+
+With the Hello flag *video chunks* and the AV1 codec, the host does not wait for
+a frame to finish encoding: it sends each piece of the bitstream as the GPU
+writes it, so most of a frame is on the wire before the encoder is done with it
+(core/vastream.c, DESIGN.md §12). The bytes are the encoder's own, byte for
+byte; a frame put back together from its pieces is exactly what a frame sent
+whole would have been. Any other codec, and the first frame of a session, still
+come whole.
+
+```
+u8  type = 9
+u32 frame_id
+u16 index          0, 1, 2 … in the order the host sent them
+u16 count          how many pieces the frame has; 0 except in the last
+u32 offset         where these bytes go in the frame's bitstream
+u32 total          the bitstream's size; 0 except in the last
+u8  flags          bit 0: keyframe (only meaningful in the last piece);
+                   bit 1: this is the frame's last piece
+u8  codec
+u16 width
+u16 height
+u64 slot_ns        host CLOCK_MONOTONIC time the frame was presented
+u64 encoded_ns     the bitstream was ready; 0 except in the last piece
+u32 overlap_ns     how long before that the frame's first piece was sent, so
+                   the client can start the network's share there instead of
+                   at the end of the encode; 0 except in the last piece
+... the frame's bytes at `offset`
+```
+
+The client keeps a `total`-byte buffer and lays each piece at its `offset`, and
+has the whole frame once it has all `count` of them. Pieces are laid down in
+**index order**: the GPU goes back and changes a few bytes it has already
+written (the frame header, and each tile group's OBU header and size), and the
+host sends those again in later pieces, which must win over the earlier ones.
+A piece may run past `total`, because the GPU writes in blocks; those bytes are
+padding and are dropped.
+
+Only the last piece knows `count`, `total`, `encoded_ns`, `overlap_ns` and
+whether the frame
+turned out to be a keyframe, so losing it loses the frame, as losing any other
+piece does. Nothing is retransmitted; the usual gap handling applies.
+
+A frame's pieces are at most `max_datagram` minus this 43-byte header.
 
 ## PyroWave
 
@@ -185,6 +238,7 @@ type byte:
 | 6 | handshake (below) |
 | 7 | mouse (client → host): `u32 sequence` then a sealed payload (below) |
 | 8 | acknowledgement (host → client): `u32 sequence` then a sealed `u32` |
+| 9 | a piece of a frame, as in "Video chunks" above |
 
 A session starts with a handshake. Client → host: type 6, an ephemeral X25519
 public key, then zeros up to 129 bytes in all (so a forged request gets back no

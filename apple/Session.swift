@@ -130,8 +130,11 @@ final class Session: ConnectionDelegate {
     init(shell: SessionShell) {
         self.shell = shell
         decoder.yuv = !options.bgra
-        decoder.onDecoded = { [renderer, probe] image, height, timing in
+        decoder.onDecoded = { [renderer, probe, decoder] image, height, timing in
             probe?.decoded(image, timing)
+            // The stream says whether it is HDR10; the renderer switches its
+            // layer on its own thread.
+            renderer.wantsHDR = decoder.hdr
             renderer.submit(.buffer(image, height: height), timing)
         }
         pyro?.onDecoded = { [renderer] planes, timing in renderer.submit(.planes(planes), timing) }
@@ -279,6 +282,9 @@ final class Session: ConnectionDelegate {
 
     private func start(_ c: Connection) {
         c.delegate = self
+        // The screen list, on the main thread and late enough for AppKit to
+        // have one: the Hello that carries it goes out just below.
+        primeHDRCapable()
         hostSize = (0, 0)
         conn = c
         let (w, h) = wantedSize()
@@ -374,6 +380,11 @@ final class Session: ConnectionDelegate {
         pads.rumble(index: index, strong: strong, weak: weak, ms: ms)
     }
 
+    /// What the host's encoder takes in (its own words), for the stats.
+    func encodeFormat(_ text: String) {
+        hostFormat = text
+    }
+
     func closed(reason: String) {
         guard closedReason == nil else { return }
         closedReason = reason
@@ -426,6 +437,12 @@ final class Session: ConnectionDelegate {
         let phaseText = mode + (!pacing.phaseLock ? "phase: off" : phase.summary())
         lines.append(phaseText + "  vsync \(immediate ? "off" : "on")  VRR \(["Steam", "off", "on"][Int(pacing.steamVRR)])  compositing \(renderer.compositingStatus)")
         lines.append("cursor \(cursorSource), \(cursorMode) \(String(format: "%.0f", cursorFPS)) fps  game mouse \(gameRelative ? "relative" : "absolute")  clip \(gameClip != nil ? "yes" : "no")  mouse \(sendsMotion ? "relative" : "absolute")  confined \(confined ? "yes" : "no")")
+        // What goes into each encoder and each decoder, since a mismatch at
+        // either end costs a conversion pass nobody asked for.
+        if !hostFormat.isEmpty {
+            lines.append("host in  " + hostFormat)
+        }
+        lines.append("here in  " + decoder.inputSummary)
         let hold = renderer.holdStatus(offset: conn?.clockOffsetNs)
         lines += [
             "rtt \(fmt(conn.map { Double($0.rttNs) / 1e6 })) ms  skipped \(st.skipped)  dropped \(st.dropped)  gaps \(s.gaps)" +
@@ -442,6 +459,8 @@ final class Session: ConnectionDelegate {
         updateOverlay()
     }
 
+    /// What the host's encoder takes in, as it described it.
+    var hostFormat = ""
     /// The stats overlay's text (updated once a second).
     var hudText = ""
     /// Who draws the cursor, for the stats (set by the shell): "host",

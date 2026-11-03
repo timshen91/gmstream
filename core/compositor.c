@@ -1552,6 +1552,11 @@ static void screen_added(struct vd_server *server, struct wlr_output *output) {
 	screen->destroy.notify = handle_screen_destroy;
 	wl_signal_add(&output->events.destroy, &screen->destroy);
 	wl_list_insert(&server->screens, &screen->link);
+	// In the layout before the global: a client that asks for this output's
+	// xdg_output aborts wlroots if it is not in one (gamescope asks, so
+	// panel mode brought the whole host down). The layout drops it again
+	// when the output is destroyed.
+	wlr_output_layout_add_auto(server->layout, output);
 	wlr_output_create_global(output, server->display);
 	wlr_log(WLR_INFO, "Panel: screen %s (%s)", output->name,
 		output->description ? output->description : "");
@@ -1689,25 +1694,103 @@ static void handle_new_input(struct wl_listener *listener, void *data) {
 	wlr_log(WLR_INFO, "Input: %s", device->name ? device->name : "?");
 }
 
+// Drops the modifiers the video encoder cannot read from. AMD's colour
+// compression (DCC) is the default for anything the GPU renders into, and
+// every other consumer here copes with it — the 3D engine decompresses as it
+// samples (PyroWave), so does a VA-API blit, and the display engine scans it
+// out — but the encode block reads such a surface as raw bytes and turns the
+// picture into compression blocks. Vulkan reports no modifier at all as
+// encodable on this driver, which is not true (a plain one works), so the
+// filter goes by what DCC actually is: AMD's modifier with its DCC bit set,
+// which also carries the extra metadata plane.
+static bool encodable_modifier(uint64_t mod) {
+	return !IS_AMD_FMT_MOD(mod) || AMD_FMT_MOD_GET(DCC, mod) == 0;
+}
+
+// Ten-bit formats: gamescope composites at ten bits whenever it is offered
+// one, and the client throws the extra bits away — VideoToolbox converts them
+// to eight-bit on the way out of the decoder, which costs it about 3 ms a
+// frame at 2560x1600. Leaving them unadvertised keeps everything eight-bit
+// from gamescope's composite to the client's texture. GM_10BIT offers them
+// again (for HDR, or to measure).
+static bool wanted_format(uint32_t format) {
+	switch (format) {
+	case DRM_FORMAT_XRGB2101010:
+	case DRM_FORMAT_ARGB2101010:
+	case DRM_FORMAT_XBGR2101010:
+	case DRM_FORMAT_ABGR2101010:
+		return getenv("GM_10BIT") != NULL;
+	}
+	return true;
+}
+
+static bool filter_formats(struct wlr_drm_format_set *set) {
+	struct wlr_drm_format_set kept = {0};
+	for (size_t i = 0; i < set->len; i++) {
+		const struct wlr_drm_format *f = &set->formats[i];
+		if (!wanted_format(f->format)) {
+			continue;
+		}
+		for (size_t j = 0; j < f->len; j++) {
+			if (encodable_modifier(f->modifiers[j]) &&
+					!wlr_drm_format_set_add(&kept, f->format, f->modifiers[j])) {
+				wlr_drm_format_set_finish(&kept);
+				return false;
+			}
+		}
+	}
+	if (kept.len == 0) {
+		wlr_drm_format_set_finish(&kept);
+		return false;
+	}
+	wlr_drm_format_set_finish(set);
+	*set = kept;
+	return true;
+}
+
+static size_t filter_feedback(struct wlr_linux_dmabuf_feedback_v1 *feedback) {
+	size_t n = feedback->tranches.size / sizeof(struct wlr_linux_dmabuf_feedback_v1_tranche);
+	struct wlr_linux_dmabuf_feedback_v1_tranche *t = feedback->tranches.data;
+	size_t dropped = 0;
+	for (size_t i = 0; i < n; i++) {
+		size_t before = 0;
+		for (size_t j = 0; j < t[i].formats.len; j++) {
+			before += t[i].formats.formats[j].len;
+		}
+		if (!filter_formats(&t[i].formats)) {
+			continue; // nothing encodable in this tranche: leave it as it was
+		}
+		size_t after = 0;
+		for (size_t j = 0; j < t[i].formats.len; j++) {
+			after += t[i].formats.formats[j].len;
+		}
+		dropped += before - after;
+	}
+	return dropped;
+}
+
 // gamescope picks its buffers' modifier from the formats we advertise
 // (linux-dmabuf v3: the flat list, no feedback). With a screen, only those
 // its primary plane can scan out (and the renderer read) are offered, so
 // frames go to the screen as they are instead of being copied (180 of 180
-// frames copied at 2560x1600@180 before). The encoder imports these too.
+// frames copied at 2560x1600@180 before). The encoder imports these too, so
+// the compressed modifiers are dropped as well (encodable_modifier): then
+// gamescope composites into a buffer the encoder can read where it lies.
 static void create_linux_dmabuf(struct vd_server *server) {
 	if (wlr_renderer_get_texture_formats(server->renderer, WLR_BUFFER_CAP_DMABUF) == NULL) {
 		return;
 	}
 	struct wlr_linux_dmabuf_v1 *dmabuf = NULL;
 	struct wlr_linux_dmabuf_feedback_v1 feedback = {0};
-	if (server->screen != NULL && wlr_linux_dmabuf_feedback_v1_init_with_options(&feedback,
+	if (wlr_linux_dmabuf_feedback_v1_init_with_options(&feedback,
 			&(struct wlr_linux_dmabuf_feedback_v1_init_options){
 				.main_renderer = server->renderer,
-				.scanout_primary_output = server->screen->output,
+				.scanout_primary_output = server->screen != NULL
+					? server->screen->output : NULL,
 			})) {
 		size_t n = feedback.tranches.size / sizeof(struct wlr_linux_dmabuf_feedback_v1_tranche);
 		struct wlr_linux_dmabuf_feedback_v1_tranche *t = feedback.tranches.data;
-		if (n >= 2 && t[0].formats.len > 0) {
+		if (server->screen != NULL && n >= 2 && t[0].formats.len > 0) {
 			// The first tranche scans out; the last is everything the
 			// renderer reads. Legacy clients get their union: narrow the
 			// last to the first.
@@ -1716,10 +1799,15 @@ static void create_linux_dmabuf(struct vd_server *server) {
 				wlr_drm_format_set_finish(&t[n - 1].formats);
 				t[n - 1].formats = scanout;
 			}
-			dmabuf = wlr_linux_dmabuf_v1_create(server->display, 4, &feedback);
 			wlr_log(WLR_INFO, "Panel: offering %zu formats %s can scan out",
 				t[0].formats.len, server->screen->output->name);
 		}
+		size_t dropped = filter_feedback(&feedback);
+		if (dropped > 0) {
+			wlr_log(WLR_INFO, "Not offering %zu compressed modifiers: the video "
+				"encoder cannot read them", dropped);
+		}
+		dmabuf = wlr_linux_dmabuf_v1_create(server->display, 4, &feedback);
 		wlr_linux_dmabuf_feedback_v1_finish(&feedback);
 	}
 	if (dmabuf == NULL) {
@@ -1751,7 +1839,7 @@ enum cmd_type {
 struct cmd {
 	enum cmd_type type;
 	union {
-		struct { enum gm_codec codec; int w, h, refresh, kbps, packet; } stream;
+		struct { enum gm_codec codec; int w, h, refresh, kbps, packet, flags; } stream;
 		struct { double x, y; int32_t v120_x, v120_y; } motion;
 		struct { uint32_t code; bool pressed; } key;
 		struct { uint8_t pad; struct gm_gamepad_state state; } pad;
@@ -1812,7 +1900,7 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		grid_leads_reset(server);
 		if (server->encoder != NULL) {
 			encoder_start(server->encoder, c->stream.codec, c->stream.kbps,
-				server->refresh, c->stream.packet);
+				server->refresh, c->stream.packet, c->stream.flags);
 		}
 		audio_start(server->audio);
 		server->streaming = true;
@@ -1934,9 +2022,9 @@ void gm_quit(void) {
 }
 
 void gm_stream_start(enum gm_codec codec, int width, int height,
-		int refresh_mhz, int bitrate_kbps, int packet_bytes) {
+		int refresh_mhz, int bitrate_kbps, int packet_bytes, int flags) {
 	push((struct cmd){ .type = CMD_STREAM_START, .stream = { codec, width,
-		height, refresh_mhz, bitrate_kbps, packet_bytes } });
+		height, refresh_mhz, bitrate_kbps, packet_bytes, flags } });
 }
 
 void gm_stream_configure(int width, int height, int refresh_mhz) {
@@ -2025,12 +2113,24 @@ static int handle_stats(void *data) {
 	if (server->encoder != NULL) {
 		encoder_take_stats(server->encoder, &encoded, &dropped, &encode_ms);
 	}
+	unsigned chunk_frames = 0, chunks = 0, patched = 0;
+	double first_ms = 0, last_ms = 0;
+	if (server->encoder != NULL) {
+		encoder_take_chunk_stats(server->encoder, &chunk_frames, &chunks,
+			&patched, &first_ms, &last_ms);
+	}
 	struct wlr_output *shown = server->panel ? server->screen->output : server->output;
 	wlr_log(WLR_INFO, "stats: %u presented (%u copied), %u superseded, %u fence waits, "
 		"%u encoded (%.2f ms avg), %u encoder drops, %s %dx%d",
 		server->stats_presented, server->stats_copied, server->stats_superseded,
 		server->stats_fence_waits, encoded, encode_ms, dropped,
 		shown->name, shown->width, shown->height);
+	if (chunk_frames > 0) {
+		wlr_log(WLR_INFO, "stats: %u frames streamed in %u pieces, first piece "
+			"%.2f ms after the frame was given to the GPU, bitstream done "
+			"%.2f ms, %u bytes re-sent", chunk_frames, chunks, first_ms,
+			last_ms, patched);
+	}
 	server->stats_presented = server->stats_superseded = 0;
 	server->stats_fence_waits = server->stats_copied = 0;
 	wl_event_source_timer_update(server->stats_timer, 1000);
@@ -2063,9 +2163,11 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 	}
 	wlr_multi_backend_add(server.backend, server.headless);
 	// Panel mode: this machine's screens and input devices, through the
-	// seat session (logind) as native gamescope takes them. Without one
-	// (no seat, GM_NO_PANEL), streams only.
-	if (getenv("GM_NO_PANEL") == NULL &&
+	// seat session (logind) as native gamescope takes them. Off unless
+	// GM_PANEL asks for it: the path needs work (it exposes the screen to
+	// clients as a second wl_output, among other things), and a host that
+	// only streams has no use for it. Without a seat it is off anyway.
+	if (getenv("GM_PANEL") != NULL && getenv("GM_NO_PANEL") == NULL &&
 			(server.session = wlr_session_create(server.loop)) != NULL) {
 		struct wlr_device *gpu;
 		if (wlr_session_find_gpus(server.session, 1, &gpu) == 1) {

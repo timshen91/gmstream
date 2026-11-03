@@ -50,6 +50,11 @@ private func obuPayload(_ data: Data, at start: Int) -> (payload: Int, size: Int
 /// What the sequence header says about the stream.
 struct AV1Config {
     let width: Int, height: Int // the largest frame
+    /// The transfer function the stream declares; 16 is PQ (SMPTE ST 2084),
+    /// i.e. HDR10. The client shows those frames on an HDR layer.
+    let transfer: Int
+    /// Ten-bit (high_bitdepth in the sequence header).
+    let tenBit: Bool
     /// The av1C record: four bytes, then the sequence header OBU.
     let av1C: Data
 
@@ -128,6 +133,8 @@ struct AV1Config {
             }
         }
         guard !r.overrun else { return nil }
+        self.transfer = transfer
+        self.tenBit = high != 0
         av1C = Data([0x81, // marker, version
                      UInt8(profile << 5 | level),
                      UInt8(tier << 7 | high << 6 | twelve << 5 | mono << 4 | subX << 3 | subY << 2 | position),
