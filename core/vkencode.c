@@ -196,6 +196,7 @@ struct gm_vkencode {
 	struct vkprofile prof; // the profile the session and its images were made with
 	VkFormat picture_format; // what gamescope gives us, and what the encoder takes
 	uint32_t src_format_drm; // the same, as gamescope's own fourcc
+	uint8_t told_cols, told_rows; // the tile layout the client has been told
 
 	pthread_t thread;
 	pthread_mutex_t lock;
@@ -895,6 +896,22 @@ static StdVideoAV1ColorConfig color_config_for(bool ten, bool hdr) {
 		.chroma_sample_position = STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN };
 }
 
+// What the encoder takes in and puts out, in words, for the client's stats
+// line. The tile layout goes with it: it follows the frame's budget, so it is
+// worth seeing next to the bitrate.
+static void report_format(struct gm_vkencode *vk, unsigned cols, unsigned rows) {
+	if (vk->cb->encode_format == NULL) {
+		return;
+	}
+	bool ten = ten_bit(vk->picture_format);
+	char text[160];
+	snprintf(text, sizeof(text), "%.4s %u-bit %s, no copy → AV1 %u-bit %s, %ux%u tiles",
+		(const char *)&vk->src_format_drm, ten ? 10 : 8,
+		hdr_session(vk) ? "BT.2020" : "BT.709", ten ? 10 : 8,
+		hdr_session(vk) ? "PQ" : "BT.709", cols, rows);
+	vk->cb->encode_format(vk->cb->ctx, text);
+}
+
 static bool session_open(struct gm_vkencode *vk, int width, int height,
 		VkFormat format) {
 	session_free(vk);
@@ -1099,14 +1116,7 @@ static bool session_open(struct gm_vkencode *vk, int width, int height,
 	wlr_log(WLR_INFO, "Encoding %u-bit %s AV1 %dx%d (coded %ux%u) on the Vulkan "
 		"video encode queue, straight from gamescope's buffer", ten ? 10 : 8,
 		hdr_session(vk) ? "HDR10 (PQ, BT.2020)" : "SDR (BT.709)", width, height, w, h);
-	if (vk->cb->encode_format != NULL) {
-		char text[128];
-		snprintf(text, sizeof(text), "%.4s %u-bit %s, no copy → AV1 %u-bit %s",
-			(const char *)&vk->src_format_drm, ten ? 10 : 8,
-			hdr_session(vk) ? "BT.2020" : "BT.709", ten ? 10 : 8,
-			hdr_session(vk) ? "PQ" : "BT.709");
-		vk->cb->encode_format(vk->cb->ctx, text);
-	}
+	vk->told_cols = vk->told_rows = 0; // the next inter frame tells the client
 	return true;
 }
 
@@ -1174,6 +1184,14 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 	struct tiles tiles;
 	tiles_for(vk, &tiles, vk->coded_width, vk->coded_height,
 		keyframe ? target * 4 : target);
+	// A keyframe gets its own, larger, layout; the steady state is what the
+	// stats line is about.
+	if (!keyframe && (tiles.info.TileCols != vk->told_cols ||
+			tiles.info.TileRows != vk->told_rows)) {
+		vk->told_cols = tiles.info.TileCols;
+		vk->told_rows = tiles.info.TileRows;
+		report_format(vk, tiles.info.TileCols, tiles.info.TileRows);
+	}
 
 	uint32_t slot = keyframe ? 0 : 1 - vk->ref_slot;
 	uint32_t frame_id = vk->next_frame_id++;

@@ -179,6 +179,7 @@ async fn main() -> Result<()> {
                     ),
                     0x83 => format!("pointer lock {}", body[0]),
                     0x84 => "rumble".to_owned(),
+                    0x88 => format!("encoding {}", String::from_utf8_lossy(&body)),
                     _ => continue,
                 };
                 host_msgs.lock().unwrap().push(note);
