@@ -63,9 +63,6 @@
 #define PREFILL_MAX (4u << 20)
 // One datagram's worth of bitstream, by default.
 #define DEFAULT_PACKET 1100
-// Bytes of bitstream per tile: the frame is split into about this many pieces,
-// so a keyframe gets many tiles and a small inter frame gets one or two.
-#define DEFAULT_TILE_BYTES 49152
 
 /* ---- Vulkan, loaded at run time ----------------------------------------- */
 
@@ -494,12 +491,25 @@ static void tiles_for(struct gm_vkencode *vk, struct tiles *t, int w, int h,
 		max_cols = sb_cols;
 	}
 
-	uint32_t want = expect_bytes / vk->tile_bytes;
+	// As many tiles as the hardware and the frame allow, always. Tiles are
+	// what lets the encoder hand us finished bytes early, and they cost us no
+	// padding: pieces are cut from the bitstream by size, not at tile edges,
+	// so several small tiles share a datagram. What they do cost is bits --
+	// each one resets the entropy context and cannot predict across its edge.
+	// GM_AV1_TILE_BYTES goes back to sizing them by the frame's budget, which
+	// is how that cost was measured.
+	uint32_t want = max_rows * max_cols;
+	if (vk->tile_bytes > 0) {
+		want = expect_bytes / vk->tile_bytes;
+	}
 	if (want < 1) {
 		want = 1;
 	}
 	uint32_t rows = want < max_rows ? want : max_rows;
-	uint32_t cols = rows > 0 && want / rows > 1 ? want / rows : 1;
+	uint32_t cols = rows > 0 ? (want + rows - 1) / rows : 1;
+	if (cols < 1) {
+		cols = 1;
+	}
 	if (cols > max_cols) {
 		cols = max_cols;
 	}
@@ -1670,7 +1680,7 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 	}
 	vk->cb = cb;
 	vk->packet_bytes = DEFAULT_PACKET;
-	vk->tile_bytes = DEFAULT_TILE_BYTES;
+	vk->tile_bytes = 0; // a datagram's worth, once the stream's size is known
 	vk->q_inter = vk->q_key = 128;
 	const char *pq = getenv("GM_AV1_Q");
 	if (pq != NULL && atoi(pq) > 0) {
@@ -1840,8 +1850,9 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 	}
 
 	wlr_log(WLR_INFO, "Vulkan AV1 encoding on %s (queue family %u, tiles up to "
-		"%ux%u)", props.properties.deviceName, vk->family, a.maxTiles.width,
-		a.maxTiles.height);
+		"%ux%u, no smaller than %ux%u)", props.properties.deviceName, vk->family,
+		a.maxTiles.width, a.maxTiles.height, a.minTileSize.width,
+		a.minTileSize.height);
 	pthread_mutex_init(&vk->lock, NULL);
 	pthread_cond_init(&vk->cond, NULL);
 	if (pthread_create(&vk->thread, NULL, vkencode_thread, vk) != 0) {
