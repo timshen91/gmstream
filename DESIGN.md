@@ -1977,38 +1977,45 @@ PyroWave may still be the cheaper answer at high bitrate: it already sends
 independently decodable packets as they are produced. Compare against it before
 going further.
 
-## 13. PyroWave inter frames
+## 13. Riptide: inter frames, overlapped
 
-PyroWave stays a fixed-size-per-frame GPU wavelet codec, but a frame can now be
-coded as its difference from a prediction from the previous decoded frame
-(motion compensated, per 32x32 block on or off). There are no keyframes: every
-frame is the same size, and the first frame (or one after the host lost track
-of the client) is intra at that size. The codec work, step by step with each
-step measured, is in PyroWave's tree under `INTER.md` (the patched source this
-repository builds: `build/pyrowave-inter.patch` over upstream 79a3232, applied
-by `build/pyrowave.sh` for the host and `apple/pyrowave.sh` for the clients).
-On the AOM gaming clips it needs 37% fewer bits than intra PyroWave for the same
+Riptide (codec 4, `riptide/`) is a codec of its own, built for this stream: a
+GPU wavelet codec that grew out of PyroWave (whose transform, quantizer, rate
+control and packing it keeps), with every frame coded as its difference from a
+motion-compensated prediction from the previous decoded frame, each frame cut
+into stripes that are encoded, sent and decoded one after another, and losses
+repaired by replaying the client's decode instead of by keyframes. There are no
+keyframes: every frame is the same size, and the first frame (or one after the
+host lost track of the client) is intra at that size. `riptide/README.md` is
+the full account; `riptide/HISTORY.md` has every step as it was measured.
+PyroWave (codec 3) is stock upstream again, intra-only, and links next to it.
+On the AOM gaming clips Riptide needs 37% fewer bits than PyroWave for the same
 PSNR (Dota -70%, StarCraft -63%, Euro Truck -44%, Witcher -7%, Minecraft -1%).
 
 ### 13.1 How it runs
 
-- Protocol: Hello bit 4 (plain UDP clients that ask for PyroWave), datagram type
-  10, loss reports type 11 (PROTOCOL.md, "PyroWave inter frames").
+- Protocol: codec 4, offered only over plain UDP; datagram type 10, loss
+  reports type 11 (PROTOCOL.md, "Riptide"). `Parallelism` (0x11) sets the
+  stripe count.
+- Build: `build/riptide.sh` (from `build.rs`) builds `riptide/` with CMake into
+  `libriptide.a` and `libriptide-c.a`; the clients compile `riptide/metal/`
+  directly. Its symbols are `riptide_*` and namespace `Riptide`, so it links
+  beside stock PyroWave (`build/pyrowave.sh`, `apple/pyrowave.sh`).
 - Stripes (13.3): the frame is coded as horizontal bands, each an image of its
   own that predicts from the whole previous frame, so encode, network and
   decode overlap stripe by stripe.
-- Host (`core/pyrowave.c`): `pyrowave_encoder_enable_inter` with the stripe
-  layout. The encoder decodes each stripe it hands out (its reference is what
-  the client has when nothing is lost) and keeps the last 8 frames. The stripes
-  are GPU submissions one after another; `pyrowave_encoder_packetize_stripe`
-  waits only for its own and the stripe goes out at once
-  (`gm_callbacks.pyrowave`), then `pyrowave_encoder_decode_stripe` queues its
-  own decode behind the frame's encode.
-- Client (`apple/PyroWave.swift`): a decoder per stripe; decodes every frame in
+- Host (`core/riptide.c`): the encoder decodes each stripe it hands out (its
+  reference is what the client has when nothing is lost) and keeps the last 8
+  frames. The stripes are GPU submissions one after another;
+  `riptide_encoder_packetize_stripe` waits only for its own and the stripe goes
+  out at once (`gm_callbacks.riptide`), then `riptide_encoder_decode_stripe`
+  queues its own decode behind the frame's encode. The layout it settled on is
+  reported in `EncodeFormat` (the stats line's `host in` row).
+- Client (`apple/Riptide.swift`): a decoder per stripe; decodes every frame in
   order from its own previous output, each stripe straight into its rows of the
-  frame (`pyrowave_decoder_decode_gpu_buffer_rows`). Once a stripe's inter
+  frame (`riptide_decoder_decode_gpu_buffer_rows`). Once a stripe's inter
   packets are in it forms that stripe's prediction
-  (`pyrowave_decoder_prepare_prediction`) while its coefficients arrive. A
+  (`riptide_decoder_prepare_prediction`) while its coefficients arrive. A
   stripe is decoded when complete, when its last packet is in (packets come in
   order: the missing ones are lost), or when a later stripe or frame starts; a
   stripe or frame of which nothing came is decoded from nothing. What it missed
@@ -2018,13 +2025,16 @@ PSNR (Dota -70%, StarCraft -63%, Euro Truck -44%, Witcher -7%, Minecraft -1%).
   gap longer than the host keeps): an intra frame (`KeyframeRequest`).
 - Both GPUs are kept awake while frames flow (13.4): `core/gpuwarm.c` on the
   host, `apple/GPUWarm.swift` on the client.
-- Settings: "PyroWave inter frames" (Mac and iPad, default on; `--intra-only`),
-  only usable with PyroWave; the AV1/HEVC "frames in pieces" setting likewise
-  only with those. The Hello carries each flag only with its codec.
+- Settings (Mac and iPad), each usable only with its codecs: Codec: Riptide
+  (`--riptide`); "Riptide stripes" (Auto, or 1-16 a frame; `--stripes N`);
+  "Keep the GPU awake for PyroWave and Riptide"; "AV1/HEVC parallelism" (tiles
+  or slice segments) and the AV1/HEVC "frames in pieces" setting only with
+  those. The Hello carries the pieces flag only with its codecs, and the stats
+  line shows `overlap` only for AV1/HEVC in pieces and Riptide.
 
 ### 13.2 Measured (2026-11-04)
 
-Cross-GPU (`tools/pwenc.c` on the host's AMD GPU, `tools/pwdec.mm` on the Mac):
+Cross-GPU (`riptide/tools/rtenc.c` on the host's AMD GPU, `riptide/tools/rtdec.mm` on the Mac):
 the Mac's decode of the AMD encoder's frames differs from the encoder's own
 decode in 0.01% of luma samples (fp16 transform rounding), not growing over 30
 frames; frame 10's inter packets dropped on the Mac with the loss reported, frame
@@ -2048,11 +2058,12 @@ damaged): every loss reported and replayed, no intra frame needed, 1080p p99
 11.1 ms (it was 23.9 before a frame was decoded as soon as its last packet
 arrived instead of when the next one began).
 
-So on this GPU inter frames cost 2-4 ms of latency at the same bitrate, almost
-all the host's motion search (six passes over the frame, ~0.7 ms each at 4K):
-the inter packets are ready only ~0.3-1 ms before the rest, so the overlap they
-buy on the client is small next to it. Inter frames buy bits (37%) or quality,
-not latency, until the search is cheaper.
+So on this GPU, before stripes, inter frames cost 2-4 ms of latency at the
+same bitrate, almost all the host's motion search (six passes over the frame,
+~0.7 ms each at 4K): the inter packets are ready only ~0.3-1 ms before the
+rest, so the overlap they buy on the client is small next to it. Whole inter
+frames bought bits (37%) or quality, not latency; stripes (13.3) are what
+turned that around.
 
 The measurements above are of whole frames, before stripes (13.3).
 
@@ -2061,8 +2072,8 @@ The measurements above are of whole frames, before stripes (13.3).
 A whole frame overlapped nothing: the motion search, the transform, the rate
 control and the packing each finish the frame before the next starts, and the
 client's inverse transform needs every packet (its coarsest level spans the
-frame). So the frame is cut into horizontal stripes, each coded as a PyroWave
-image of its own: its own transform, rate control, packets and inter packets,
+frame). So the frame is cut into horizontal stripes, each coded as an image of
+its own: its own transform, rate control, packets and inter packets,
 predicting from anywhere in the whole previous frame (the inter shaders take the
 stripe's row in the reference). The host's GPU does the stripes one after
 another and each goes out as soon as it is done; the client decodes each as it
@@ -2072,7 +2083,9 @@ stripe), loss replay per stripe.
 
 - Layout: a first stripe of 128 rows (out sooner), then 384, the last taking the
   rest (128 rows or more); stripe boundaries on 64 rows so every grid lines up
-  (`GM_PYROWAVE_STRIPE_ROWS`, `GM_PYROWAVE_FIRST_ROWS`; 0 rows: one stripe).
+  (`GM_RIPTIDE_STRIPE_ROWS`, `GM_RIPTIDE_FIRST_ROWS`; 0 rows: one stripe). The
+  client's "Riptide stripes" setting overrides it: N stripes of (height / N)
+  rows rounded down to 64, the last taking the rest.
 - Rate: each stripe gets the share of the frame's bytes that the rate control
   would have given it across the whole frame, from the last frame's statistics
   (the same distortion-per-byte cut in every stripe), at least a quarter of its
@@ -2099,11 +2112,11 @@ last: the GPU is never idle in its eyes, the filler does almost nothing, and the
 codec's work goes first. Any gap in the filler (even 0.5 ms) lets the clock
 drop again.
 - Client: `apple/GPUWarm.swift` (256 threads x 100 FMAs a dispatch, two in
-  flight, Metal queue priority 0), setting "Keep the GPU awake for PyroWave"
-  (default on, PyroWave only; `--no-gpu-awake`).
+  flight, Metal queue priority 0), setting "Keep the GPU awake for PyroWave and
+  Riptide" (default on; `--no-gpu-awake`).
 - Host: `core/gpuwarm.c` (its own Vulkan device, a compute queue at low global
-  priority, 4 workgroups a dispatch), on whenever PyroWave frames are encoded
-  (`GM_PYROWAVE_GPU_WARM=0` turns it off). Under a GPU-bound load it costs
+  priority, 4 workgroups a dispatch), on whenever Riptide frames are encoded
+  (`GM_RIPTIDE_GPU_WARM=0` turns it off). Under a GPU-bound load it costs
   ~0.15 ms of encode time; under a light one it saves ~0.9.
 Like Keep Wi-Fi awake, power for latency, only while streaming.
 

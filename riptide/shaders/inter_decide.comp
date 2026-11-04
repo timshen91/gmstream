@@ -1,0 +1,81 @@
+#version 450
+// Inter frames: per 32x32 luma block, whether to predict from the reference
+// (through the motion field). Predict when the residual's absolute sum is no larger than the block's own
+// absolute deviation from its mean, the intra cost proxy. Weight 1 predicts,
+// 0 codes the block intra (the DC shift).
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) uniform mediump sampler2D uSource;
+layout(set = 0, binding = 1) writeonly uniform mediump image2D uWeights;
+layout(set = 0, binding = 2) uniform mediump sampler2D uReference;
+layout(set = 0, binding = 3) uniform isampler2D uVectors;
+#include "inter_motion.h"
+
+layout(push_constant) uniform Registers
+{
+    int refresh_period; // 0: off; else each block is coded intra once per this many frames
+    int refresh_phase; // the frame number modulo the period
+    int ref_y; // the stripe's first row in the reference
+};
+
+shared float s_a[64];
+shared float s_b[64];
+
+// Tree sum of each thread's a and b; every thread gets the totals.
+vec2 reduce2(float a, float b)
+{
+    uint t = gl_LocalInvocationIndex;
+    s_a[t] = a;
+    s_b[t] = b;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (t < s)
+        {
+            s_a[t] += s_a[t + s];
+            s_b[t] += s_b[t + s];
+        }
+        barrier();
+    }
+    vec2 r = vec2(s_a[0], s_b[0]);
+    barrier();
+    return r;
+}
+
+void main()
+{
+    ivec2 size = textureSize(uSource, 0);
+    uint t = gl_LocalInvocationIndex;
+    // Thread t: row t / 2 of the block, 16 pixels from column (t % 2) * 16.
+    ivec2 p0 = ivec2(gl_WorkGroupID.xy) * 32 + ivec2(int(t & 1u) * 16, int(t >> 1));
+    float vals[16];
+    float sum = 0.0, sad = 0.0, n = 0.0;
+    // The 16 pixels span two vector cells: 0-7 and 8-15.
+    MotionCell mc0 = motion_cell(p0, 16.0), mc1 = motion_cell(p0 + ivec2(8, 0), 16.0);
+    for (int i = 0; i < 16; i++)
+    {
+        ivec2 p = p0 + ivec2(i, 0);
+        bool inside = all(lessThan(p, size));
+        float s = inside ? texelFetch(uSource, p, 0).x : 0.0;
+        vec2 v = i < 8 ? motion_in_cell(mc0, ivec2(i, 0)) : motion_in_cell(mc1, ivec2(i - 8, 0));
+        float r = inside ? sample_reference(vec2(p) + v, ref_y) : 0.0;
+        vals[i] = s;
+        sum += s;
+        sad += abs(s - r);
+        n += inside ? 1.0 : 0.0;
+    }
+    vec2 sn = reduce2(sum, n);
+    float mean = sn.x / max(sn.y, 1.0);
+    float dev = 0.0;
+    for (int i = 0; i < 16; i++)
+        if (all(lessThan(p0 + ivec2(i, 0), size)))
+            dev += abs(vals[i] - mean);
+    vec2 cost = reduce2(sad, dev);
+    if (t == 0u)
+    {
+        // Refresh: the blocks whose turn it is, scattered so no two neighbours go together.
+        ivec2 b = ivec2(gl_WorkGroupID.xy);
+        bool refresh = refresh_period > 0 && (b.x * 7 + b.y * 3) % refresh_period == refresh_phase;
+        imageStore(uWeights, b, vec4(cost.x <= cost.y && !refresh ? 1.0 : 0.0));
+    }
+}

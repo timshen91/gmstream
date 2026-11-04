@@ -1,0 +1,24 @@
+#version 450
+// Stripes (a frame coded as horizontal bands, each an image of its own): rows
+// of one plane into another, from row src_y to row dst_y, width x height texels.
+// Cuts a stripe out of the frame for its encoder, and puts a stripe's decode
+// back into the frame.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uSource;
+layout(set = 0, binding = 1) writeonly uniform image2D uDest;
+
+layout(push_constant) uniform Registers
+{
+    ivec2 size;
+    int src_y;
+    int dst_y;
+};
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, size)))
+        return;
+    imageStore(uDest, p + ivec2(0, dst_y), texelFetch(uSource, p + ivec2(0, src_y), 0));
+}

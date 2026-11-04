@@ -51,8 +51,10 @@ final class Session: ConnectionDelegate {
     let stages = StageStats()
     var netFirst: (id: UInt32, first: UInt64, last: UInt64, maxGap: UInt64, gapAt: Int, readLag: UInt64)? // measuring (GM_DEBUG_NET)
     lazy var pyro = PyroWaveDecoder(device: renderer.device, queue: renderer.queue)
-    /// H.264, HEVC, AV1 in hardware, and PyroWave where its Metal decoder runs.
-    var clientCodecs: UInt8 { codecMask | (pyro != nil ? 1 << 3 : 0) }
+    lazy var riptide = RiptideDecoder(device: renderer.device, queue: renderer.queue)
+    /// H.264, HEVC, AV1 in hardware, and PyroWave and Riptide where their Metal
+    /// decoders run.
+    var clientCodecs: UInt8 { codecMask | (pyro != nil ? 1 << 3 : 0) | (riptide != nil ? 1 << 4 : 0) }
     let chart = LatencyChart()
     let panel = PanelRate()
     // The host's frame-rate cap when the panel's real top rate is below its
@@ -73,6 +75,7 @@ final class Session: ConnectionDelegate {
     var immediate = false  // vsync off, as last applied
     var pacing = Pacing(options: options, vrr: false, capable: false)
     var codecName = "-"
+    var streamCodec: UInt8 = 0 // the codec the host chose (HelloAck)
     var timers: [Timer] = []
     var closedReason: String?
     var mock: MockSource?
@@ -143,11 +146,14 @@ final class Session: ConnectionDelegate {
         }
         pyro?.onDecoded = { [renderer] planes, timing in renderer.submit(.planes(planes), timing) }
         pyro?.onIncomplete = { [stats] in stats.gap() }
-        // Inter frames: what never arrived goes back to the host, which replays
-        // this decoder; with nothing to predict from, it is asked for an intra frame.
-        pyro?.onLoss = { [weak self] id, count, ranges in self?.conn?.pyrowaveLoss(frameId: id, count: count, ranges: ranges) }
-        pyro?.onNeedIntra = { [weak self] in self?.conn?.send(Msg.keyframe) }
         pyro?.keepGPUAwake = options.keepGPUAwake
+        riptide?.onDecoded = { [renderer] planes, timing in renderer.submit(.planes(planes), timing) }
+        riptide?.onIncomplete = { [stats] in stats.gap() }
+        // What never arrived goes back to the host, which replays this decoder;
+        // with nothing to predict from, it is asked for an intra frame.
+        riptide?.onLoss = { [weak self] id, count, ranges in self?.conn?.riptideLoss(frameId: id, count: count, ranges: ranges) }
+        riptide?.onNeedIntra = { [weak self] in self?.conn?.send(Msg.keyframe) }
+        riptide?.keepGPUAwake = options.keepGPUAwake
         renderer.onPresented = { [stages, chart, phase, panel] t in
             stages.add(t)
             phase.presented(t)
@@ -358,7 +364,16 @@ final class Session: ConnectionDelegate {
             }
         }
         stats.addBytes(p.payload.count)
-        pyro.packet(p) { first, overlap in
+        pyro.packet(p) {
+            FrameTiming(slotNs: p.slotNs, encodedNs: p.encodedNs, received: nowNs()) { conn.toLocal(hostNs: $0) }
+        }
+        sizeFromHost(width: Int(p.width), height: Int(p.height))
+    }
+
+    func riptide(_ p: RiptidePacket) {
+        guard let conn, let riptide else { return }
+        stats.addBytes(p.payload.count)
+        riptide.packet(p) { first, overlap in
             FrameTiming(slotNs: p.slotNs, encodedNs: p.encodedNs, received: nowNs(), firstReceived: first,
                         overlapNs: overlap) { conn.toLocal(hostNs: $0) }
         }
@@ -383,7 +398,8 @@ final class Session: ConnectionDelegate {
             }
         }
         probe?.start { [weak self] dx in self?.motion(dx: dx, dy: 0) }
-        codecName = ["H.264", "HEVC", "AV1", "PyroWave"][Int(Swift.min(codec, 3))]
+        codecName = ["H.264", "HEVC", "AV1", "PyroWave", "Riptide"][Int(Swift.min(codec, 4))]
+        streamCodec = codec
         pads.resend()
     }
 
@@ -436,7 +452,10 @@ final class Session: ConnectionDelegate {
                 "\(String(format: "%.0f", s.mbps)) Mbps",
             "\(pad("ms, 5 s", 10))\(pad("p50", 7))\(pad("p99", 7))max",
         ]
-        for row in st.rows {
+        // Overlap is only a thing for a frame that goes out before it is
+        // finished: AV1 and HEVC in pieces, Riptide in stripes.
+        let overlaps = (Options.takesFramesInPieces(streamCodec) && options.streamFrames) || Options.isRiptide(streamCodec)
+        for row in st.rows where overlaps || row.name != "overlap" {
             if ["to \(systemName)", "total", "spacing"].contains(row.name) { lines.append(String(repeating: "─", count: 28)) }
             lines.append("\(pad(row.name, 10))\(num(row.p50)) \(num(row.p99)) \(fmt(row.max))")
         }
@@ -453,7 +472,9 @@ final class Session: ConnectionDelegate {
         if !hostFormat.isEmpty {
             lines.append("host in  " + hostFormat)
         }
-        lines.append("here in  " + decoder.inputSummary)
+        if !Options.decodesOnGPU(streamCodec) {
+            lines.append("here in  " + decoder.inputSummary) // VideoToolbox's
+        }
         let hold = renderer.holdStatus(offset: conn?.clockOffsetNs)
         lines += [
             "rtt \(fmt(conn.map { Double($0.rttNs) / 1e6 })) ms  skipped \(st.skipped)  dropped \(st.dropped)  gaps \(s.gaps)" +
@@ -522,19 +543,24 @@ final class Session: ConnectionDelegate {
         case .keepAwake:
             conn?.keepAwake(options.keepWiFiAwake)
             pyro?.keepGPUAwake = options.keepGPUAwake
+            riptide?.keepGPUAwake = options.keepGPUAwake
         case .cursor: updateCapture()
         case .parallelism: sendParallelism()
         case .phaseLock: applyPresentMode() // pacing settings: phase lock, hold, auto
         }
     }
 
-    /// How many parts to cut each frame into, so the encode and the network
-    /// overlap (DESIGN.md 12.6). The host clamps it to what the hardware and
-    /// the picture allow and reports what it settled on, which is the count in
-    /// the stats line's "host in" row.
+    /// How many parts to cut each frame into, so the encode, the network (and
+    /// with Riptide the decode) overlap: AV1 tiles or HEVC slice segments
+    /// (DESIGN.md 12.6), Riptide stripes (§13), each its own setting; the
+    /// codec's default for the rest. The host clamps it to what the hardware
+    /// and the picture allow and reports what it settled on, which is the count
+    /// in the stats line's "host in" row.
     func sendParallelism() {
+        let c = options.codec
+        let parts = Options.cutsIntoParts(c) ? options.parallelism : Options.isRiptide(c) ? options.riptideStripes : 0
         var m = Writer()
-        m.u16(UInt16(clamping: options.parallelism))
+        m.u16(UInt16(clamping: parts))
         conn?.send(Msg.parallelism, m.data)
     }
 

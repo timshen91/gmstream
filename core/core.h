@@ -38,11 +38,9 @@ struct gm_pyrowave;
 struct gm_pyrowave *pyrowave_create(const struct gm_callbacks *cb);
 void pyrowave_destroy(struct gm_pyrowave *pw);
 void pyrowave_start(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz,
-	int packet_bytes, bool inter);
+	int packet_bytes);
 void pyrowave_stop(struct gm_pyrowave *pw);
 void pyrowave_set_rate(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz);
-// Inter frames: the next frame intra (the client has no reference).
-void pyrowave_request_intra(struct gm_pyrowave *pw);
 
 // core/gpuwarm.c: keeps the GPU's clock up while frames are encoded. NULL if
 // unavailable or turned off; touch() then does nothing.
@@ -55,6 +53,25 @@ void gpuwarm_touch(struct gm_gpuwarm *w);
 bool pyrowave_submit(struct gm_pyrowave *pw, struct wlr_buffer *buffer,
 	int width, int height, uint64_t slot_ns);
 void pyrowave_take_stats(struct gm_pyrowave *pw, unsigned *encoded,
+	unsigned *dropped, uint64_t *encode_ns);
+
+/* riptide.c: Riptide (our codec, riptide/) straight from gamescope's dma-buf,
+ * each stripe of a frame to gm_callbacks.riptide as soon as the GPU has
+ * finished it; its own worker thread. */
+struct gm_rtenc;
+struct gm_rtenc *rtenc_create(const struct gm_callbacks *cb);
+void rtenc_destroy(struct gm_rtenc *rt);
+void rtenc_start(struct gm_rtenc *rt, int bitrate_kbps, int refresh_mhz, int packet_bytes);
+void rtenc_stop(struct gm_rtenc *rt);
+void rtenc_set_rate(struct gm_rtenc *rt, int bitrate_kbps, int refresh_mhz);
+// Stripes per frame; 0 for ours.
+void rtenc_set_stripes(struct gm_rtenc *rt, unsigned stripes);
+// The next frame intra (the client has nothing to predict from).
+void rtenc_request_intra(struct gm_rtenc *rt);
+// Compositor thread. False if the buffer cannot be encoded (not a dma-buf).
+bool rtenc_submit(struct gm_rtenc *rt, struct wlr_buffer *buffer,
+	int width, int height, uint64_t slot_ns);
+void rtenc_take_stats(struct gm_rtenc *rt, unsigned *encoded,
 	unsigned *dropped, uint64_t *encode_ns);
 
 /* vkencode.c: AV1 or HEVC on the Vulkan video encode queue, straight from

@@ -1,4 +1,4 @@
-// Keeps an Apple GPU's clock up while PyroWave frames are being decoded.
+// Keeps an Apple GPU's clock up while PyroWave and Riptide frames are being decoded.
 //
 // The GPU's power management sets its clock by how busy it is, and decoding a
 // frame stripe by stripe as it arrives keeps it lightly busy in short bursts:

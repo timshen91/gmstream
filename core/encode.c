@@ -91,12 +91,13 @@ struct gm_encoder {
 
 	// PyroWave runs instead of VA-API while it is the session's codec.
 	struct gm_pyrowave *pw;
+	struct gm_rtenc *rt;
 	// So does the Vulkan AV1 encoder, for AV1 (vkencode.c). The VA-API path
 	// below stays as the reference: GM_AV1_VAAPI picks it instead.
 	struct gm_vkencode *vk;
 	unsigned vk_frames, vk_chunks, vk_patched;
 	double vk_first_ms;
-	bool pw_active, vk_active; // compositor thread
+	bool pw_active, rt_active, vk_active; // compositor thread
 
 	// Worker thread only. Frame ids run on across encoder sessions so the
 	// client can tell a gap from a restart.
@@ -358,6 +359,10 @@ void encoder_submit(struct gm_encoder *enc, struct wlr_buffer *buffer,
 		pyrowave_submit(enc->pw, buffer, width, height, slot_ns);
 		return;
 	}
+	if (enc->rt_active) {
+		rtenc_submit(enc->rt, buffer, width, height, slot_ns);
+		return;
+	}
 	if (enc->vk_active) {
 		vkencode_submit(enc->vk, buffer, width, height, slot_ns);
 		return;
@@ -466,6 +471,7 @@ static bool session_open(struct gm_encoder *enc, struct session *s,
 			}
 			break;
 		case GM_CODEC_PYROWAVE:
+		case GM_CODEC_RIPTIDE:
 			break; // not a VA-API codec (pyrowave.c)
 		}
 		av_opt_set(ctx->priv_data, "async_depth", "1", 0);
@@ -677,6 +683,10 @@ struct gm_encoder *encoder_create(int drm_fd, const struct gm_callbacks *cb) {
 	if (enc->pw != NULL) {
 		enc->supported |= 1u << GM_CODEC_PYROWAVE;
 	}
+	enc->rt = rtenc_create(cb);
+	if (enc->rt != NULL) {
+		enc->supported |= 1u << GM_CODEC_RIPTIDE;
+	}
 	if (getenv("GM_AV1_VAAPI") == NULL) {
 		enc->vk = vkencode_create(cb);
 	}
@@ -711,6 +721,9 @@ void encoder_destroy(struct gm_encoder *enc) {
 	av_frame_free(&enc->pending.frame);
 	vkencode_destroy(enc->vk);
 	pyrowave_destroy(enc->pw);
+	if (enc->rt != NULL) {
+		rtenc_destroy(enc->rt);
+	}
 
 	struct import *imp, *tmp;
 	wl_list_for_each_safe(imp, tmp, &enc->imports, link) {
@@ -748,7 +761,10 @@ void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 		if (enc->pw != NULL) {
 			pyrowave_stop(enc->pw);
 		}
-		enc->pw_active = false;
+		if (enc->rt != NULL) {
+			rtenc_stop(enc->rt);
+		}
+		enc->pw_active = enc->rt_active = false;
 		pthread_mutex_lock(&enc->lock);
 		enc->active = false; // the VA-API worker closes its session
 		av_frame_free(&enc->pending.frame);
@@ -759,19 +775,28 @@ void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 	if (enc->vk != NULL) {
 		vkencode_stop(enc->vk);
 	}
+	// PyroWave and Riptide encode on their own Vulkan devices, each on its own
+	// worker thread.
 	enc->pw_active = codec == GM_CODEC_PYROWAVE && enc->pw != NULL;
-	if (enc->pw_active) {
-		pyrowave_start(enc->pw, bitrate_kbps, refresh_mhz, packet_bytes,
-			(flags & GM_STREAM_PYROWAVE_INTER) != 0);
+	enc->rt_active = codec == GM_CODEC_RIPTIDE && enc->rt != NULL;
+	if (enc->pw != NULL && !enc->pw_active) {
+		pyrowave_stop(enc->pw);
+	}
+	if (enc->rt != NULL && !enc->rt_active) {
+		rtenc_stop(enc->rt);
+	}
+	if (enc->pw_active || enc->rt_active) {
+		if (enc->pw_active) {
+			pyrowave_start(enc->pw, bitrate_kbps, refresh_mhz, packet_bytes);
+		} else {
+			rtenc_start(enc->rt, bitrate_kbps, refresh_mhz, packet_bytes);
+		}
 		pthread_mutex_lock(&enc->lock);
 		enc->active = false; // the VA-API worker closes its session
 		av_frame_free(&enc->pending.frame);
 		pthread_cond_signal(&enc->cond);
 		pthread_mutex_unlock(&enc->lock);
 		return;
-	}
-	if (enc->pw != NULL) {
-		pyrowave_stop(enc->pw);
 	}
 	pthread_mutex_lock(&enc->lock);
 	enc->active = true;
@@ -788,10 +813,13 @@ void encoder_stop(struct gm_encoder *enc) {
 	if (enc->pw != NULL) {
 		pyrowave_stop(enc->pw);
 	}
+	if (enc->rt != NULL) {
+		rtenc_stop(enc->rt);
+	}
 	if (enc->vk != NULL) {
 		vkencode_stop(enc->vk);
 	}
-	enc->pw_active = enc->vk_active = false;
+	enc->pw_active = enc->rt_active = enc->vk_active = false;
 	pthread_mutex_lock(&enc->lock);
 	enc->active = false;
 	av_frame_free(&enc->pending.frame);
@@ -799,14 +827,21 @@ void encoder_stop(struct gm_encoder *enc) {
 	pthread_mutex_unlock(&enc->lock);
 }
 
-// Only the Vulkan encoder cuts a frame up: the VA-API path takes whatever
-// FFmpeg's defaults give it, and PyroWave's units are its wavelet subbands,
-// which are not ours to choose.
+// The Vulkan encoder's tiles or slice segments, or Riptide's stripes: the
+// VA-API path takes whatever FFmpeg's defaults give it, and PyroWave's units
+// are its wavelet subbands, which are not ours to choose. Each applies it to
+// its own codec.
 void encoder_set_parallelism(struct gm_encoder *enc, unsigned parts) {
 	vkencode_set_parallelism(enc->vk, parts);
+	if (enc->rt != NULL) {
+		rtenc_set_stripes(enc->rt, parts);
+	}
 }
 
 void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps) {
+	if (enc->rt != NULL) {
+		rtenc_set_rate(enc->rt, bitrate_kbps, 0);
+	}
 	if (enc->pw != NULL) {
 		pyrowave_set_rate(enc->pw, bitrate_kbps, 0);
 	}
@@ -822,6 +857,9 @@ void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps) {
 }
 
 void encoder_set_refresh(struct gm_encoder *enc, int refresh_mhz) {
+	if (enc->rt != NULL) {
+		rtenc_set_rate(enc->rt, 0, refresh_mhz);
+	}
 	if (enc->pw != NULL) {
 		pyrowave_set_rate(enc->pw, 0, refresh_mhz);
 	}
@@ -840,8 +878,8 @@ void encoder_request_keyframe(struct gm_encoder *enc) {
 	if (enc->vk != NULL) {
 		vkencode_request_keyframe(enc->vk);
 	}
-	if (enc->pw != NULL) {
-		pyrowave_request_intra(enc->pw); // inter frames: the client has nothing to predict from
+	if (enc->rt != NULL) {
+		rtenc_request_intra(enc->rt); // the client has nothing to predict from
 	}
 	pthread_mutex_lock(&enc->lock);
 	enc->keyframe = true;
@@ -860,6 +898,16 @@ void encoder_take_stats(struct gm_encoder *enc, unsigned *encoded,
 		enc->stats_encoded += pe;
 		enc->stats_dropped += pd;
 		enc->stats_encode_ns += pns;
+		*encoded = enc->stats_encoded;
+		*dropped = enc->stats_dropped;
+	}
+	if (enc->rt != NULL) {
+		unsigned re, rd;
+		uint64_t rns;
+		rtenc_take_stats(enc->rt, &re, &rd, &rns);
+		enc->stats_encoded += re;
+		enc->stats_dropped += rd;
+		enc->stats_encode_ns += rns;
 		*encoded = enc->stats_encoded;
 		*dropped = enc->stats_dropped;
 	}

@@ -94,7 +94,7 @@ enum Confinement: Int, CaseIterable {
 struct Options {
     var host = "steamdeck.local"
     var port: UInt16 = 8444
-    var codec: UInt8 = 0 // preferred: 0 H.264, 1 HEVC, 2 AV1, 3 PyroWave
+    var codec: UInt8 = 0 // preferred: 0 H.264, 1 HEVC, 2 AV1, 3 PyroWave, 4 Riptide
     var mbps: UInt32 = 40
     var refresh: Double? // nil: the display's rate
     var size: (Int, Int)? // nil: the window's pixel size
@@ -123,14 +123,12 @@ struct Options {
     // the wire before it is finished (AV1 and HEVC; core/vkencode.c). Off: the
     // host sends whole frames, as before.
     var streamFrames = true
-    // PyroWave with inter frames: each frame predicted from the last one, the
-    // client's losses reported back so the host follows (PROTOCOL.md). Off:
-    // every frame stands alone, as before.
-    var pyrowaveInter = true
     // Each only means something for its own codecs, so each is asked for only
     // with them (and its setting is greyed out otherwise).
     static func takesFramesInPieces(_ codec: UInt8) -> Bool { codec == 1 || codec == 2 }
-    static func takesInterFrames(_ codec: UInt8) -> Bool { codec == 3 }
+    static func cutsIntoParts(_ codec: UInt8) -> Bool { codec == 1 || codec == 2 } // tiles, slice segments
+    static func isRiptide(_ codec: UInt8) -> Bool { codec == 4 }
+    static func decodesOnGPU(_ codec: UInt8) -> Bool { codec == 3 || codec == 4 } // PyroWave, Riptide
     // Manual pacing. Phase lock (Phase.swift): gamescope produces frames on this display's
     // refresh grid. Off: an empty grid, so gamescope paces itself and frames
     // are shown as they arrive (as on a variable-refresh display).
@@ -152,6 +150,11 @@ struct Options {
     // is what measured best -- see DESIGN.md 12.6). Each part costs bits, so
     // this is worth turning down as well as up.
     var parallelism = 0
+    // Riptide: how many stripes the host cuts each frame into (encoded, sent
+    // and decoded one after another). 0: the host's own (a short first stripe,
+    // then 384 rows). More go out sooner but cost bits and a fixed amount of GPU
+    // work each, on both ends.
+    var riptideStripes = 0
     var layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:] // measuring
     var bgra = false // decoder output BGRA instead of NV12 (measuring)
     // Tell the host this client can show HDR10, when the display it is on can
@@ -174,7 +177,6 @@ struct Options {
         if d.object(forKey: "keepWiFiAwake") != nil { keepWiFiAwake = d.bool(forKey: "keepWiFiAwake") }
         if d.object(forKey: "keepGPUAwake") != nil { keepGPUAwake = d.bool(forKey: "keepGPUAwake") }
         if d.object(forKey: "streamFrames") != nil { streamFrames = d.bool(forKey: "streamFrames") }
-        if d.object(forKey: "pyrowaveInter") != nil { pyrowaveInter = d.bool(forKey: "pyrowaveInter") }
         if d.object(forKey: "hdr") != nil { hdr = d.bool(forKey: "hdr") }
         if d.object(forKey: "phaseLock") != nil { phaseLock = d.bool(forKey: "phaseLock") }
         holdFrames = d.bool(forKey: "holdFrames")
@@ -188,6 +190,7 @@ struct Options {
         mouseMode = MouseMode(rawValue: d.integer(forKey: "mouseMode")) ?? .auto
         confinement = Confinement(rawValue: d.integer(forKey: "cursorConfinement")) ?? .auto
         parallelism = d.integer(forKey: "parallelism")
+        riptideStripes = d.integer(forKey: "riptideStripes")
 
         var it = args.makeIterator()
         while let a = it.next() {
@@ -196,6 +199,7 @@ struct Options {
             case "--hevc": codec = 1
             case "--av1": codec = 2
             case "--pyrowave": codec = 3
+            case "--riptide": codec = 4
             case "--bitrate": mbps = UInt32(it.next() ?? "") ?? mbps
             case "--refresh": refresh = Double(it.next() ?? "")
             case "--size": size = Options.parseSize(it.next() ?? "")
@@ -212,7 +216,6 @@ struct Options {
             case "--no-keep-awake": keepWiFiAwake = false
             case "--no-gpu-awake": keepGPUAwake = false
             case "--whole-frames": streamFrames = false
-            case "--intra-only": pyrowaveInter = false
             case "--no-phase": phaseLock = false
             case "--hold": holdFrames = true; pacingMode = .manual
             case "--no-hold": holdFrames = false; pacingMode = .manual
@@ -233,6 +236,9 @@ struct Options {
             case "--confine":
                 let n = it.next()?.lowercased()
                 confinement = Confinement.allCases.first { $0.name == n } ?? confinement
+            case "--stripes":
+                let n = it.next()
+                riptideStripes = n == "auto" ? 0 : max(0, Int(n ?? "") ?? 0)
             case "--parallelism":
                 let n = it.next()?.lowercased()
                 parallelism = n == "auto" ? 0 : max(0, Int(n ?? "") ?? 0)
@@ -275,7 +281,6 @@ struct Options {
         d.set(keepWiFiAwake, forKey: "keepWiFiAwake")
         d.set(keepGPUAwake, forKey: "keepGPUAwake")
         d.set(streamFrames, forKey: "streamFrames")
-        d.set(pyrowaveInter, forKey: "pyrowaveInter")
         d.set(phaseLock, forKey: "phaseLock")
         d.set(holdFrames, forKey: "holdFrames")
         d.set(pacingMode.rawValue, forKey: "pacingMode")
@@ -285,6 +290,7 @@ struct Options {
         d.set(mouseMode.rawValue, forKey: "mouseMode")
         d.set(confinement.rawValue, forKey: "cursorConfinement")
         d.set(parallelism, forKey: "parallelism")
+        d.set(riptideStripes, forKey: "riptideStripes")
     }
 }
 

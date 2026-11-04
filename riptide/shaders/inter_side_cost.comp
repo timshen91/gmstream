@@ -1,0 +1,117 @@
+#version 450
+// Inter frames: the side information's size, charged to the rate control
+// before it resolves, so the whole frame (coefficients, and the inter packets
+// carrying the prediction map and the motion vectors) fits the target. One
+// threadgroup; each thread sizes 4x4 vector tiles' records as they are coded
+// (bitstream/inter.md, riptide_inter.cpp): a map bit per 32x32 block, per
+// component a 4-bit width, then each vector's zigzag delta from last frame's
+// at that width. Then one thread splits them into packets by the same rule as
+// inter_layout().
+//
+// First, a vector whose 32x32 weight block was decided intra is set to last
+// frame's, which costs nothing to send: its own value only reaches the
+// prediction in the blend toward its predicted neighbours. (Experiment knob:
+// FreeIntraVectors, default on.)
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const bool FreeIntraVectors = true;
+
+layout(set = 0, binding = 4) buffer Buckets
+{
+    uint count;
+    uint consumed_payload; // u32 words, accumulated by analyze_rate_control
+} buckets;
+layout(set = 0, binding = 1, rg16i) uniform iimage2D uVectors;
+layout(set = 0, binding = 2) uniform isampler2D uVectorsPrev;
+layout(set = 0, binding = 3) uniform mediump sampler2D uWeights;
+
+layout(push_constant) uniform Registers
+{
+    uint packet_boundary; // bytes per inter packet at most
+};
+
+const int MaxTiles = 4096; // 5K; beyond, an estimate
+shared uint s_tile_bits[MaxTiles];
+
+shared uint s_bits[256];
+
+uint zigzag(int d)
+{
+    return d >= 0 ? uint(2 * d) : uint(-2 * d - 1);
+}
+
+void main()
+{
+    ivec2 size = imageSize(uVectors);
+    ivec2 tiles = (size + 3) / 4;
+    ivec2 msize = textureSize(uWeights, 0);
+    uint bits = 0u;
+    for (int t = int(gl_LocalInvocationIndex); t < tiles.x * tiles.y; t += 256)
+    {
+        ivec2 base = ivec2(t % tiles.x, t / tiles.x) * 4;
+        uvec2 mx = uvec2(0u);
+        int n = 0;
+        for (int y = base.y; y < min(base.y + 4, size.y); y++)
+            for (int x = base.x; x < min(base.x + 4, size.x); x++, n++)
+            {
+                ivec2 prev = texelFetch(uVectorsPrev, ivec2(x, y), 0).xy;
+                ivec2 v = imageLoad(uVectors, ivec2(x, y)).xy;
+                if (FreeIntraVectors && v != prev && texelFetch(uWeights, ivec2(x, y) / 2, 0).x == 0.0)
+                {
+                    v = prev;
+                    imageStore(uVectors, ivec2(x, y), ivec4(v, 0, 0));
+                }
+                ivec2 d = v - prev;
+                mx = max(mx, uvec2(zigzag(d.x), zigzag(d.y)));
+            }
+        uvec2 width = uvec2(findMSB(mx) + 1); // findMSB(0) is -1
+        ivec2 tm = min(ivec2(2), msize - (base / 2));
+        uint tb = uint(tm.x * tm.y) + 8u + uint(n) * (width.x + width.y);
+        if (t < MaxTiles)
+            s_tile_bits[t] = tb;
+        bits += tb;
+    }
+    s_bits[gl_LocalInvocationIndex] = bits;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u)
+    {
+        if (gl_LocalInvocationIndex < s)
+            s_bits[gl_LocalInvocationIndex] += s_bits[gl_LocalInvocationIndex + s];
+        barrier();
+    }
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        uint total = 0u;
+        int count = tiles.x * tiles.y;
+        if (count <= MaxTiles)
+        {
+            // Greedily in tile order, whole records per packet: 8 header bytes,
+            // the records padded to a word.
+            uint open_bits = 0u;
+            bool open = false;
+            for (int t = 0; t < count; t++)
+            {
+                uint b = s_tile_bits[t];
+                if (open && 8u + 4u * ((open_bits + b + 31u) / 32u) > packet_boundary)
+                {
+                    total += 8u + 4u * ((open_bits + 31u) / 32u);
+                    open = false;
+                }
+                if (!open)
+                {
+                    open_bits = 0u;
+                    open = true;
+                }
+                open_bits += b;
+            }
+            if (open)
+                total += 8u + 4u * ((open_bits + 31u) / 32u);
+        }
+        else
+        {
+            // Every packet at most a record (66 bytes) short of full.
+            uint bytes = (s_bits[0] + 7u) / 8u;
+            total = bytes + (bytes / max(packet_boundary - 80u, 1u) + 1u) * 80u;
+        }
+        atomicAdd(buckets.consumed_payload, (total + 3u) / 4u);
+    }
+}

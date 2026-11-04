@@ -15,10 +15,18 @@ mkdir -p build
 pw=build/pyrowave
 pyrowave_checkout $pw
 mkdir -p build/pw-obj
-for f in $pw/metal/*.mm $pw/metal/*.cpp $pw/pyrowave_inter.cpp; do
+for f in $pw/metal/*.mm $pw/metal/*.cpp; do
 	o=build/pw-obj/$(basename "$f").o
 	[ "$o" -nt "$f" ] || clang++ -c -O2 -std=c++17 -fobjc-arc -arch arm64 -mmacosx-version-min=14.0 \
 		-I$pw/metal -I$pw/metal/shaders "$f" -o "$o"
+done
+# Riptide's Metal decoder (../riptide, our codec), beside PyroWave's.
+rt=../riptide
+mkdir -p build/rt-obj
+for f in $rt/metal/*.mm $rt/metal/*.cpp $rt/riptide_inter.cpp; do
+	o=build/rt-obj/$(basename "$f").o
+	[ "$o" -nt "$f" ] || clang++ -c -O2 -std=c++17 -fobjc-arc -arch arm64 -mmacosx-version-min=14.0 \
+		-I$rt -I$rt/metal -I$rt/metal/shaders "$f" -o "$o"
 done
 
 app=build/GMStream.app
@@ -26,8 +34,8 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp Info.plist "$app/Contents/"
 swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -o "$app/Contents/MacOS/GMStream" \
-	-import-objc-header ../apple/Bridge.h -Xcc -I$pw/metal \
-	../apple/*.swift Sources/*.swift build/pw-obj/*.o -lc++ -framework Metal -framework IOSurface
+	-import-objc-header ../apple/Bridge.h -Xcc -I$pw/metal -Xcc -I$rt/metal \
+	../apple/*.swift Sources/*.swift build/pw-obj/*.o build/rt-obj/*.o -lc++ -framework Metal -framework IOSurface
 # Ad-hoc signed, but with a designated requirement naming only the bundle
 # identifier: macOS's privacy permissions (Local Network, Bluetooth) then
 # survive rebuilds instead of following each build's code hash.

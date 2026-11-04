@@ -182,6 +182,7 @@ final class Recorder: ConnectionDelegate {
     private(set) var events: [String] = []
     private(set) var frames: [Frame] = []
     private(set) var packets: [PyroWavePacket] = []
+    private(set) var riptidePackets: [RiptidePacket] = []
     private(set) var audioPackets: [Data] = []
     var onEvent: (String) -> Void = { _ in }
 
@@ -193,6 +194,7 @@ final class Recorder: ConnectionDelegate {
     func received(frame: Frame) { lock.lock(); frames.append(frame); lock.unlock(); onEvent("frame") }
     func audio(_ packet: Data) { lock.lock(); audioPackets.append(packet); lock.unlock(); onEvent("audio") }
     func pyrowave(_ p: PyroWavePacket) { lock.lock(); packets.append(p); lock.unlock(); onEvent("pyrowave") }
+    func riptide(_ p: RiptidePacket) { lock.lock(); riptidePackets.append(p); lock.unlock(); onEvent("riptide") }
     func helloAck(codec: UInt8) { record("helloAck \(codec)") }
     func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data) {
         record("cursor \(width)x\(height) hot \(hotX),\(hotY) \([UInt8](rgba))")
@@ -203,8 +205,8 @@ final class Recorder: ConnectionDelegate {
     func encodeFormat(_ text: String) {}
     func closed(reason: String) { record("closed \(reason)") }
 
-    var snapshot: (events: [String], frames: [Frame], packets: [PyroWavePacket], audio: [Data]) {
+    var snapshot: (events: [String], frames: [Frame], packets: [PyroWavePacket], riptide: [RiptidePacket], audio: [Data]) {
         lock.lock(); defer { lock.unlock() }
-        return (events, frames, packets, audioPackets)
+        return (events, frames, packets, riptidePackets, audioPackets)
     }
 }

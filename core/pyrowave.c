@@ -9,19 +9,8 @@
 // dma-buf into Vulkan (cached per buffer), encodes it straight from there, and
 // cuts the bitstream into packets that each fit one datagram. The frame goes
 // to the callback as the packets back to back, each after a u16 length.
-//
-// With inter frames (GM_STREAM_PYROWAVE_INTER, PROTOCOL.md) each frame is
-// predicted from the encoder's own decode of the previous one, which is what
-// the client has as long as nothing is lost. The frame is coded in stripes,
-// horizontal bands each coded as an image of its own: the GPU finishes them one
-// after another, and each goes out as soon as it is done, so the frame is on
-// the wire while the rest is coded, and the client decodes each while the next
-// arrives. A client that misses packets says which; the encoder replays its
-// decode (pyrowave_encoder_report_loss) so the next frames predict from what it
-// actually has.
 
 #include <errno.h>
-#include <poll.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/dma-buf.h>
@@ -47,37 +36,6 @@
 // packets took ~8 ms to arrive and in ~64 KB packets ~0.2 ms.
 #define DEFAULT_PACKET 1100
 #define MAX_IMPORTS 8
-// Inter frames: the frames kept for replaying a client's losses (~133 ms at 60
-// fps; a report older than that makes the next frame intra), and the reports
-// waiting for the worker.
-#define INTER_HISTORY 8
-#define FRAME_MAP 64
-#define MAX_LOSSES 16
-#define MAX_RANGES 64
-// Inter frames: each stripe's rows (the last takes the rest). Shorter stripes
-// go out sooner but cost bits (on Euro Truck at 1080p, 256 rows cost 0.05 dB
-// PSNR-Y, 128 rows 0.15) and a fixed amount of GPU work each, on both ends.
-// Measured at 2560x1600, 120 Hz (present to decoded on the client, with both
-// GPUs kept awake): 384 rows after a first stripe of 128 were best or close to
-// it, light or heavy GPU load, 100 or 300 Mb/s (5.3-8.6 ms; 256 rows 5.4-9.2,
-// one stripe 6.4-9.7). GM_PYROWAVE_STRIPE_ROWS (0 for one stripe) and
-// GM_PYROWAVE_FIRST_ROWS.
-#define STRIPE_ROWS 384
-#define FIRST_STRIPE_ROWS 128
-
-struct loss {
-	uint32_t frame_id;
-	uint16_t count;
-	uint16_t n_ranges;
-	uint16_t ranges[2 * MAX_RANGES];
-};
-
-// An encoded frame's id and what the encoder calls it.
-struct frame_entry {
-	bool valid;
-	uint32_t frame_id, number;
-	uint16_t packets;
-};
 
 struct dmabuf {
 	int fds[WLR_DMABUF_MAX_PLANES];
@@ -110,7 +68,6 @@ struct import {
 struct gm_pyrowave {
 	const struct gm_callbacks *cb;
 	pyrowave_device device;
-	struct gm_gpuwarm *warm;
 
 	pthread_t thread;
 	pthread_mutex_t lock;
@@ -119,23 +76,12 @@ struct gm_pyrowave {
 	bool quit, active;
 	struct job pending;
 	int bitrate_kbps, refresh_mhz, packet_bytes;
-	bool inter; // the stream wants inter frames
-	bool intra_requested;
-	struct loss losses[MAX_LOSSES];
-	int n_losses;
 	unsigned stats_encoded, stats_dropped;
 	uint64_t stats_encode_ns;
 
 	// Worker thread only.
 	pyrowave_encoder encoder;
 	int enc_width, enc_height;
-	bool inter_on; // the encoder has inter frames enabled
-	size_t inter_packet;
-	int stripe_rows, first_rows;
-	struct frame_entry frames[FRAME_MAP];
-	uint32_t repaired; // newest frame id whose loss report was taken in
-	uint8_t *received;
-	size_t received_cap;
 	struct import imports[MAX_IMPORTS];
 	uint64_t use_counter;
 	uint32_t next_frame_id;
@@ -221,26 +167,9 @@ bool pyrowave_submit(struct gm_pyrowave *pw, struct wlr_buffer *buffer,
 /* ---- worker thread ------------------------------------------------------ */
 
 // Measuring (GM_DEBUG_ENCODE=<file>): per encoded frame "e slot submitted
-// started gpu_done packetized first", host ns: its slot, when the compositor
-// handed it over, when the worker started on it, when the GPU work was done,
-// when the packets were ready, when the first stripe's were (inter frames;
-// 0 otherwise), and when the encode call had submitted the GPU work.
-// GM_DEBUG_INTER: log loss reports as they are taken in.
-static bool debug_inter(void) {
-	static int on = -1;
-	if (on < 0) {
-		on = getenv("GM_DEBUG_INTER") != NULL;
-	}
-	return on;
-}
-
-static void profile_line(void *userdata, const char *msg) {
-	(void)userdata;
-	if (strstr(msg, "Heap") == NULL) {
-		wlr_log(WLR_INFO, "PyroWave GPU %s", msg);
-	}
-}
-
+// started gpu_done packetized", host ns: its slot, when the compositor
+// handed it over, when the worker started on it, when the GPU work was done
+// and when the packets were ready.
 static FILE *encode_trace(void) {
 	static FILE *f;
 	static bool opened;
@@ -341,7 +270,6 @@ static bool ensure_encoder(struct gm_pyrowave *pw, int width, int height) {
 	}
 	pw->enc_width = width;
 	pw->enc_height = height;
-	pw->inter_on = false; // a new encoder starts without (encode_one turns them on)
 	wlr_log(WLR_INFO, "Encoding PyroWave %dx%d", width, height);
 	return true;
 }
@@ -354,140 +282,11 @@ static void *grow(void *p, size_t *cap, size_t need, size_t elem) {
 	return realloc(p, *cap * elem);
 }
 
-// Sends packets to the callback: video for an intra-only stream (the whole
-// frame), pyrowave for one with inter frames (a stripe: n packets numbered from
-// first, its inter packets first).
-static void emit(struct gm_pyrowave *pw, struct job *job, uint32_t frame_id, const pyrowave_packet *packets,
-		const uint8_t *bitstream, size_t first, size_t n, size_t n_inter, int stripe, int stripes,
-		bool predicted, uint64_t ready_ns) {
-	size_t total = 0;
-	for (size_t i = 0; i < n; i++) {
-		total += 2 + packets[i].size;
-	}
-	pw->out = grow(pw->out, &pw->out_cap, total, 1);
-	size_t off = 0;
-	for (size_t i = 0; i < n; i++) {
-		uint16_t len = (uint16_t)packets[i].size;
-		memcpy(pw->out + off, &len, 2);
-		memcpy(pw->out + off + 2, bitstream + packets[i].offset, len);
-		off += 2 + len;
-	}
-	if (!pw->inter_on) {
-		struct gm_video_packet out = {
-			.data = pw->out,
-			.len = total,
-			.frame_id = frame_id,
-			.slot_ns = job->slot_ns,
-			.encoded_ns = ready_ns,
-			.width = (uint16_t)job->width,
-			.height = (uint16_t)job->height,
-			.keyframe = true, // every frame stands alone
-			.codec = GM_CODEC_PYROWAVE,
-		};
-		pw->cb->video(pw->cb->ctx, &out);
-		return;
-	}
-	struct gm_pyrowave_packets out = {
-		.data = pw->out,
-		.len = total,
-		.frame_id = frame_id,
-		.first = (uint16_t)first,
-		.count = (uint16_t)n,
-		.stripe = (uint8_t)stripe,
-		.stripes = (uint8_t)stripes,
-		.first_rows = (uint16_t)pw->first_rows,
-		.stripe_rows = (uint16_t)pw->stripe_rows,
-		.inter = (uint8_t)n_inter,
-		.predicted = predicted,
-		.repaired = pw->repaired,
-		.slot_ns = job->slot_ns,
-		.encoded_ns = ready_ns,
-		.width = (uint16_t)job->width,
-		.height = (uint16_t)job->height,
-	};
-	pw->cb->pyrowave(pw->cb->ctx, &out);
-}
-
-// Inter frames: the client's loss reports, oldest first, into the encoder.
-static void take_losses(struct gm_pyrowave *pw) {
-	struct loss losses[MAX_LOSSES];
-	pthread_mutex_lock(&pw->lock);
-	int n = pw->n_losses;
-	memcpy(losses, pw->losses, sizeof(losses[0]) * (size_t)n);
-	pw->n_losses = 0;
-	pthread_mutex_unlock(&pw->lock);
-	for (int k = 0; k < n; k++) {
-		struct loss *l = &losses[k];
-		if ((int32_t)(l->frame_id - pw->repaired) <= 0) {
-			continue; // taken in already (the client repeats a report until it hears)
-		}
-		struct frame_entry *f = &pw->frames[l->frame_id % FRAME_MAP];
-		pw->repaired = l->frame_id;
-		if (!f->valid || f->frame_id != l->frame_id) {
-			pyrowave_encoder_request_intra(pw->encoder);
-			wlr_log(WLR_INFO, "PyroWave: loss report for unknown frame %u; next frame intra", l->frame_id);
-			continue;
-		}
-		pw->received = grow(pw->received, &pw->received_cap, f->packets, 1);
-		memset(pw->received, 1, f->packets);
-		for (int r = 0; r < l->n_ranges; r++) {
-			uint32_t first = l->ranges[2 * r], len = l->ranges[2 * r + 1];
-			for (uint32_t i = first; i < first + len && i < f->packets; i++) {
-				pw->received[i] = 0;
-			}
-		}
-		pyrowave_result r = pyrowave_encoder_report_loss(pw->encoder, f->number, pw->received, f->packets);
-		if (debug_inter()) {
-			wlr_log(WLR_INFO, "PyroWave: frame %u loss report (%u ranges): %s", l->frame_id, l->n_ranges,
-				r == PYROWAVE_SUCCESS ? "replayed" : "too old, next frame intra");
-		}
-	}
-}
-
 static void encode_one(struct gm_pyrowave *pw, struct job *job, int bitrate_kbps,
-		int refresh_mhz, size_t packet, bool inter) {
+		int refresh_mhz, size_t packet) {
 	pyrowave_image image = import_dmabuf(pw, &job->buf);
 	if (image == NULL || !ensure_encoder(pw, job->width, job->height)) {
 		return;
-	}
-	gpuwarm_touch(pw->warm);
-	if (inter != pw->inter_on || (inter && packet != pw->inter_packet)) {
-		const char *rows_env = getenv("GM_PYROWAVE_STRIPE_ROWS"), *first_env = getenv("GM_PYROWAVE_FIRST_ROWS");
-		int rows = rows_env != NULL ? atoi(rows_env) : STRIPE_ROWS;
-		int first = first_env != NULL ? atoi(first_env) : FIRST_STRIPE_ROWS;
-		if (job->height < 2 * rows) {
-			rows = first = 0; // one stripe
-		}
-		pyrowave_inter_info ii = { .enable = inter, .packet_boundary = packet, .history = INTER_HISTORY,
-			.stripe_rows = rows, .first_stripe_rows = first };
-		if (pyrowave_encoder_enable_inter(pw->encoder, &ii) != PYROWAVE_SUCCESS) {
-			wlr_log(WLR_ERROR, "PyroWave: enabling inter frames (stripes of %d rows) failed", rows);
-			inter = false;
-		}
-		pw->stripe_rows = rows;
-		pw->first_rows = first;
-		pw->inter_on = inter;
-		pw->inter_packet = packet;
-		memset(pw->frames, 0, sizeof(pw->frames));
-		wlr_log(WLR_INFO, "PyroWave inter frames %s", inter ? "on" : "off");
-	}
-	if (pw->inter_on) {
-		take_losses(pw);
-		pthread_mutex_lock(&pw->lock);
-		bool intra = pw->intra_requested;
-		pw->intra_requested = false;
-		pthread_mutex_unlock(&pw->lock);
-		if (intra) {
-			pyrowave_encoder_request_intra(pw->encoder);
-		}
-	}
-	uint64_t fence_ns = 0;
-	if (getenv("GM_DEBUG_FENCEWAIT") != NULL && job->sync_fd >= 0) {
-		// Measuring: when gamescope's rendering of the frame is done (the CPU
-		// waits for it here instead of the GPU).
-		struct pollfd p = { .fd = job->sync_fd, .events = POLLIN };
-		poll(&p, 1, 100);
-		fence_ns = gm_now_ns();
 	}
 	pyrowave_sync_object sync = NULL;
 	if (job->sync_fd >= 0) {
@@ -522,85 +321,57 @@ static void encode_one(struct gm_pyrowave *pw, struct job *job, int bitrate_kbps
 
 	uint64_t start = gm_now_ns();
 	pyrowave_result r = pyrowave_encoder_encode_gpu_scaled(pw->encoder, &acquire, &release, &si, &rc);
-	uint64_t submitted = gm_now_ns();
-	uint32_t frame_id = pw->next_frame_id++;
-	uint64_t first_done = 0, gpu_done = 0, done = 0;
-	if (r == PYROWAVE_SUCCESS && pw->inter_on) {
-		bool predicted = false;
-		uint32_t number = 0;
-		pyrowave_encoder_get_frame_info(pw->encoder, &number, &predicted);
-		int stripes = pyrowave_encoder_get_stripe_count(pw->encoder);
-		size_t cap = budget / 256 + 1024;
-		pw->packets = grow(pw->packets, &pw->packets_cap, cap, sizeof(*pw->packets));
-		pw->bitstream = grow(pw->bitstream, &pw->bitstream_cap, budget + 65536, 1);
-		size_t first = 0;
-		for (int k = 0; k < stripes && r == PYROWAVE_SUCCESS; k++) {
-			// Blocks until the GPU has finished this stripe, not the frame.
-			size_t n = 0, n_inter = 0;
-			r = pyrowave_encoder_packetize_stripe(pw->encoder, k, packet, pw->packets, pw->packets_cap, &n,
-				&n_inter, pw->bitstream, pw->bitstream_cap);
-			if (r != PYROWAVE_SUCCESS) {
-				break;
-			}
-			uint64_t ready = gm_now_ns();
-			if (k == 0) {
-				first_done = ready;
-			}
-			emit(pw, job, frame_id, pw->packets, pw->bitstream, first, n, n_inter, k, stripes,
-				predicted, ready);
-			uint64_t emitted = gm_now_ns();
-			first += n;
-			// The next frame's reference (submitted; the GPU does it after this frame).
-			pyrowave_encoder_decode_stripe(pw->encoder, k);
-			if (encode_trace() != NULL) {
-				fprintf(encode_trace(), "s %d %" PRIu64 " %" PRIu64 " %" PRIu64 " %zu\n", k, ready - start,
-					emitted - start, gm_now_ns() - start, n);
-			}
-		}
-		gpu_done = done = gm_now_ns();
-		if (r == PYROWAVE_SUCCESS) {
-			pw->frames[frame_id % FRAME_MAP] = (struct frame_entry){ .valid = true, .frame_id = frame_id,
-				.number = number, .packets = (uint16_t)first };
-		}
-	} else {
-		size_t n = 0;
-		if (r == PYROWAVE_SUCCESS) {
-			// Blocks until the GPU is done.
-			r = pyrowave_encoder_compute_num_packets(pw->encoder, packet, &n);
-		}
-		gpu_done = gm_now_ns();
-		size_t out_packets = 0;
-		if (r == PYROWAVE_SUCCESS) {
-			pw->packets = grow(pw->packets, &pw->packets_cap, n, sizeof(*pw->packets));
-			pw->bitstream = grow(pw->bitstream, &pw->bitstream_cap, budget + n * 64 + 4096, 1);
-			r = pyrowave_encoder_packetize(pw->encoder, pw->packets, packet, &out_packets,
-				pw->bitstream, pw->bitstream_cap);
-		}
-		done = gm_now_ns();
-		if (r == PYROWAVE_SUCCESS) {
-			emit(pw, job, frame_id, pw->packets, pw->bitstream, 0, out_packets, 0, 0, 1, false, done);
-		}
+	size_t n = 0;
+	if (r == PYROWAVE_SUCCESS) {
+		// Blocks until the GPU is done.
+		r = pyrowave_encoder_compute_num_packets(pw->encoder, packet, &n);
 	}
+	uint64_t gpu_done = gm_now_ns();
 	if (sync != NULL) {
 		pyrowave_sync_object_destroy(sync);
 	}
 	if (r != PYROWAVE_SUCCESS) {
 		wlr_log(WLR_ERROR, "PyroWave: encode failed: %d", r);
-		if (pw->inter_on) {
-			pyrowave_encoder_request_intra(pw->encoder);
-		}
 		return;
 	}
+	pw->packets = grow(pw->packets, &pw->packets_cap, n, sizeof(*pw->packets));
+	pw->bitstream = grow(pw->bitstream, &pw->bitstream_cap, budget + n * 64 + 4096, 1);
+	size_t out_packets = 0;
+	if (pyrowave_encoder_packetize(pw->encoder, pw->packets, packet, &out_packets,
+			pw->bitstream, pw->bitstream_cap) != PYROWAVE_SUCCESS) {
+		wlr_log(WLR_ERROR, "PyroWave: packetize failed");
+		return;
+	}
+	size_t total = 0;
+	for (size_t i = 0; i < out_packets; i++) {
+		total += 2 + pw->packets[i].size;
+	}
+	pw->out = grow(pw->out, &pw->out_cap, total, 1);
+	size_t off = 0;
+	for (size_t i = 0; i < out_packets; i++) {
+		uint16_t len = (uint16_t)pw->packets[i].size;
+		memcpy(pw->out + off, &len, 2);
+		memcpy(pw->out + off + 2, pw->bitstream + pw->packets[i].offset, len);
+		off += 2 + len;
+	}
+	uint64_t done = gm_now_ns();
 	if (encode_trace() != NULL) {
-		fprintf(encode_trace(), "e %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
-			job->slot_ns, job->submit_ns, start, gpu_done, done, first_done, submitted, fence_ns);
+		fprintf(encode_trace(), "e %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+			job->slot_ns, job->submit_ns, start, gpu_done, done);
 	}
+	struct gm_video_packet out = {
+		.data = pw->out,
+		.len = total,
+		.frame_id = pw->next_frame_id++,
+		.slot_ns = job->slot_ns,
+		.encoded_ns = done,
+		.width = (uint16_t)job->width,
+		.height = (uint16_t)job->height,
+		.keyframe = true, // every frame stands alone
+		.codec = GM_CODEC_PYROWAVE,
+	};
+	pw->cb->video(pw->cb->ctx, &out);
 
-	static unsigned profiled;
-	if (getenv("GM_DEBUG_PWPROF") != NULL && ++profiled % 240 == 0) {
-		// Measuring: the encoder's GPU time per pass, averaged since the last report.
-		pyrowave_device_report_performance_stats(pw->device, profile_line, NULL, true);
-	}
 	pthread_mutex_lock(&pw->lock);
 	pw->stats_encoded++;
 	pw->stats_encode_ns += done - start;
@@ -619,9 +390,8 @@ static void *worker(void *data) {
 		pw->pending.valid = false;
 		int bitrate = pw->bitrate_kbps, refresh = pw->refresh_mhz;
 		size_t packet = pw->packet_bytes > 0 ? (size_t)pw->packet_bytes : DEFAULT_PACKET;
-		bool inter = pw->inter;
 		pthread_mutex_unlock(&pw->lock);
-		encode_one(pw, &job, bitrate, refresh, packet, inter);
+		encode_one(pw, &job, bitrate, refresh, packet);
 		job_clear(&job);
 		pthread_mutex_lock(&pw->lock);
 	}
@@ -630,31 +400,6 @@ static void *worker(void *data) {
 }
 
 /* ---- setup -------------------------------------------------------------- */
-
-// The one encoder, for gm_pyrowave_loss.
-static struct gm_pyrowave *current;
-static pthread_mutex_t current_lock = PTHREAD_MUTEX_INITIALIZER;
-
-void gm_pyrowave_loss(uint32_t frame_id, uint16_t count, const uint16_t *ranges, size_t n_ranges) {
-	pthread_mutex_lock(&current_lock);
-	struct gm_pyrowave *pw = current;
-	if (pw != NULL) {
-		pthread_mutex_lock(&pw->lock);
-		if (pw->n_losses < MAX_LOSSES) {
-			struct loss *l = &pw->losses[pw->n_losses++];
-			l->frame_id = frame_id;
-			l->count = count;
-			l->n_ranges = (uint16_t)(n_ranges < MAX_RANGES ? n_ranges : MAX_RANGES);
-			memcpy(l->ranges, ranges, sizeof(uint16_t) * 2 * l->n_ranges);
-			if (n_ranges > MAX_RANGES) {
-				// Too fragmented to list: count everything after the listed ones lost.
-				l->ranges[2 * MAX_RANGES - 1] = 0xffff;
-			}
-		}
-		pthread_mutex_unlock(&pw->lock);
-	}
-	pthread_mutex_unlock(&current_lock);
-}
 
 struct gm_pyrowave *pyrowave_create(const struct gm_callbacks *cb) {
 	struct gm_pyrowave *pw = calloc(1, sizeof(*pw));
@@ -681,11 +426,7 @@ struct gm_pyrowave *pyrowave_create(const struct gm_callbacks *cb) {
 		VK_QUEUE_GLOBAL_PRIORITY_HIGH, VK_QUEUE_GLOBAL_PRIORITY_REALTIME);
 	pthread_mutex_init(&pw->lock, NULL);
 	pthread_cond_init(&pw->cond, NULL);
-	pw->warm = gpuwarm_create();
 	pthread_create(&pw->thread, NULL, worker, pw);
-	pthread_mutex_lock(&current_lock);
-	current = pw;
-	pthread_mutex_unlock(&current_lock);
 	wlr_log(WLR_INFO, "PyroWave encoder ready");
 	return pw;
 }
@@ -694,17 +435,11 @@ void pyrowave_destroy(struct gm_pyrowave *pw) {
 	if (pw == NULL) {
 		return;
 	}
-	pthread_mutex_lock(&current_lock);
-	if (current == pw) {
-		current = NULL;
-	}
-	pthread_mutex_unlock(&current_lock);
 	pthread_mutex_lock(&pw->lock);
 	pw->quit = true;
 	pthread_cond_signal(&pw->cond);
 	pthread_mutex_unlock(&pw->lock);
 	pthread_join(pw->thread, NULL);
-	gpuwarm_destroy(pw->warm);
 	job_clear(&pw->pending);
 	for (int i = 0; i < MAX_IMPORTS; i++) {
 		if (pw->imports[i].image != NULL) {
@@ -718,16 +453,13 @@ void pyrowave_destroy(struct gm_pyrowave *pw) {
 	free(pw->packets);
 	free(pw->bitstream);
 	free(pw->out);
-	free(pw->received);
 	free(pw);
 }
 
 void pyrowave_start(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz,
-		int packet_bytes, bool inter) {
+		int packet_bytes) {
 	pthread_mutex_lock(&pw->lock);
 	pw->active = true;
-	pw->inter = inter;
-	pw->n_losses = 0;
 	pw->bitrate_kbps = bitrate_kbps;
 	pw->refresh_mhz = refresh_mhz;
 	pw->packet_bytes = packet_bytes;
@@ -749,12 +481,6 @@ void pyrowave_set_rate(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz
 	if (refresh_mhz > 0) {
 		pw->refresh_mhz = refresh_mhz;
 	}
-	pthread_mutex_unlock(&pw->lock);
-}
-
-void pyrowave_request_intra(struct gm_pyrowave *pw) {
-	pthread_mutex_lock(&pw->lock);
-	pw->intra_requested = true;
 	pthread_mutex_unlock(&pw->lock);
 }
 

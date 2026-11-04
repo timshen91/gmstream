@@ -50,23 +50,23 @@ Unknown types are skipped.
 | 0x0b | GamepadRemove | `u8 index` |
 | 0x0c | Ping | `u64 client_time_us` |
 | 0x0e | VrrPolicy | `u8 policy`: what the client wants of Steam's VRR. 0 = leave Steam's toggle alone (the default); 1 = off: the host reports the client's grid as a fixed refresh, or the stream's rate with no grid, so gamescope calls the display VRR-incapable and Steam greys its toggle; 2 = on: the host sets gamescope's `adaptive_sync` (what Steam's toggle sets) and hands each frame to the encoder at once, stamped with gamescope's commit time (the client holds frames itself). Leaving 2, the host restores `adaptive_sync` from Steam's preference (`GAMESCOPE_VRR_ENABLED`). Cleared when a stream starts or stops. |
-| 0x11 | Parallelism | `u16 parts`: how many parts the host cuts each frame into, so the encode and the network overlap -- AV1 tiles or HEVC slice segments. 0 asks for the codec's default (AV1 as many as the hardware allows, HEVC one). The host clamps it to what the hardware and the picture allow and reports what it settled on in `EncodeFormat`, so the client can show the count it actually got. May be sent at any time; the next frame uses it. |
+| 0x11 | Parallelism | `u16 parts`: how many parts the host cuts each frame into, so the encode and the network overlap -- AV1 tiles, HEVC slice segments or Riptide stripes, whichever codec the stream uses. 0 asks for the codec's default (AV1 as many as the hardware allows, HEVC one, Riptide a 128-row stripe then 384-row ones). The host clamps it to what the hardware and the picture allow and reports what it settled on in `EncodeFormat`, so the client can show the count it actually got. May be sent at any time; the next frame uses it. |
 | 0x0f | Touch | `u8 id, u8 phase, f32 x, f32 y`: a touchscreen. Phase 0 = down, 1 = moved, 2 = up, 3 = cancel (every touch ends; id and position ignored); x, y normalized 0..1 over the video. Ids are the client's, reused after up. The host's gamescope applies its touch mode (SteamOS: passed through to Steam and the game as a touchscreen). |
 | 0x0d | DisplayGrid | `u64 anchor_ns, u32 interval_ns`: the client display's refresh grid in host CLOCK_MONOTONIC (a vblank and the interval), shifted by the client to set where frames land. The host then reports gamescope's frames as presented on that grid (still as a VRR-capable display, so Steam's VRR toggle stays available; with it off, gamescope paces to the grid). Native clients send it every 500 ms; it is cleared when a stream starts, and by an interval of 0 (a client on a variable-refresh display, which shows frames as they arrive). |
 
 `Hello` must be first. Hello flags: bit 0 = one video stream, bit 1 = video
 datagrams (see Video; if both are set, datagrams win), bit 2 = video chunks
 (AV1 and HEVC; see "Video chunks" below), bit 3 = the client can show HDR10 (PQ,
-BT.2020, ten-bit), bit 4 = PyroWave inter frames (plain UDP only; see "PyroWave
-inter frames" below). Bits 2 and 4 belong to their codecs: a client sets them
-only when it asks for one of those codecs, and the host ignores them for any
-other codec it settles on. Bit 3 states what the client is able to display, not what
+BT.2020, ten-bit). Bit 2 belongs to its codecs: a client sets it only when it
+asks for AV1 or HEVC, and the host ignores it for any other codec it settles
+on. Bit 4 once asked for PyroWave inter frames; that is now its own codec,
+Riptide (below), and the bit is unused. Bit 3 states what the client is able to display, not what
 it wants: whether the session is HDR at all is the host's own setting (on
 SteamOS, Steam's display setting, which drives gamescope). The host sends an
 HDR stream only when both agree, and an eight-bit BT.709 one otherwise, so a
 client that cannot show HDR is never made to convert a ten-bit stream it
 has no use for.
-`max_datagram`: the largest UDP payload the client's link carries unfragmented (its interface MTU minus the IP and UDP headers); 0 = unknown. Version 1 clients (no flags byte) and version 2 clients (no `max_datagram`) are still accepted. Codec ids: 0 = H.264, 1 = HEVC, 2 = AV1, 3 = PyroWave (see below); the mask has
+`max_datagram`: the largest UDP payload the client's link carries unfragmented (its interface MTU minus the IP and UDP headers); 0 = unknown. Version 1 clients (no flags byte) and version 2 clients (no `max_datagram`) are still accepted. Codec ids: 0 = H.264, 1 = HEVC, 2 = AV1, 3 = PyroWave, 4 = Riptide (plain UDP only; see below); the mask has
 bit `1 << id` set for each codec the client can decode. Gamepad buttons follow
 the W3C standard mapping (bit i = `buttons[i]`, 0..16); stick y is positive
 down; triggers are 0..255. Keys are not repeated by the client: gamescope does
@@ -185,7 +185,7 @@ A frame's pieces are at most `max_datagram` minus this 43-byte header.
 ## PyroWave
 
 Codec 3 is [PyroWave](https://github.com/Themaister/pyrowave): a GPU wavelet
-codec, intra-only unless the client asks for inter frames (below), whose rate control caps every frame at bitrate / refresh rate
+codec, intra-only, whose rate control caps every frame at bitrate / refresh rate
 bytes, so each frame's transmit time is bounded. YCbCr 4:2:0, BT.709 full
 range. Its frames always go as datagrams, whatever the Hello flags, one
 PyroWave packet per datagram. A packet is at most 1100 bytes, except over
@@ -209,25 +209,27 @@ u64 encoded_ns
 Packets decode independently: a lost one only blurs its part of the frame.
 The client decodes once it has `packet_count` packets of a frame; a frame
 still incomplete when a newer one starts is skipped. Every frame stands
-alone, so there are no keyframe requests (inter frames, below, differ).
+alone, so there are no keyframe requests (Riptide, below, differs).
 
-## PyroWave inter frames
+## Riptide
 
-With Hello flag bit 4, over plain UDP, a PyroWave frame is coded as its
-difference from a prediction from the previous decoded frame (PyroWave's
-`bitstream/inter.md`, in the tree `build/pyrowave-inter.patch` gives). Every
-frame is still at most bitrate / refresh rate bytes, and there are no
-keyframes: the first frame, and any frame after the host loses track of the
-client, is intra (it predicts from nothing), at the same size as the rest.
+Codec 4 is Riptide (`riptide/`; its design is `riptide/README.md`, its
+bitstream `riptide/bitstream/`). It is offered only over plain UDP, where the
+loss reports below travel. A frame is coded as its difference from a
+prediction from the previous decoded frame. Every frame is at most bitrate /
+refresh rate bytes, and there are no keyframes: the first frame, and any frame
+after the host loses track of the client, is intra (it predicts from nothing),
+at the same size as the rest. YCbCr 4:2:0, BT.709 full range.
 
 The frame is coded in stripes: horizontal bands, each coded as an image of its
-own (its own PyroWave packets, inter packets and share of the frame's bytes)
-that predicts from the whole previous frame. The first stripe is
-`first_rows` tall, the others `stripe_rows`, and the last takes the rest (it is
-never shorter than 128 rows). The host sends each stripe as soon as its GPU has
-finished it, while it codes the next, and the client decodes each as soon as it
-has arrived, into its rows of the frame, while the next is on the way. The
-frame's packets are numbered across its stripes in order.
+own (its own packets, inter packets and share of the frame's bytes) that
+predicts from the whole previous frame. The first stripe is `first_rows` tall,
+the others `stripe_rows`, and the last takes the rest (it is never shorter
+than 128 rows). `Parallelism` sets how many stripes there are. The host sends
+each stripe as soon as its GPU has finished it, while it codes the next, and
+the client decodes each as soon as it has arrived, into its rows of the frame,
+while the next is on the way. The frame's packets are numbered across its
+stripes in order, and each is at most `max_datagram` minus this 43-byte header.
 
 ```
 u8  type = 10
@@ -246,7 +248,7 @@ u16 stripe_rows       every other stripe's but the last's
 u16 stripe_first      the stripe's first packet's number
 u16 stripe_count      the stripe's packets
 u8  stripe_inter      its first stripe_inter packets are inter packets
-... one PyroWave packet
+... one Riptide packet
 ```
 
 A stripe's inter packets (its prediction map and motion vectors) come first;
@@ -259,7 +261,7 @@ never came reports the rest as missing.
 
 The client decodes every frame, in order, with whatever arrived of it: a frame
 still incomplete when the next one starts is decoded as it is, and a frame of
-which nothing arrived is decoded from nothing (PyroWave's loss rules make each
+which nothing arrived is decoded from nothing (Riptide's loss rules make each
 of these exact). It reports what it missed, sealed like a mouse datagram with
 nonce kind 3 and its own sequence numbers:
 
@@ -282,7 +284,7 @@ decodes nothing until an intra frame comes.
 
 ## Audio
 
-Datagrams (type 1; type 2 is video in datagram mode, 4 is PyroWave):
+Datagrams (type 1; type 2 is video in datagram mode, 4 is PyroWave, 10 is Riptide):
 
 ```
 u8  type = 1
@@ -313,8 +315,8 @@ type byte:
 | 7 | mouse (client → host): `u32 sequence` then a sealed payload (below) |
 | 8 | acknowledgement (host → client): `u32 sequence` then a sealed `u32` |
 | 9 | a piece of a frame, as in "Video chunks" above |
-| 10 | a PyroWave inter frame packet, as in "PyroWave inter frames" above |
-| 11 | a PyroWave loss report (client → host), as in "PyroWave inter frames" above |
+| 10 | a Riptide packet, as in "Riptide" above |
+| 11 | a Riptide loss report (client → host), as in "Riptide" above |
 
 A session starts with a handshake. Client → host: type 6, an ephemeral X25519
 public key, then zeros up to 129 bytes in all (so a forged request gets back no
@@ -332,7 +334,7 @@ the big-endian sequence number as nonce, the 16-byte tag last, so its payload is
 at most 1379 bytes. A datagram that doesn't open is dropped.
 
 The nonce's first byte says what the number counts, each with its own numbers: 0
-control, 1 mouse, 2 acknowledgement, 3 PyroWave loss report.
+control, 1 mouse, 2 acknowledgement, 3 Riptide loss report.
 
 Mouse datagrams are not ordered, nor resent: a client sends one per mouse event
 and the host ignores any older than the newest it has seen. A payload of `u8 0, f64
@@ -358,7 +360,7 @@ The control stream (the same messages as over WebTransport, both
 directions) is cut into type-3 datagrams numbered from 0 in each direction;
 the receiver puts them back in order and reads messages from the bytes. A
 control datagram never carries more than 1400 bytes, so nothing is fragmented
-by IP; PyroWave datagrams follow `max_datagram` (above).
+by IP; PyroWave and Riptide datagrams follow `max_datagram` (above).
 
 A client is identified by its address and port. Its control datagram 0
 (which starts with `Auth`), sealed with the handshake's keys, begins a session; a

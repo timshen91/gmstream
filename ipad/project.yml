@@ -13,7 +13,10 @@ targets:
       # PyroWave's Metal decoder (build.sh checks it out).
       - path: build/pyrowave/metal
         includes: ["*.mm", "*.cpp"]
-      - path: build/pyrowave/pyrowave_inter.cpp
+      # Riptide's (../riptide, our codec).
+      - path: ../riptide/metal
+        includes: ["*.mm", "*.cpp"]
+      - path: ../riptide/riptide_inter.cpp
     settings:
       base:
         PRODUCT_NAME: GMStream
@@ -23,7 +26,7 @@ targets:
         TARGETED_DEVICE_FAMILY: "2"
         SWIFT_VERSION: "5.0"
         SWIFT_OBJC_BRIDGING_HEADER: ../apple/Bridge.h
-        HEADER_SEARCH_PATHS: ["$(SRCROOT)/build/pyrowave/metal", "$(SRCROOT)/build/pyrowave/metal/shaders"]
+        HEADER_SEARCH_PATHS: ["$(SRCROOT)/build/pyrowave/metal", "$(SRCROOT)/build/pyrowave/metal/shaders", "$(SRCROOT)/../riptide", "$(SRCROOT)/../riptide/metal", "$(SRCROOT)/../riptide/metal/shaders"]
         CLANG_CXX_LANGUAGE_STANDARD: c++17
         CLANG_ENABLE_OBJC_ARC: YES
         OTHER_LDFLAGS: ["-lc++"]

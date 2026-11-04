@@ -1,4 +1,4 @@
-// Keeps the GPU's clock up while PyroWave frames are being encoded.
+// Keeps the GPU's clock up while Riptide frames are being encoded.
 //
 // The GPU's power management sets its clock by how busy it is. A game that
 // leaves it lightly loaded leaves it slow, and the encoder, which does a frame in
@@ -9,7 +9,7 @@
 // its own at low priority so it yields to the game and to the encoder, keeps
 // the GPU busy in its eyes; it does almost no work. Only while frames are
 // encoded: it stops a second after the last (gpuwarm_touch). Its own Vulkan
-// device, so nothing is shared with the encoder's. GM_PYROWAVE_GPU_WARM=0 turns
+// device, so nothing is shared with the encoder's. GM_RIPTIDE_GPU_WARM=0 turns
 // it off.
 
 #include <dlfcn.h>
@@ -315,7 +315,7 @@ static bool init(struct gm_gpuwarm *w) {
 }
 
 struct gm_gpuwarm *gpuwarm_create(void) {
-	const char *env = getenv("GM_PYROWAVE_GPU_WARM");
+	const char *env = getenv("GM_RIPTIDE_GPU_WARM");
 	if (env != NULL && strcmp(env, "0") == 0) {
 		return NULL;
 	}

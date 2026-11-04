@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 		libegl-dev libgles-dev libgbm-dev libpipewire-0.3-dev \
 		libinput-dev libseat-dev libudev-dev hwdata \
 	&& rm -rf /var/lib/apt/lists/*
-COPY deps.sh pyrowave.sh pyrowave-inter.patch /
+COPY deps.sh pyrowave.sh /
 RUN sh /deps.sh && sh /pyrowave.sh
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 ENV PATH=/root/.cargo/bin:$PATH \

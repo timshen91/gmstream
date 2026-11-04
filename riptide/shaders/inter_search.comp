@@ -1,0 +1,102 @@
+#version 450
+// Inter frames: one pass of 3-D recursive search for the 16x16 luma blocks'
+// vectors. Every block updates at once from the previous pass's field: it
+// keeps whichever of nine candidates (its current vector, zero, its vector
+// last frame, its four neighbours' current vectors, and two nudges of `step`)
+// gives the least SAD over a 2:1 subsampled block, plus a small pull toward its
+// neighbours' mean that keeps the field smooth.
+//
+// One thread per (block, candidate): each sums its candidate's 64 samples
+// alone, so the SAD needs no reduction across threads; the nine then meet once,
+// in shared memory, to pick the best. Eight blocks per threadgroup.
+layout(local_size_x = 72) in;
+const int NC = 9, BLOCKS = 8;
+
+layout(set = 0, binding = 0) uniform mediump sampler2D uSource;
+layout(set = 0, binding = 1) writeonly uniform iimage2D uOut;
+layout(set = 0, binding = 2) uniform mediump sampler2D uReference;
+layout(set = 0, binding = 3) uniform isampler2D uCur;
+layout(set = 0, binding = 4) uniform isampler2D uPrev;
+
+layout(push_constant) uniform Registers
+{
+    int step;       // quarter pel
+    int iteration;
+    float lambda;   // SAD units per quarter pel from the neighbours' mean
+    float zero_bias; // SAD units taken off the zero vector's cost
+    int ref_y;       // the stripe's first row in the reference (a stripe is coded as its own image)
+};
+
+// The reference through the sampler's own bilinear filter (bound linear):
+// the search only picks vectors, so it need not match the decoder's exact
+// interpolation, and a quarter-pel position is exact in the filter's weights.
+float search_sample(vec2 q)
+{
+    return textureLod(uReference, (q + vec2(0.5, 0.5 + float(ref_y))) / vec2(textureSize(uReference, 0)), 0.0).x;
+}
+
+shared float s_src[BLOCKS][64]; // each block's 2:1 subsampled source, read once
+shared float s_cost[BLOCKS][NC];
+shared ivec2 s_cand[BLOCKS][NC];
+
+void main()
+{
+    ivec2 gsize = textureSize(uCur, 0);
+    uint t = gl_LocalInvocationIndex;
+    uint b = t / uint(NC), k = t % uint(NC);
+    ivec2 blk = ivec2(gl_WorkGroupID.x * uint(BLOCKS) + b, gl_WorkGroupID.y);
+    bool live = blk.x < gsize.x;
+    blk.x = min(blk.x, gsize.x - 1);
+
+    ivec2 cur = texelFetch(uCur, blk, 0).xy;
+    ivec2 prev = texelFetch(uPrev, blk, 0).xy;
+    ivec2 n0 = texelFetch(uCur, clamp(blk + ivec2(-1, 0), ivec2(0), gsize - 1), 0).xy;
+    ivec2 n1 = texelFetch(uCur, clamp(blk + ivec2(1, 0), ivec2(0), gsize - 1), 0).xy;
+    ivec2 n2 = texelFetch(uCur, clamp(blk + ivec2(0, -1), ivec2(0), gsize - 1), 0).xy;
+    ivec2 n3 = texelFetch(uCur, clamp(blk + ivec2(0, 1), ivec2(0), gsize - 1), 0).xy;
+    int sgn = ((blk.x + blk.y + iteration) & 1) != 0 ? -1 : 1;
+    ivec2 c = k == 0u ? cur
+            : k == 1u ? ivec2(0)
+            : k == 2u ? prev
+            : k == 3u ? n0 : k == 4u ? n1 : k == 5u ? n2 : k == 6u ? n3
+            : k == 7u ? cur + ivec2(sgn * step, 0)
+            : cur + ivec2(0, sgn * step);
+    c = clamp(c, ivec2(-256), ivec2(256)); // +-64 pixels
+
+    ivec2 size = textureSize(uSource, 0);
+    for (uint j = t; j < uint(BLOCKS * 64); j += uint(BLOCKS * NC))
+    {
+        uint jb = j / 64u, js = j % 64u;
+        ivec2 sb = ivec2(min(gl_WorkGroupID.x * uint(BLOCKS) + jb, uint(gsize.x - 1)), gl_WorkGroupID.y);
+        s_src[jb][js] = texelFetch(uSource, min(sb * 16 + 2 * ivec2(int(js & 7u), int(js >> 3)), size - 1), 0).x;
+    }
+    barrier();
+    vec2 off = vec2(c) * 0.25;
+    float sad = 0.0;
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++)
+        {
+            ivec2 p = min(blk * 16 + 2 * ivec2(x, y), size - 1);
+            sad += abs(s_src[b][y * 8 + x] - search_sample(vec2(p) + off));
+        }
+    vec2 dv = abs(vec2(c) - vec2(n0 + n1 + n2 + n3) * 0.25);
+    sad += lambda * (dv.x + dv.y);
+    if (c == ivec2(0))
+        sad -= zero_bias;
+    s_cost[b][k] = sad;
+    s_cand[b][k] = c;
+    barrier();
+    if (k == 0u && live)
+    {
+        // The first of equal costs wins, in candidate order.
+        float best = s_cost[b][0];
+        ivec2 bv = s_cand[b][0];
+        for (int j = 1; j < NC; j++)
+            if (s_cost[b][j] < best)
+            {
+                best = s_cost[b][j];
+                bv = s_cand[b][j];
+            }
+        imageStore(uOut, blk, ivec4(bv, 0, 0));
+    }
+}

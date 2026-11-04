@@ -130,7 +130,7 @@ final class ConnectionTests: XCTestCase {
         XCTAssertEqual(p.u32(10), 40_000)
         XCTAssertEqual(p[14], 0b1011)
         XCTAssertEqual(p[15], 3)
-        XCTAssertEqual(p[16], 16, "PyroWave preferred: inter frames asked for (bit 4), frames in pieces (bit 2, AV1 and HEVC) not")
+        XCTAssertEqual(p[16], 0, "PyroWave preferred: no codec flags (frames in pieces, bit 2, are AV1 and HEVC's)")
         XCTAssertGreaterThanOrEqual(Int(p.u16(17)), maxDatagram, "max_datagram: at least the control size, from the link's MTU")
     }
 
@@ -142,11 +142,12 @@ final class ConnectionTests: XCTestCase {
     }
 
     func testFramesInPiecesGoOnlyWithAV1AndHEVC() {
-        XCTAssertEqual(helloFlags(preferred: 2) & (4 | 16), 4, "AV1: frames in pieces, no PyroWave inter frames")
+        XCTAssertEqual(helloFlags(preferred: 2) & 4, 4, "AV1: frames in pieces")
+        XCTAssertEqual(helloFlags(preferred: 4) & 4, 0, "Riptide: not")
     }
 
     func testNoCodecFlagsWithH264() {
-        XCTAssertEqual(helloFlags(preferred: 0) & (4 | 16), 0)
+        XCTAssertEqual(helloFlags(preferred: 0) & 4, 0)
     }
 
     func testStartPingsWithOurClock() {
@@ -407,22 +408,22 @@ final class ConnectionTests: XCTestCase {
         XCTAssertGreaterThan(pkt?.receivedNs ?? 0, 0)
     }
 
-    func testPyroWaveInterDatagrams() {
+    func testRiptideDatagrams() {
         start()
         // Packet 7 of a frame of 1920x1080 in 4 stripes (128 rows, then 256): in
         // stripe 1, whose 5 packets are numbers 4 to 8, 2 of them inter packets.
         var p = Writer()
-        p.u8(datagramPyroWaveInter); p.u32(42); p.u16(7); p.u16(1920); p.u16(1080); p.u64(1_000); p.u64(2_000)
+        p.u8(datagramRiptide); p.u32(42); p.u16(7); p.u16(1920); p.u16(1080); p.u64(1_000); p.u64(2_000)
         p.u8(1); p.u32(40); p.u8(1); p.u8(4); p.u16(128); p.u16(256); p.u16(4); p.u16(5); p.u8(2)
-        XCTAssertEqual(p.data.count, pyrowaveInterHeader)
+        XCTAssertEqual(p.data.count, riptideHeader)
         host.send(p.data + Data([9, 8, 7]))
         // The last stripe's: the frame's packet count is then known.
         var q = Writer()
-        q.u8(datagramPyroWaveInter); q.u32(42); q.u16(20); q.u16(1920); q.u16(1080); q.u64(1_000); q.u64(3_000)
+        q.u8(datagramRiptide); q.u32(42); q.u16(20); q.u16(1920); q.u16(1080); q.u64(1_000); q.u64(3_000)
         q.u8(1); q.u32(40); q.u8(3); q.u8(4); q.u16(128); q.u16(256); q.u16(18); q.u16(6); q.u8(1)
         host.send(q.data + Data([6]))
-        waitUntil { recorder.snapshot.packets.count == 2 }
-        let pkt = recorder.snapshot.packets.first
+        waitUntil { recorder.snapshot.riptide.count == 2 }
+        let pkt = recorder.snapshot.riptide.first
         XCTAssertEqual(pkt?.frameId, 42)
         XCTAssertEqual(pkt?.index, 7)
         XCTAssertEqual(pkt?.count, 0, "not the last stripe: the total is not known yet")
@@ -430,7 +431,6 @@ final class ConnectionTests: XCTestCase {
         XCTAssertEqual(pkt?.height, 1080)
         XCTAssertEqual(pkt?.slotNs, 1_000)
         XCTAssertEqual(pkt?.encodedNs, 2_000)
-        XCTAssertEqual(pkt?.inter, true)
         XCTAssertEqual(pkt?.predicted, true)
         XCTAssertEqual(pkt?.repaired, 40)
         XCTAssertEqual(pkt?.stripe, 1)
@@ -441,13 +441,13 @@ final class ConnectionTests: XCTestCase {
         XCTAssertEqual(pkt?.stripeFirst, 4)
         XCTAssertEqual(pkt?.stripeCount, 5)
         XCTAssertEqual(pkt?.payload, Data([9, 8, 7]))
-        XCTAssertEqual(recorder.snapshot.packets.last?.count, 24)
+        XCTAssertEqual(recorder.snapshot.riptide.last?.count, 24)
     }
 
-    func testPyroWaveLossReportIsSealed() {
+    func testRiptideLossReportIsSealed() {
         start()
-        conn.pyrowaveLoss(frameId: 77, count: 120, ranges: [(0, 2), (100, 0xffff)])
-        let d = host.receiveDatagram(datagramPyroWaveLoss, nonceKind: 3)
+        conn.riptideLoss(frameId: 77, count: 120, ranges: [(0, 2), (100, 0xffff)])
+        let d = host.receiveDatagram(datagramRiptideLoss, nonceKind: 3)
         XCTAssertNotNil(d)
         guard let (seq, m) = d else { return }
         XCTAssertEqual(seq, 0)

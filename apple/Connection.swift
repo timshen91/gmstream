@@ -29,9 +29,9 @@ let datagramMouse: UInt8 = 7, datagramAck: UInt8 = 8
 /// A piece of a frame, sent while the host is still encoding the rest.
 let datagramVideoChunk: UInt8 = 9
 let videoChunkHeader = 43
-/// PyroWave with inter frames (host → client), and the client's loss reports.
-let datagramPyroWaveInter: UInt8 = 10, pyrowaveInterHeader = 43
-let datagramPyroWaveLoss: UInt8 = 11
+/// Riptide (host → client), and the client's loss reports.
+let datagramRiptide: UInt8 = 10, riptideHeader = 43
+let datagramRiptideLoss: UInt8 = 11
 let handshakeSize = 129 // padded, so a forged request gets back no more than it sent
 let tagSize = 16
 
@@ -130,6 +130,8 @@ protocol ConnectionDelegate: AnyObject {
     func audio(_ packet: Data)
     /// One PyroWave packet of a frame, on the network thread.
     func pyrowave(_ p: PyroWavePacket)
+    /// One Riptide packet of a frame's stripe, on the network thread.
+    func riptide(_ p: RiptidePacket)
     /// The rest on the main thread.
     func helloAck(codec: UInt8)
     func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data)
@@ -328,13 +330,11 @@ final class Connection {
         w.u32(refreshMhz); w.u32(kbps)
         w.u8(codecMask); w.u8(preferred)
         // Plain UDP always sends video as datagrams; bit 2 asks for each frame
-        // in pieces as the host encodes it (AV1, HEVC), bit 3 says this client
-        // can show HDR10, bit 4 asks for PyroWave inter frames. HDR is a
-        // capability, not a request: whether the session is HDR stays
-        // SteamOS's setting. The codec bits go only with their codecs.
+        // in pieces as the host encodes it (AV1, HEVC; only with them), bit 3
+        // says this client can show HDR10. HDR is a capability, not a request:
+        // whether the session is HDR stays SteamOS's setting.
         let pieces = options.streamFrames && Options.takesFramesInPieces(preferred)
-        let inter = options.pyrowaveInter && Options.takesInterFrames(preferred)
-        w.u8((pieces ? 4 : 0) | (canShowHDR() ? 8 : 0) | (inter ? 16 : 0))
+        w.u8((pieces ? 4 : 0) | (canShowHDR() ? 8 : 0))
         w.u16(UInt16(linkMaxDatagram))
         started = true
         send(Msg.hello, w.data)
@@ -459,11 +459,11 @@ final class Connection {
 
     private enum SeqKind: UInt8 { case control = 0, mouse = 1, ack = 2, loss = 3 }
 
-    /// PyroWave inter frames: tells the host which packets of a frame never
+    /// Riptide: tells the host which packets of a frame never
     /// arrived (`ranges`: first, length; a length past the end means the rest),
     /// so its next frames predict from what this decoder actually has. The
     /// caller repeats it until the host's frames say it was taken in.
-    func pyrowaveLoss(frameId: UInt32, count: Int, ranges: [(Int, Int)]) {
+    func riptideLoss(frameId: UInt32, count: Int, ranges: [(Int, Int)]) {
         sendLock.lock()
         defer { sendLock.unlock() }
         guard running, let key = sendKey else { return }
@@ -477,7 +477,7 @@ final class Connection {
             m.u16(UInt16(clamping: length))
         }
         var d = Writer()
-        d.u8(datagramPyroWaveLoss)
+        d.u8(datagramRiptideLoss)
         d.u32(lossSeq)
         guard let box = try? AES.GCM.seal(m.data, using: key, nonce: Self.nonce(.loss, lossSeq), authenticating: d.data) else { return }
         lossSeq += 1
@@ -666,10 +666,10 @@ final class Connection {
             let id = n >= 5 ? d.u32(1) : 0
             let frag = (kind == datagramVideo || kind == datagramPyroWave ||
                         kind == datagramVideoChunk) && n >= 9
-            let inter = kind == datagramPyroWaveInter && n > pyrowaveInterHeader
+            let inter = kind == datagramRiptide && n > riptideHeader
             let host: UInt64 = kind == datagramAudio && n >= 13 ? d.u64(5) : kind == datagramPyroWave && n > 29 ? d.u64(21)
                 : inter ? d.u64(19) : 0
-            // PyroWave inter frames: the packet's number, and its stripe in place of the count.
+            // Riptide: the packet's number, and its stripe in place of the count.
             trace.record(t: t, aux: lastHeard &- t, kind: kind, size: n, id: id,
                          index: frag || inter ? Int(d.u16(5)) : 0,
                          count: frag ? Int(d.u16(7)) : inter ? Int(d[d.startIndex + 32]) : 0, host: host)
@@ -704,19 +704,19 @@ final class Connection {
                 frameId: d.u32(1), index: Int(d.u16(5)), count: Int(d.u16(7)),
                 width: Int(d.u16(9)), height: Int(d.u16(11)), slotNs: d.u64(13), encodedNs: d.u64(21),
                 payload: d.subdata(in: 29..<n), receivedNs: arrived > 0 ? arrived : lastHeard, readNs: lastHeard))
-        case datagramPyroWaveInter where n > pyrowaveInterHeader:
+        case datagramRiptide where n > riptideHeader:
             if Self.dropEvery > 0 {
-                // Measuring (GM_DEBUG_DROP=N): every Nth inter frame datagram lost.
+                // Measuring (GM_DEBUG_DROP=N): every Nth Riptide datagram lost.
                 droppedCount += 1
                 if droppedCount % Self.dropEvery == 0 { return }
             }
             let stripe = Int(d[d.startIndex + 32]), stripes = Int(d[d.startIndex + 33])
             let first = Int(d.u16(38)), count = Int(d.u16(40))
-            delegate?.pyrowave(PyroWavePacket(
+            delegate?.riptide(RiptidePacket(
                 frameId: d.u32(1), index: Int(d.u16(5)), count: stripe + 1 == stripes ? first + count : 0,
                 width: Int(d.u16(7)), height: Int(d.u16(9)), slotNs: d.u64(11), encodedNs: d.u64(19),
-                payload: d.subdata(in: pyrowaveInterHeader..<n), receivedNs: arrived > 0 ? arrived : lastHeard, readNs: lastHeard,
-                inter: true, predicted: d[d.startIndex + 27] & 1 != 0, repaired: d.u32(28),
+                payload: d.subdata(in: riptideHeader..<n), receivedNs: arrived > 0 ? arrived : lastHeard, readNs: lastHeard,
+                predicted: d[d.startIndex + 27] & 1 != 0, repaired: d.u32(28),
                 stripe: stripe, stripes: max(stripes, 1), firstRows: Int(d.u16(34)), stripeRows: Int(d.u16(36)),
                 stripeFirst: first, stripeCount: count, stripeInter: Int(d[d.startIndex + 42])))
         case datagramAudio where n > 13:
@@ -867,13 +867,23 @@ struct PyroWavePacket {
     let payload: Data
     let receivedNs: UInt64 // arrived (kernel time stamp)
     let readNs: UInt64     // read by the network thread
-    // Inter frames (type 10), sent stripe by stripe: count is the frame's
-    // packets in the last stripe's, 0 before; repaired is the newest frame whose
-    // loss report the host has taken in. The frame is `stripes` horizontal bands,
-    // the first of firstRows rows, then of stripeRows (the last takes the rest),
-    // each coded as an image of its own; this packet's stripe has stripeCount
-    // packets from number stripeFirst, the first stripeInter of them inter packets.
-    var inter = false
+}
+
+/// One Riptide packet (PROTOCOL.md, Riptide; type 10), sent stripe by stripe:
+/// count is the frame's packets in the last stripe's, 0 before; repaired is the
+/// newest frame whose loss report the host has taken in. The frame is `stripes`
+/// horizontal bands, the first of firstRows rows, then of stripeRows (the last
+/// takes the rest), each coded as an image of its own; this packet's stripe has
+/// stripeCount packets from number stripeFirst, the first stripeInter of them
+/// inter packets.
+struct RiptidePacket {
+    let frameId: UInt32
+    let index: Int, count: Int
+    let width: Int, height: Int
+    let slotNs: UInt64, encodedNs: UInt64
+    let payload: Data
+    let receivedNs: UInt64 // arrived (kernel time stamp)
+    let readNs: UInt64     // read by the network thread
     var predicted = false
     var repaired: UInt32 = 0
     var stripe = 0, stripes = 1, firstRows = 0, stripeRows = 0

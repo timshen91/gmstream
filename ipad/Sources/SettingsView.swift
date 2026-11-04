@@ -32,6 +32,7 @@ struct SettingsView: View {
                         Text("HEVC").tag(UInt8(1))
                         if Decoder.hasAV1 { Text("AV1").tag(UInt8(2)) }
                         Text("PyroWave").tag(UInt8(3))
+                        Text("Riptide").tag(UInt8(4))
                     }
                     LabeledContent("Bitrate (Mb/s)") { TextField("40", text: $bitrate).multilineTextAlignment(.trailing).keyboardType(.numberPad) }
                     Picker("Refresh rate", selection: $o.refresh) {
@@ -50,10 +51,18 @@ struct SettingsView: View {
                     // Each only with its own codecs.
                     Toggle("Take AV1 and HEVC frames as the host encodes them", isOn: $o.streamFrames)
                         .disabled(!Options.takesFramesInPieces(o.codec))
-                    Toggle("PyroWave inter frames (predicted from the last)", isOn: $o.pyrowaveInter)
-                        .disabled(!Options.takesInterFrames(o.codec))
-                    Toggle("Keep the GPU awake for PyroWave (decodes ~3x faster)", isOn: $o.keepGPUAwake)
-                        .disabled(o.codec != 3)
+                    Toggle("Keep the GPU awake for PyroWave and Riptide (decodes ~3x faster)", isOn: $o.keepGPUAwake)
+                        .disabled(!Options.decodesOnGPU(o.codec))
+                    Picker("AV1/HEVC parallelism", selection: $o.parallelism) {
+                        Text("Auto").tag(0)
+                        ForEach([1, 2, 4, 8, 16, 32, 64, 128], id: \.self) { Text("\($0) per frame").tag($0) }
+                    }
+                    .disabled(!Options.cutsIntoParts(o.codec))
+                    Picker("Riptide stripes", selection: $o.riptideStripes) {
+                        Text("Auto").tag(0)
+                        ForEach([1, 2, 3, 4, 5, 6, 8, 10, 12, 16], id: \.self) { Text("\($0) per frame").tag($0) }
+                    }
+                    .disabled(!Options.isRiptide(o.codec))
                 }
                 Section {
                     Picker("Cursor", selection: $o.cursorMode) {
@@ -108,8 +117,9 @@ struct SettingsView: View {
         if n.showStats != old.showStats { changes.append(.stats) }
         if n.vividColors != old.vividColors { changes.append(.present) }
         if n.keepWiFiAwake != old.keepWiFiAwake || n.keepGPUAwake != old.keepGPUAwake { changes.append(.keepAwake) }
+        if n.parallelism != old.parallelism || n.riptideStripes != old.riptideStripes { changes.append(.parallelism) }
         // The host is told in Hello, so the stream starts over.
-        if n.streamFrames != old.streamFrames || n.pyrowaveInter != old.pyrowaveInter { changes.append(.connection) }
+        if n.streamFrames != old.streamFrames { changes.append(.connection) }
         if n.cursorMode != old.cursorMode || n.mouseMode != old.mouseMode { changes.append(.cursor) }
         if n.pacingMode != old.pacingMode || n.phaseLock != old.phaseLock || n.holdFrames != old.holdFrames { changes.append(.phaseLock) }
         options = n

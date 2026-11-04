@@ -32,7 +32,7 @@ pub const DATAGRAM_CONTROL: u8 = 3;
 const DATAGRAM_HANDSHAKE: u8 = 6;
 const DATAGRAM_MOUSE: u8 = 7;
 const DATAGRAM_ACK: u8 = 8;
-const DATAGRAM_PYROWAVE_LOSS: u8 = 11;
+const DATAGRAM_RIPTIDE_LOSS: u8 = 11;
 const MOUSE_MOTION: u8 = 0;
 const MOUSE_POSITION: u8 = 1;
 /// Largest datagram payload we send: fits a 1500-byte Ethernet/Wi-Fi MTU
@@ -95,10 +95,10 @@ impl Route {
         }
     }
 
-    /// A PyroWave loss report: `u32 frame_id, u16 count, u16 n`, then n (first,
+    /// A Riptide loss report: `u32 frame_id, u16 count, u16 n`, then n (first,
     /// length) ranges of missing packets. Reports are repeated until the host's
     /// frames say they were taken in, so neither order nor loss matters.
-    fn pyrowave_loss(&mut self, m: &[u8]) {
+    fn riptide_loss(&mut self, m: &[u8]) {
         if !self.mouse_on.load(Ordering::Relaxed) || m.len() < 8 {
             return;
         }
@@ -107,7 +107,7 @@ impl Route {
         let n = u16::from_le_bytes([m[6], m[7]]) as usize;
         let ranges: Vec<u16> = m[8..].chunks_exact(2).take(2 * n).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         if ranges.len() == 2 * n {
-            core::pyrowave_loss(frame_id, count, &ranges);
+            core::riptide_loss(frame_id, count, &ranges);
         }
     }
 
@@ -301,17 +301,17 @@ where
             continue;
         }
         if n < CONTROL_HEADER + auth::TAG_SIZE
-            || (buf[0] != DATAGRAM_CONTROL && buf[0] != DATAGRAM_MOUSE && buf[0] != DATAGRAM_PYROWAVE_LOSS)
+            || (buf[0] != DATAGRAM_CONTROL && buf[0] != DATAGRAM_MOUSE && buf[0] != DATAGRAM_RIPTIDE_LOSS)
         {
             continue;
         }
         let seq = u32::from_le_bytes(buf[1..5].try_into().unwrap());
         let (header, sealed) = buf[..n].split_at(CONTROL_HEADER);
         let mut map = routes.lock().unwrap();
-        if header[0] == DATAGRAM_PYROWAVE_LOSS {
+        if header[0] == DATAGRAM_RIPTIDE_LOSS {
             if let Some(route) = map.get_mut(&addr) {
                 if let Some(m) = route.keys.open(Kind::Loss, header, seq, sealed) {
-                    route.pyrowave_loss(&m);
+                    route.riptide_loss(&m);
                 }
             }
             continue;

@@ -60,9 +60,9 @@ impl VideoChunk {
     }
 }
 
-/// PyroWave packets of a stream with inter frames (core/gm.h).
+/// A stripe of a Riptide frame (core/gm.h).
 #[repr(C)]
-pub struct PyroWavePackets {
+pub struct RiptidePackets {
     data: *const u8,
     len: usize,
     pub frame_id: u32,
@@ -81,7 +81,7 @@ pub struct PyroWavePackets {
     pub height: u16,
 }
 
-impl PyroWavePackets {
+impl RiptidePackets {
     /// The packets, each after a u16 length.
     pub fn data(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.data, self.len) }
@@ -119,7 +119,7 @@ struct GmCallbacks {
     cursor_clip: extern "C" fn(*mut c_void, u16, u16, u16, u16),
     rumble: extern "C" fn(*mut c_void, u8, u16, u16, u16),
     encode_format: extern "C" fn(*mut c_void, *const std::os::raw::c_char),
-    pyrowave: extern "C" fn(*mut c_void, *const PyroWavePackets),
+    riptide: extern "C" fn(*mut c_void, *const RiptidePackets),
 }
 
 #[repr(C)]
@@ -163,7 +163,7 @@ unsafe extern "C" {
     fn gm_touch(id: i32, phase: c_int, x: f64, y: f64);
     fn gm_gamepad_update(pad: u8, state: *const GamepadState);
     fn gm_gamepad_remove(pad: u8);
-    fn gm_pyrowave_loss(frame_id: u32, count: u16, ranges: *const u16, n_ranges: usize);
+    fn gm_riptide_loss(frame_id: u32, count: u16, ranges: *const u16, n_ranges: usize);
 }
 
 /// What the core calls back into; implemented by the session hub.
@@ -176,7 +176,7 @@ pub trait Sink: Sync + 'static {
     fn cursor_clip(&self, clip: [u16; 4]);
     fn rumble(&self, pad: u8, strong: u16, weak: u16, duration_ms: u16);
     fn encode_format(&self, text: &str);
-    fn pyrowave(&self, packets: &PyroWavePackets);
+    fn riptide(&self, packets: &RiptidePackets);
 }
 
 static mut SINK: Option<&'static dyn Sink> = None;
@@ -192,8 +192,8 @@ extern "C" fn on_video(_: *mut c_void, p: *const VideoPacket) {
 extern "C" fn on_video_chunk(_: *mut c_void, c: *const VideoChunk) {
     sink().video_chunk(unsafe { &*c });
 }
-extern "C" fn on_pyrowave(_: *mut c_void, p: *const PyroWavePackets) {
-    sink().pyrowave(unsafe { &*p });
+extern "C" fn on_riptide(_: *mut c_void, p: *const RiptidePackets) {
+    sink().riptide(unsafe { &*p });
 }
 extern "C" fn on_audio(_: *mut c_void, data: *const u8, len: usize, pts: u64) {
     sink().audio(unsafe { std::slice::from_raw_parts(data, len) }, pts);
@@ -261,7 +261,7 @@ pub fn run(config: &Config, sink: &'static dyn Sink) -> i32 {
         cursor_clip: on_cursor_clip,
         encode_format: on_encode_format,
         rumble: on_rumble,
-        pyrowave: on_pyrowave,
+        riptide: on_riptide,
     };
     unsafe { gm_run(&c, &cb) }
 }
@@ -275,15 +275,12 @@ pub fn heartbeat_ns() -> u64 {
 /// Send each frame in pieces as the encoder writes it (AV1 only).
 pub const STREAM_CHUNKED: u32 = 1 << 0;
 pub const STREAM_HDR: u32 = 1 << 1;
-/// PyroWave with inter frames (packets through Sink::pyrowave, losses back
-/// through pyrowave_loss).
-pub const STREAM_PYROWAVE_INTER: u32 = 1 << 2;
 
-/// PyroWave inter frames: the client missed these packets of a frame. `count`:
-/// the frame's packets as the client knows them (0: unknown); `ranges`: (first,
-/// length) pairs.
-pub fn pyrowave_loss(frame_id: u32, count: u16, ranges: &[u16]) {
-    unsafe { gm_pyrowave_loss(frame_id, count, ranges.as_ptr(), ranges.len() / 2) }
+/// Riptide: the client missed these packets of a frame. `count`: the frame's
+/// packets as the client knows them (0: unknown); `ranges`: (first, length)
+/// pairs.
+pub fn riptide_loss(frame_id: u32, count: u16, ranges: &[u16]) {
+    unsafe { gm_riptide_loss(frame_id, count, ranges.as_ptr(), ranges.len() / 2) }
 }
 
 /// `packet`: the most PyroWave or video chunk payload per datagram (0: the

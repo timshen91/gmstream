@@ -1,0 +1,33 @@
+#version 450
+// Inter frames: the prediction of one plane (inter_predict.h, exact integer
+// arithmetic), written as 8 bits. The forward transform subtracts it from the
+// source where intra frames subtract 0.5, and the inverse adds it back.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform mediump sampler2D uReference;
+layout(set = 0, binding = 1) writeonly uniform mediump image2D uPrediction;
+layout(set = 0, binding = 2) uniform mediump sampler2D uWeights;
+layout(set = 0, binding = 3) uniform isampler2D uVectors;
+
+layout(push_constant) uniform Registers
+{
+    int ref_y; // a stripe's first row in the reference, in this plane's rows
+};
+
+#include "inter_predict.h"
+
+// One thread per 2x2 pixels.
+void main()
+{
+    ivec2 size = imageSize(uPrediction);
+    ivec2 p = 2 * ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, size)))
+        return;
+    ivec4 pred = predict8_quad(p, ref_y);
+    for (int k = 0; k < 4; k++)
+    {
+        ivec2 o = ivec2(k & 1, k >> 1);
+        if (all(lessThan(p + o, size)))
+            imageStore(uPrediction, p + o, vec4(float(pred[k]) / 255.0));
+    }
+}

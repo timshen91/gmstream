@@ -1,0 +1,4 @@
+{
+  global: riptide_*;
+  local: *;
+};

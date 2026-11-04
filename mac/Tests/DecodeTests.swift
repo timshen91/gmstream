@@ -244,7 +244,7 @@ final class PyroWaveDecoderTests: XCTestCase {
         var planes: [MTLTexture] = []
         decoder.onDecoded = { p, t in planes = p; XCTAssertGreaterThanOrEqual(t.decoded, t.decodeStart); done.fulfill() }
         decoder.onIncomplete = { XCTFail("incomplete") }
-        for i in parts.indices.reversed() { decoder.packet(packet(1, i, of: parts)) { _, _ in timing(present: 1) } } // any order
+        for i in parts.indices.reversed() { decoder.packet(packet(1, i, of: parts)) { timing(present: 1) } } // any order
         wait(for: [done], timeout: 5)
         XCTAssertEqual(planes.map(\.width), [width, width / 2, width / 2])
         XCTAssertEqual(planes.map(\.height), [height, height / 2, height / 2])
@@ -259,9 +259,9 @@ final class PyroWaveDecoderTests: XCTestCase {
         let done = expectation(description: "decoded")
         decoder.onDecoded = { _, _ in decoded += 1; done.fulfill() }
         decoder.onIncomplete = { incomplete += 1 }
-        decoder.packet(packet(1, 0, of: a)) { _, _ in timing(present: 1) }
-        for i in b.indices { decoder.packet(packet(2, i, of: b)) { _, _ in timing(present: 2) } }
-        for i in a.indices.dropFirst() { decoder.packet(packet(1, i, of: a)) { _, _ in timing(present: 1) } } // stale now
+        decoder.packet(packet(1, 0, of: a)) { timing(present: 1) }
+        for i in b.indices { decoder.packet(packet(2, i, of: b)) { timing(present: 2) } }
+        for i in a.indices.dropFirst() { decoder.packet(packet(1, i, of: a)) { timing(present: 1) } } // stale now
         wait(for: [done], timeout: 5)
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         XCTAssertEqual(decoded, 1)
@@ -269,20 +269,20 @@ final class PyroWaveDecoderTests: XCTestCase {
     }
 }
 
-/// Inter frames in stripes (PROTOCOL.md, "PyroWave inter frames"): the host
+/// Inter frames in stripes (PROTOCOL.md, "Riptide"): the host
 /// codes each frame as two 128-row stripes, each an image of its own (an encoder
 /// each) predicting from its own decode of the whole last frame, as
 /// pyrowave_encoder_packetize_stripe hands them out.
-final class PyroWaveStripeTests: XCTestCase {
+final class RiptideTests: XCTestCase {
     let width = 256, height = 256, rows = 128
     var stripes: Int { height / rows }
     var device: MTLDevice!
-    var decoder: PyroWaveDecoder!
-    var pw: pyrowave_device!
+    var decoder: RiptideDecoder!
+    var pw: riptide_device!
     let queue = MTLCreateSystemDefaultDevice()!.makeCommandQueue()!
     // The host: an encoder and a decoder per stripe, its decoded frames.
-    var encoders: [pyrowave_encoder] = []
-    var hostDecoders: [pyrowave_decoder] = []
+    var encoders: [riptide_encoder] = []
+    var hostDecoders: [riptide_decoder] = []
     var hostStripePlanes: [[MTLTexture]] = []
     var hostPlanes: [[MTLTexture]] = []
     var luma: [UInt8] = []
@@ -298,21 +298,21 @@ final class PyroWaveStripeTests: XCTestCase {
 
     override func setUpWithError() throws {
         device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        guard let d = PyroWaveDecoder(device: device, queue: device.makeCommandQueue()!) else { throw XCTSkip("PyroWave unsupported here") }
+        guard let d = RiptideDecoder(device: device, queue: device.makeCommandQueue()!) else { throw XCTSkip("PyroWave unsupported here") }
         decoder = d
-        var info = pyrowave_device_create_info(mtl_device: Unmanaged.passUnretained(device as AnyObject).toOpaque(),
+        var info = riptide_device_create_info(mtl_device: Unmanaged.passUnretained(device as AnyObject).toOpaque(),
                                                message_callback: nil, message_userdata: nil)
-        var dev: pyrowave_device?
-        XCTAssertEqual(pyrowave_device_create(&info, &dev), PYROWAVE_SUCCESS)
+        var dev: riptide_device?
+        XCTAssertEqual(riptide_device_create(&info, &dev), RIPTIDE_SUCCESS)
         pw = dev
         for _ in 0..<stripes {
-            var e = pyrowave_encoder_create_info(device: pw, width: Int32(width), height: Int32(rows), chroma: PYROWAVE_CHROMA_SUBSAMPLING_420)
-            var enc: pyrowave_encoder?
-            XCTAssertEqual(pyrowave_encoder_create(&e, &enc), PYROWAVE_SUCCESS)
+            var e = riptide_encoder_create_info(device: pw, width: Int32(width), height: Int32(rows), chroma: RIPTIDE_CHROMA_SUBSAMPLING_420)
+            var enc: riptide_encoder?
+            XCTAssertEqual(riptide_encoder_create(&e, &enc), RIPTIDE_SUCCESS)
             encoders.append(enc!)
-            var di = pyrowave_decoder_create_info(device: pw, width: Int32(width), height: Int32(rows), chroma: PYROWAVE_CHROMA_SUBSAMPLING_420)
-            var hd: pyrowave_decoder?
-            XCTAssertEqual(pyrowave_decoder_create(&di, &hd), PYROWAVE_SUCCESS)
+            var di = riptide_decoder_create_info(device: pw, width: Int32(width), height: Int32(rows), chroma: RIPTIDE_CHROMA_SUBSAMPLING_420)
+            var hd: riptide_decoder?
+            XCTAssertEqual(riptide_decoder_create(&di, &hd), RIPTIDE_SUCCESS)
             hostDecoders.append(hd!)
             hostStripePlanes.append(planes(width, rows))
         }
@@ -320,9 +320,9 @@ final class PyroWaveStripeTests: XCTestCase {
     }
 
     override func tearDown() {
-        for d in hostDecoders { pyrowave_decoder_destroy(d) }
-        for e in encoders { pyrowave_encoder_destroy(e) }
-        if let pw { pyrowave_device_destroy(pw) }
+        for d in hostDecoders { riptide_decoder_destroy(d) }
+        for e in encoders { riptide_encoder_destroy(e) }
+        if let pw { riptide_device_destroy(pw) }
     }
 
     let ptr = { (o: AnyObject) in Unmanaged.passUnretained(o).toOpaque() }
@@ -338,12 +338,12 @@ final class PyroWaveStripeTests: XCTestCase {
             let encoder = encoders[k], y0 = k * rows
             if predicted {
                 let r = hostPlanes[(n - 1) & 1]
-                var ref = pyrowave_gpu_buffers(planes: (ptr(r[0]), ptr(r[1]), ptr(r[2])))
-                withUnsafePointer(to: &ref) { _ = pyrowave_encoder_set_reference_stripe(encoder, OpaquePointer($0), Int32(y0)) } // declared before its struct
-                pyrowave_decoder_set_reference_stripe(hostDecoders[k], &ref, Int32(y0))
+                var ref = riptide_gpu_buffers(planes: (ptr(r[0]), ptr(r[1]), ptr(r[2])))
+                withUnsafePointer(to: &ref) { _ = riptide_encoder_set_reference_stripe(encoder, OpaquePointer($0), Int32(y0)) } // declared before its struct
+                riptide_decoder_set_reference_stripe(hostDecoders[k], &ref, Int32(y0))
             } else {
-                pyrowave_encoder_set_reference_stripe(encoder, nil, 0)
-                pyrowave_decoder_set_reference_stripe(hostDecoders[k], nil, Int32(y0))
+                riptide_encoder_set_reference_stripe(encoder, nil, 0)
+                riptide_decoder_set_reference_stripe(hostDecoders[k], nil, Int32(y0))
             }
             var y = Array(luma[y0 * width..<(y0 + rows) * width])
             var cbp = [UInt8](repeating: 100, count: width * rows / 4), crp = [UInt8](repeating: 150, count: width * rows / 4)
@@ -351,32 +351,32 @@ final class PyroWaveStripeTests: XCTestCase {
             let r = y.withUnsafeMutableBytes { yp in
                 cbp.withUnsafeMutableBytes { cbb in
                     crp.withUnsafeMutableBytes { crb in
-                        var input = pyrowave_cpu_buffer(data: (yp.baseAddress, cbb.baseAddress, crb.baseAddress),
+                        var input = riptide_cpu_buffer(data: (yp.baseAddress, cbb.baseAddress, crb.baseAddress),
                                                         row_stride_in_bytes: (w, w / 2, w / 2),
                                                         plane_size_in_bytes: (w * h, w * h / 4, w * h / 4),
-                                                        width: Int32(w), height: Int32(h), format: PYROWAVE_CPU_BUFFER_FORMAT_YUV420P)
-                        var rate = pyrowave_rate_control(maximum_bitstream_size: 100_000)
-                        return pyrowave_encoder_encode_cpu(encoder, &input, &rate)
+                                                        width: Int32(w), height: Int32(h), format: RIPTIDE_CPU_BUFFER_FORMAT_YUV420P)
+                        var rate = riptide_rate_control(maximum_bitstream_size: 100_000)
+                        return riptide_encoder_encode_cpu(encoder, &input, &rate)
                     }
                 }
             }
-            guard r == PYROWAVE_SUCCESS else { throw XCTSkip("encode: \(r)") }
+            guard r == RIPTIDE_SUCCESS else { throw XCTSkip("encode: \(r)") }
             var count = 0
-            XCTAssertEqual(pyrowave_encoder_compute_num_packets(encoder, 1400, &count), PYROWAVE_SUCCESS)
-            var packets = [pyrowave_packet](repeating: pyrowave_packet(), count: count)
+            XCTAssertEqual(riptide_encoder_compute_num_packets(encoder, 1400, &count), RIPTIDE_SUCCESS)
+            var packets = [riptide_packet](repeating: riptide_packet(), count: count)
             var bits = [UInt8](repeating: 0, count: 400_000)
             var got = 0
-            XCTAssertEqual(pyrowave_encoder_packetize(encoder, &packets, 1400, &got, &bits, bits.count), PYROWAVE_SUCCESS)
+            XCTAssertEqual(riptide_encoder_packetize(encoder, &packets, 1400, &got, &bits, bits.count), RIPTIDE_SUCCESS)
             let parts = packets.prefix(got).map { Data(bits[$0.offset..<$0.offset + $0.size]) }
             XCTAssertGreaterThan(parts.count, 1)
             out.append(parts)
             // The host's own decode of the stripe, into its frame.
             let hd = hostDecoders[k]
-            pyrowave_decoder_clear(hd)
-            for p in parts { p.withUnsafeBytes { _ = pyrowave_decoder_push_packet(hd, $0.baseAddress, $0.count) } }
+            riptide_decoder_clear(hd)
+            for p in parts { p.withUnsafeBytes { _ = riptide_decoder_push_packet(hd, $0.baseAddress, $0.count) } }
             let s = hostStripePlanes[k]
-            var buffers = pyrowave_gpu_buffers(planes: (ptr(s[0]), ptr(s[1]), ptr(s[2])))
-            XCTAssertEqual(pyrowave_decoder_decode_gpu_buffer(hd, ptr(cb), &buffers), PYROWAVE_SUCCESS)
+            var buffers = riptide_gpu_buffers(planes: (ptr(s[0]), ptr(s[1]), ptr(s[2])))
+            XCTAssertEqual(riptide_decoder_decode_gpu_buffer(hd, ptr(cb), &buffers), RIPTIDE_SUCCESS)
             let blit = cb.makeBlitCommandEncoder()!
             for c in 0..<3 {
                 blit.copy(from: s[c], sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
@@ -391,16 +391,15 @@ final class PyroWaveStripeTests: XCTestCase {
     }
 
     /// Frame f's packets as the host numbers them: every stripe's, in order.
-    func packets(_ id: UInt32, _ f: (stripes: [[Data]], predicted: Bool), repaired: UInt32 = 0) -> [PyroWavePacket] {
-        var all: [PyroWavePacket] = []
+    func packets(_ id: UInt32, _ f: (stripes: [[Data]], predicted: Bool), repaired: UInt32 = 0) -> [RiptidePacket] {
+        var all: [RiptidePacket] = []
         let total = f.stripes.map(\.count).reduce(0, +)
         var first = 0
         for (k, parts) in f.stripes.enumerated() {
             for (i, part) in parts.enumerated() {
-                var p = PyroWavePacket(frameId: id, index: first + i, count: k + 1 == f.stripes.count ? total : 0,
+                var p = RiptidePacket(frameId: id, index: first + i, count: k + 1 == f.stripes.count ? total : 0,
                                        width: width, height: height, slotNs: 1, encodedNs: 2, payload: part,
                                        receivedNs: 3, readNs: 4)
-                p.inter = true
                 p.predicted = f.predicted
                 p.repaired = repaired
                 p.stripe = k
@@ -432,7 +431,7 @@ final class PyroWaveStripeTests: XCTestCase {
         return Array(UnsafeBufferPointer(start: buffer.contents().assumingMemoryBound(to: UInt8.self), count: width * height))
     }
 
-    func send(_ ps: [PyroWavePacket]) {
+    func send(_ ps: [RiptidePacket]) {
         for p in ps { decoder.packet(p) { _, _ in timing(present: 1) } }
     }
 

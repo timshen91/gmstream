@@ -74,10 +74,37 @@ fn main() {
     h += "0};\n";
     fs::write(out.join("keymap.h"), h).unwrap();
 
+    // Riptide (riptide/, our codec), built here into OUT_DIR by build/riptide.sh:
+    // its sources, not its Granite checkout or build tree, decide when.
+    fn watch(dir: &Path) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_str().unwrap();
+            if p.is_dir() {
+                if name != "Granite" && name != "build" {
+                    watch(&p);
+                }
+            } else {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
+    }
+    watch(Path::new("riptide"));
+    let riptide = out.join("riptide");
+    fs::create_dir_all(riptide.join("lib")).unwrap();
+    let status = Command::new("sh")
+        .arg("build/riptide.sh")
+        .env("P", &riptide)
+        .env("RIPTIDE_BUILD", out.join("riptide-build"))
+        .status()
+        .expect("build/riptide.sh");
+    assert!(status.success(), "build/riptide.sh failed");
+
     let mut build = cc::Build::new();
     build
         .std("gnu11")
         .include(&out)
+        .include(riptide.join("include"))
         .define("WLR_USE_UNSTABLE", None)
         .flag("-Wno-unused-parameter")
         .flag("-Wno-missing-field-initializers")
@@ -111,17 +138,19 @@ fn main() {
         let flag = if flag == "-lffi" { "-l:libffi.a".to_owned() } else { flag };
         println!("cargo:rustc-link-arg={flag}");
     }
-    // PyroWave (build/pyrowave.sh) and the parts of Granite it uses. Vulkan
-    // itself is loaded at run time by volk.
+    // PyroWave (build/pyrowave.sh), Riptide (above) and the parts of Granite
+    // both use (PyroWave's copy: the same commit). Vulkan itself is loaded at
+    // run time by volk.
+    println!("cargo:rustc-link-arg=-L{}", riptide.join("lib").display());
     println!("cargo:rustc-link-arg=-L{prefix}/lib");
-    for lib in ["pyrowave-c", "pyrowave", "granite-vulkan", "granite-math", "granite-util", "granite-volk"] {
+    for lib in ["riptide-c", "riptide", "pyrowave-c", "pyrowave", "granite-vulkan", "granite-math", "granite-util", "granite-volk"] {
         println!("cargo:rustc-link-arg=-l:lib{lib}.a");
     }
     println!("cargo:rustc-link-arg=-Wl,--end-group");
     for flag in pkg_config(&["--libs"], DYNAMIC_PKGS) {
         println!("cargo:rustc-link-arg={flag}");
     }
-    // PyroWave is C++; the host's libstdc++ is newer than the build image's.
+    // PyroWave and Riptide are C++; the host's libstdc++ is newer than the build image's.
     println!("cargo:rustc-link-arg=-lstdc++");
     println!("cargo:rustc-link-arg=-ldl");
 }

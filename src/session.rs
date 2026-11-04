@@ -28,17 +28,16 @@ use crate::udp;
 // datagrams; older web clients are still served.
 pub const PROTOCOL_VERSION: u16 = 5;
 
-// A PyroWave datagram's header (send_pyrowave), and with inter frames
-// (Sink::pyrowave).
+// A PyroWave datagram's header (send_pyrowave), and a Riptide one
+// (Sink::riptide).
 const PYROWAVE_HEADER: usize = 29;
-const PYROWAVE_INTER_HEADER: usize = 43;
+const RIPTIDE_HEADER: usize = 43;
 
 // Hello flags.
 const HELLO_ONE_VIDEO_STREAM: u8 = 1;
 const HELLO_VIDEO_DATAGRAMS: u8 = 2;
 const HELLO_VIDEO_CHUNKS: u8 = 4;
 const HELLO_HDR: u8 = 8;
-const HELLO_PYROWAVE_INTER: u8 = 16;
 
 // Client → host control messages.
 const C_HELLO: u8 = 0x01;
@@ -73,11 +72,12 @@ const DATAGRAM_VIDEO: u8 = 2;
 const VIDEO_FRAGMENT_HEADER: usize = 9;
 const DATAGRAM_PYROWAVE: u8 = 4;
 const DATAGRAM_VIDEO_CHUNK: u8 = 9;
-const DATAGRAM_PYROWAVE_INTER: u8 = 10;
+const DATAGRAM_RIPTIDE: u8 = 10;
 const VIDEO_CHUNK_HEADER: usize = 43;
 const CODEC_HEVC: u8 = 1;
 const CODEC_AV1: u8 = 2;
 const CODEC_PYROWAVE: u8 = 3;
+const CODEC_RIPTIDE: u8 = 4;
 const VIDEO_HEADER: usize = 32;
 // A frame that has not reached the client by then is abandoned; the client
 // asks for a keyframe instead.
@@ -208,18 +208,18 @@ impl core::Sink for Hub {
         }
     }
 
-    /// PyroWave packets of a stream with inter frames, one datagram each, out
+    /// A Riptide stripe's packets, one datagram each, out
     /// as soon as they are queued (an inter frame's inter packets before the rest
     /// of the frame is even coded).
-    fn pyrowave(&self, p: &core::PyroWavePackets) {
+    fn riptide(&self, p: &core::RiptidePackets) {
         let Some(client) = self.client() else { return };
         let mut rest = p.data();
         let mut index = p.first;
         while rest.len() >= 2 {
             let len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
             let Some(packet) = rest.get(2..2 + len) else { break };
-            let mut d = Vec::with_capacity(PYROWAVE_INTER_HEADER + len);
-            d.push(DATAGRAM_PYROWAVE_INTER);
+            let mut d = Vec::with_capacity(RIPTIDE_HEADER + len);
+            d.push(DATAGRAM_RIPTIDE);
             d.extend_from_slice(&p.frame_id.to_le_bytes());
             d.extend_from_slice(&index.to_le_bytes());
             d.extend_from_slice(&p.width.to_le_bytes());
@@ -535,10 +535,12 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         send_error(&mut send, "Protocol version mismatch; reload the page").await;
         bail!("{peer}: protocol version {version}");
     }
-    let both = mask as u32 & core::supported_codecs();
+    // Riptide only over plain UDP, where the client reports its losses.
+    let host = core::supported_codecs() & if conn.is_udp() { !0 } else { !(1 << CODEC_RIPTIDE) };
+    let both = mask as u32 & host;
     let codec = if both & (1 << pref) != 0 {
         pref
-    } else if let Some(c) = (0..4).find(|c| both & (1 << c) != 0) {
+    } else if let Some(c) = (0..5).find(|c| both & (1 << c) != 0) {
         c
     } else {
         send_error(&mut send, "No video codec in common with this host").await;
@@ -550,9 +552,6 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     // the pieces are a different datagram. The host falls back to whole frames
     // on its own if that encoder is not the one running.
     let chunked = wants_chunks && (codec == CODEC_AV1 || codec == CODEC_HEVC);
-    // PyroWave with inter frames: native clients (plain UDP, where they report
-    // their losses) that asked.
-    let pyrowave_inter = flags & HELLO_PYROWAVE_INTER != 0 && codec == CODEC_PYROWAVE && conn.is_udp();
     // The largest datagram this link carries unfragmented, so a piece of a
     // frame or a PyroWave packet fills one (each datagram has a fixed cost;
     // see core/pyrowave.c). 0: the core's default.
@@ -563,9 +562,8 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     };
     let packet = match (chunked, link_max) {
         (true, Some(max)) => max.saturating_sub(VIDEO_CHUNK_HEADER),
-        (false, Some(max)) if codec == CODEC_PYROWAVE && conn.is_udp() => {
-            max.saturating_sub(if pyrowave_inter { PYROWAVE_INTER_HEADER } else { PYROWAVE_HEADER })
-        }
+        (false, Some(max)) if codec == CODEC_PYROWAVE && conn.is_udp() => max.saturating_sub(PYROWAVE_HEADER),
+        (false, Some(max)) if codec == CODEC_RIPTIDE => max.saturating_sub(RIPTIDE_HEADER),
         _ => 0,
     };
 
@@ -610,9 +608,6 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     if wants_hdr {
         eprintln!("gmstream: client {n} can show HDR10");
     }
-    if pyrowave_inter {
-        eprintln!("gmstream: client {n} takes PyroWave inter frames");
-    }
     core::stream_start(
         codec,
         width,
@@ -621,8 +616,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         kbps,
         packet,
         (if chunked { core::STREAM_CHUNKED } else { 0 })
-            | (if wants_hdr { core::STREAM_HDR } else { 0 })
-            | (if pyrowave_inter { core::STREAM_PYROWAVE_INTER } else { 0 }),
+            | (if wants_hdr { core::STREAM_HDR } else { 0 }),
     );
 
     let writer = tokio::spawn(async move {
@@ -644,8 +638,8 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
                     Err(_) => break,
                 }
             }
-            // Measuring (GM_DEBUG_SEND): a PyroWave stripe's ready -> sent.
-            let traced = std::env::var_os("GM_DEBUG_SEND").is_some() && batch[0].len() > 27 && batch[0][0] == DATAGRAM_PYROWAVE_INTER;
+            // Measuring (GM_DEBUG_SEND): a Riptide stripe's ready -> sent.
+            let traced = std::env::var_os("GM_DEBUG_SEND").is_some() && batch[0].len() > 27 && batch[0][0] == DATAGRAM_RIPTIDE;
             let encoded = if traced { u64::from_le_bytes(batch[0][19..27].try_into().unwrap()) } else { 0 };
             let start = core::now_ns();
             if chunk_conn.send_datagrams_wait(batch).await.is_err() {

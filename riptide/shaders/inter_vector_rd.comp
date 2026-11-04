@@ -1,0 +1,100 @@
+#version 450
+// Inter frames: whether each 4x4 tile of vectors (64x64 luma) is worth its
+// bits. The tile keeps the searched vectors only if the prediction error they
+// save over last frame's vectors (which cost nothing to send) is worth more
+// than the bits they cost, at a price per bit from the rate-distortion slope:
+// a bit buys about 2 ln 2 times the mean squared error per pixel, measured on
+// last frame (inter_frame_mse.comp), times a calibration `scale`. Otherwise the
+// tile goes back to last frame's vectors.
+//
+// The error is over a 2:1 subsampled tile with each 16x16 block's own vector
+// (no interpolation between blocks): it only has to rank two choices. Vectors
+// under intra blocks are taken as last frame's first (they are set so by the
+// side-cost pass, inter_side_cost.comp), so their pixels count for nothing.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 6) readonly buffer Stats
+{
+    uint sse_256;
+} stats;
+layout(set = 0, binding = 1, rg16i) uniform iimage2D uVectors;
+layout(set = 0, binding = 2) uniform isampler2D uVectorsPrev;
+layout(set = 0, binding = 3) uniform mediump sampler2D uSource;
+layout(set = 0, binding = 4) uniform mediump sampler2D uReference; // bound with a bilinear sampler
+layout(set = 0, binding = 5) uniform mediump sampler2D uWeights;
+
+layout(push_constant) uniform Registers
+{
+    float scale; // the price's calibration; 0 turns the pass off
+};
+
+shared float s_d[256];
+shared ivec2 s_v[16], s_vp[16]; // the tile's vectors, searched and last frame's
+
+uint zigzag(int d)
+{
+    return d >= 0 ? uint(2 * d) : uint(-2 * d - 1);
+}
+
+void main()
+{
+    ivec2 vsize = imageSize(uVectors);
+    ivec2 size = textureSize(uSource, 0);
+    ivec2 tile = ivec2(gl_WorkGroupID.xy) * 4;
+    uint t = gl_LocalInvocationIndex;
+    if (t < 16u)
+    {
+        ivec2 vb = min(tile + ivec2(int(t & 3u), int(t >> 2)), vsize - 1);
+        s_vp[t] = texelFetch(uVectorsPrev, vb, 0).xy;
+        s_v[t] = texelFetch(uWeights, vb / 2, 0).x == 0.0 ? s_vp[t] : imageLoad(uVectors, vb).xy;
+    }
+    barrier();
+
+    // Thread t: four samples of the tile's 32x32 subsampled grid, in its block.
+    float dsse = 0.0; // error with the searched vectors minus with last frame's
+    for (int k = 0; k < 4; k++)
+    {
+        uint s = t * 4u + uint(k);
+        ivec2 g = ivec2(int(s & 31u), int(s >> 5)); // subsampled position in the tile
+        ivec2 p = tile * 16 + 2 * g;
+        ivec2 vb = tile + g / 8;
+        if (any(greaterThanEqual(p, size)) || any(greaterThanEqual(vb, vsize)))
+            continue;
+        int j = (g.y / 8) * 4 + g.x / 8;
+        vec2 inv = 1.0 / vec2(textureSize(uReference, 0));
+        float src = texelFetch(uSource, p, 0).x * 255.0;
+        float a = textureLod(uReference, (vec2(p) + vec2(s_v[j]) * 0.25 + 0.5) * inv, 0.0).x * 255.0;
+        float b = textureLod(uReference, (vec2(p) + vec2(s_vp[j]) * 0.25 + 0.5) * inv, 0.0).x * 255.0;
+        dsse += (src - a) * (src - a) - (src - b) * (src - b);
+    }
+    s_d[t] = dsse;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u)
+    {
+        if (t < s)
+            s_d[t] += s_d[t + s];
+        barrier();
+    }
+
+    if (t == 0u && scale > 0.0)
+    {
+        // The searched vectors' bits over last frame's (8 bits of widths either way).
+        uvec2 mx = uvec2(0u);
+        int n = 0;
+        for (int y = tile.y; y < min(tile.y + 4, vsize.y); y++)
+            for (int x = tile.x; x < min(tile.x + 4, vsize.x); x++, n++)
+            {
+                int j = (y - tile.y) * 4 + (x - tile.x);
+                ivec2 d = s_v[j] - s_vp[j];
+                mx = max(mx, uvec2(zigzag(d.x), zigzag(d.y)));
+            }
+        float bits = float(n) * float(findMSB(mx.x) + 1 + findMSB(mx.y) + 1);
+        float mse = float(stats.sse_256) * 256.0 / float(size.x * size.y);
+        float price = scale * 1.386 * max(mse, 1.0);
+        // The error is over a quarter of the pixels.
+        if (4.0 * s_d[0] + price * bits >= 0.0)
+            for (int y = tile.y; y < min(tile.y + 4, vsize.y); y++)
+                for (int x = tile.x; x < min(tile.x + 4, vsize.x); x++)
+                    imageStore(uVectors, ivec2(x, y), ivec4(s_vp[(y - tile.y) * 4 + (x - tile.x)], 0, 0));
+    }
+}

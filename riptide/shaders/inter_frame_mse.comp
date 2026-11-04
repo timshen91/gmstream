@@ -1,0 +1,42 @@
+#version 450
+// Inter frames: last frame's luma reconstruction error, the reference (its
+// decode) against its source, summed into a counter. It prices a bit for the
+// vector decision (inter_vector_rd.comp). One threadgroup per 32x32 pixels.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Stats
+{
+    uint sse_256; // squared 8-bit error over the frame, in units of 256
+} stats;
+layout(set = 0, binding = 1) uniform mediump sampler2D uReference;
+layout(set = 0, binding = 2) uniform mediump sampler2D uLastSource;
+
+shared uint s_sum[64];
+
+void main()
+{
+    ivec2 size = textureSize(uReference, 0);
+    uint t = gl_LocalInvocationIndex;
+    // Thread t: row t / 2 of the block, 16 pixels from column (t % 2) * 16.
+    ivec2 p0 = ivec2(gl_WorkGroupID.xy) * 32 + ivec2(int(t & 1u) * 16, int(t >> 1));
+    uint sum = 0u;
+    for (int i = 0; i < 16; i++)
+    {
+        ivec2 p = p0 + ivec2(i, 0);
+        if (all(lessThan(p, size)))
+        {
+            int d = int(texelFetch(uReference, p, 0).x * 255.0 + 0.5) - int(texelFetch(uLastSource, p, 0).x * 255.0 + 0.5);
+            sum += uint(d * d);
+        }
+    }
+    s_sum[t] = sum;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (t < s)
+            s_sum[t] += s_sum[t + s];
+        barrier();
+    }
+    if (t == 0u)
+        atomicAdd(stats.sse_256, (s_sum[0] + 128u) >> 8);
+}

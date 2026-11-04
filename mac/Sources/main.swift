@@ -38,24 +38,24 @@ final class Probe: ConnectionDelegate {
 
     init(conn: Connection) { self.conn = conn }
 
-    // PyroWave frames are decoded, as the app does (inter frames need it: the
-    // losses are reported back from the decoder), just not shown.
+    // Riptide frames are decoded, as the app does (the losses are reported back
+    // from the decoder), just not shown.
     private let lock = NSLock()
     private var decoded: [(total: Double, decode: Double, early: Double)] = []
     var losses = 0, intraRequests = 0
-    lazy var pyro: PyroWaveDecoder? = {
+    lazy var riptide: RiptideDecoder? = {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
-              let d = PyroWaveDecoder(device: device, queue: queue) else { return nil }
+              let d = RiptideDecoder(device: device, queue: queue) else { return nil }
         d.onLoss = { [weak self] id, count, ranges in
             self?.losses += 1
-            self?.conn.pyrowaveLoss(frameId: id, count: count, ranges: ranges)
+            self?.conn.riptideLoss(frameId: id, count: count, ranges: ranges)
         }
         d.onNeedIntra = { [weak self] in self?.intraRequests += 1; self?.conn.send(Msg.keyframe) }
         d.keepGPUAwake = options.keepGPUAwake
         d.onDecoded = { [weak self] _, t in
             guard let self, let present = t.presentLocal else { return }
             // present → decoded, last packet → decoded, and how long before the
-            // last packet the first (inter frames: the inter packets) arrived.
+            // last packet the first arrived.
             let ms = { (a: UInt64, b: UInt64) in Double(Int64(a) - Int64(b)) / 1e6 }
             self.lock.lock()
             self.decoded.append((ms(t.decoded, present), ms(t.decoded, t.received),
@@ -86,7 +86,10 @@ final class Probe: ConnectionDelegate {
     }
     func pyrowave(_ p: PyroWavePacket) {
         if p.index == p.count - 1 { stats.add(bytes: p.payload.count, netMs: nil, totalMs: nil) } else { stats.addBytes(p.payload.count) }
-        pyro?.packet(p) { [conn] first, overlap in
+    }
+    func riptide(_ p: RiptidePacket) {
+        if p.index == p.count - 1 { stats.add(bytes: p.payload.count, netMs: nil, totalMs: nil) } else { stats.addBytes(p.payload.count) }
+        riptide?.packet(p) { [conn] first, overlap in
             FrameTiming(slotNs: p.slotNs, encodedNs: p.encodedNs, received: p.receivedNs, firstReceived: first,
                         overlapNs: overlap) { conn.toLocal(hostNs: $0) }
         }
@@ -107,7 +110,7 @@ if let seconds = options.probe {
         conn.delegate = probe
         let (w, h) = options.size ?? (1920, 1080)
         conn.start(width: w, height: h, refreshMhz: UInt32((options.refresh ?? 60) * 1000), kbps: options.mbps * 1000,
-                   codecMask: codecMask | 1 << 3, preferred: options.codec)
+                   codecMask: codecMask | 1 << 3 | 1 << 4, preferred: options.codec)
         let pinger = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in conn.ping() }
         let end = Date().addingTimeInterval(seconds)
         while Date() < end {
@@ -117,9 +120,9 @@ if let seconds = options.probe {
                   "encoded→received \(fmt(s.net)) ms  present→received \(fmt(s.total)) ms (max \(fmt(s.totalMax)))  " +
                   "rtt \(fmt(Double(conn.rttNs) / 1e6)) ms  audio \(probe.audioPackets) packets \(probe.audioSamples / 2) frames decoded")
             probe.audioPackets = 0; probe.audioSamples = 0
-            if options.codec == 3 {
+            if Options.isRiptide(options.codec) {
                 print("  \(probe.takeDecoded())  losses reported \(probe.losses)  intra asked \(probe.intraRequests)")
-                if getenv("PYROWAVE_TIMESTAMPS") != nil { probe.pyro?.reportPerformance() }
+                if getenv("RIPTIDE_TIMESTAMPS") != nil { probe.riptide?.reportPerformance() }
             }
         }
         pinger.invalidate()
