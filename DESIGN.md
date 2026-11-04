@@ -440,15 +440,33 @@ environment, printing its output.
 - Cursor: iPadOS's pointer takes no image, so it is hidden over the stream
   and the host's cursor is drawn into our frames (as on a macOS VRR
   display).
-- The mouse (macOS). Two locks that have nothing to do with each other. The
-  macOS cursor is hidden and captured through the whole stream, in every setting:
-  it stays still in the middle of the view, so nothing that watches it can fire
-  (the Dock pops up even with `.hideDock`, and a flick beats any warp back or
-  margin). The cursor is the client's: the app adds up the motion and draws it
-  after decoding, redrawing the last frame at the display's refresh while it
-  moves, whatever the stream's rate. gamescope sends no position, only the image
-  (none: hidden, or a game drawing its own, or locked, which look the same) and
-  a one-bit lock (`lock_pointer`: empty image, a constraint, not Steam).
+- The mouse (macOS). The cursor over the stream is always ours, drawn into the
+  frame after decoding: the macOS cursor is hidden wherever ours appears, since
+  a cursor sprite WindowServer has to move pins the Dell at a fixed 120 Hz (§8).
+  Ours is redrawn once per the display's shortest refresh while it moves, by
+  drawing the last decoded frame again, so it moves at the panel's rate however
+  slow the stream is (`setCursor(local:)`, Video.swift; the stats line's
+  `cursor ... N fps` is the measured rate).
+  What changes with the window is who moves the pointer. **Full screen** the
+  mouse is ours: captured, so the system cursor stays still in the middle of the
+  view and nothing that watches it can fire (the Dock pops up even with
+  `.hideDock`, and a flick beats any warp back or margin), and the cursor is the
+  added-up motion, which cannot leave the view. **Windowed** the pointer stays
+  the system's and goes where it likes, in and out of the window, so the Dock,
+  the menu bar and the other displays all work; ours is drawn at the pointer's
+  real place while it is over the view (an `NSTrackingArea` says when it
+  crosses) and macOS's own comes back outside. A game that wants motion
+  (Relative) is captured either way: it has no cursor position to show.
+  gamescope sends no position, only the image (none: hidden, or a game drawing
+  its own, or locked, which look the same) and a one-bit lock (`lock_pointer`:
+  empty image, a constraint, not Steam).
+  Two earlier rules are gone: that the macOS cursor was captured through the
+  whole stream in every setting (a window should behave like a window), and the
+  brief attempt to make the macOS cursor itself the windowed cursor (then a clip
+  can only be held by warping the system pointer, and the cursor you see is no
+  longer where the mouse is). Which cursor is drawn and who moves the pointer
+  are separate questions; answering them as one is what made this go back and
+  forth.
 - Cursor setting (`--cursor`): Auto draws ours when gamescope has an image and
   not when it has none; Show always, with an arrow where there is no image
   (`--force-client-cursor`); Hide never. A cursor the game paints itself (Ender
@@ -490,15 +508,19 @@ environment, printing its output.
   wants it and positions otherwise; Absolute and Relative stand, whatever it asks.
   gamescope takes in both at all times, but a locked game ignores positions and
   a game reading the cursor's position still sees it move with motion.
-- Confinement setting (`--confine`): Auto keeps our cursor to the game's clip while
-  there is one; None lets it go anywhere in the view, whatever the game asks. The
-  macOS cursor never moves during a stream: ours stops at the view's edge, and only
-  losing focus ends the capture. The capture only starts with the mouse inside the view, in every setting (the
-  title bar stays the system's), and parks the system cursor in the middle of the
-  view, hidden: clicks go to its real place, and frozen at an edge that can be the
-  title bar (a double click there zooms the window); after
-  a warp mouse events are ignored until it settles, as queued ones still say
-  where it was and a later one can carry the whole jump as its delta. The iPad has Mouse only,
+- Confinement setting (`--confine`): Auto keeps the cursor to the game's clip
+  while there is one; None lets it go anywhere in the view, whatever the game
+  asks. Either way it only applies while the mouse is captured, which is to say
+  full screen: there the clip is simply where the added-up motion stops.
+  Windowed the pointer is macOS's and is not ours to stop, and pinning our
+  cursor on a clip edge while the hand went somewhere else would show a cursor
+  that is not where the mouse is, so no clip is held (`Session.confined` is
+  false without a capture). A capture only starts with the mouse inside the view
+  (the title bar stays the system's) and parks the system cursor in the middle of
+  the view, hidden: clicks go to its real place, and an edge can be the title bar
+  (a double click there zooms the window). Only losing focus ends a capture.
+  After a warp mouse events are ignored until it settles, as queued ones still
+  say where it was and a later one can carry the whole jump as its delta. The iPad has Mouse only,
   and captures for relative only, as iPadOS decides the lock; the web client
   still follows the host.
 - Settings: a three-finger tap (the touches it began are cancelled on the
@@ -1710,6 +1732,9 @@ What it does per frame:
   `GM_AV1_TILE_BYTES` sets the bytes per tile (48 KiB). Sizing them from the
   *last* frame's size runs away: tiles make frames bigger, which asks for more
   tiles, and it pins itself to the maximum within a second.
+  **Measured later (§12.6), tiles buy nothing at all** and the default should
+  probably be one: cutting the picture's dependences is not what makes a frame
+  streamable here, watching the buffer fill is.
 - **Rate control is off; the q index is picked per frame** (`next_q`), which
   bounds the bytes per *frame* rather than the bits per second: it is one
   frame's transmit time that shows up as latency. About 58 q indices halve the
@@ -1809,6 +1834,119 @@ against 4.3, and decode 1.7 against 1.6 — the advantage narrows with
 resolution, because what the VA-API path wastes (one GPU round trip, FFmpeg)
 is roughly fixed while the encode itself scales.
 
+### 12.6 HEVC, and what a streamable unit actually costs
+
+The same encoder takes HEVC (`VK_KHR_video_encode_h265`), and everything in
+§12.4 that is not a header transfers unchanged: the dma-buf import, the
+encoder's own RGB conversion, the bitstream buffer in our pages, gamescope's
+fence as a device semaphore, the two-slot DPB, and the whole pattern /
+frontier / shadow-compare path. Watching a buffer fill is a byte-level
+business and knows nothing about codecs.
+
+What differs is the headers (a VPS, SPS and PPS instead of one sequence
+header, with the colour description in the SPS's VUI), the per-picture syntax
+(reference lists, a short-term reference picture set and a picture order count
+instead of order hints), a qp in 0..51 instead of a q index in 0..255, and how
+a frame may be cut up. This driver reports **no HEVC tiles at all** (`maxTiles`
+is 1x1) and up to **128 slice segments**, which may start part way along a
+coding tree block row. It does not report `dependent_slice_segment_flag` as
+ours to set, so every segment is independent: an entropy context reset and a
+slice header of its own.
+
+**And the cutting turns out to be worthless.** At a fixed q on vkmark's
+`desktop` scene, 2940x1846 at 60 Hz over loopback:
+
+| slice segments | bitrate | bytes/frame | first piece before the encode ended |
+| --- | --- | --- | --- |
+| 1 | **7.9 Mb/s** | 16.9 k | 3.33 ms |
+| 31 | 9.2 Mb/s | 19.8 k | 3.36 ms |
+| 128 | 10.0 Mb/s | 22.3 k | 3.60 ms |
+
+Twenty-seven per cent of the bitrate for an overlap that does not move. The
+reason is that VCN's bitstream writer flushes as it goes whatever the slice
+structure is, so the frontier walks just as smoothly through one segment as
+through a hundred. The default is one segment; `GM_HEVC_SLICE_BYTES` sizes
+them by the frame's budget, which is how the above was measured.
+
+The same question, asked of AV1 at last, gets the same answer — 1x1 tiles
+6.3 Mb/s and 13.6 kB a frame, 2x16 tiles 7.1 Mb/s and 16.1 kB, with the first
+piece 4.60 ms against 4.65 ms before the encode ended, and 36 back-patched
+bytes a frame against none. So the tiling on the live path is cost without
+benefit too, at a size that depends on the operating point (2.6% at a high
+bitrate, 13% here) but never earning any of it back.
+
+The general point, which is worth stating because it was got wrong first:
+a streamable unit does not have to be a cut in the picture's spatial
+dependences. The frame is in memory and can be scanned any number of times;
+what is needed is only *some* unit that can leave before the rest is ready,
+and here that unit is "whatever bytes the GPU has written", which is free.
+Severing prediction and entropy context to buy it is paying for something
+already owned. (A wavelet codec makes this structural rather than incidental:
+its units are spectral, independent by construction because the transform did
+the decorrelation globally, and they can arrive out of order or not at all.
+That is PyroWave, and it is why PyroWave has no analogue of this table.)
+
+HEVC also back-patches **nothing** — 0 bytes a frame across every run —
+because Annex B frames its NAL units with start codes and carries no table of
+sizes to fill in afterwards. AV1's tile sizes have to be written once the
+tiles are done, which is what the held-back 128-byte prefix and the
+shadow-compare resend are for.
+
+Measured, 2940x1846 at 60 Hz over loopback, one slice segment, our rate
+control: 5 Mb/s asked gives 5.8, 20 gives 19.9, 50 gives 48.4, at qp 33, 19
+and 11, with the first piece leaving 3.07, 3.71 and 3.95 ms before the encode
+finished and no gaps. Ten-bit Main 10 encodes from gamescope's `XB30`
+composite with the encoder's own conversion and no copy, tagged PQ and
+BT.2020, coded 2944x1856 and cropped back to 2940x1846 by the conformance
+window — which is better than the AV1 path, where the padding is coded.
+
+The client needed almost nothing: the pieces carry their codec, so
+reassembly was already codec-agnostic, and HEVC parameter-set extraction and
+`CMVideoFormatDescriptionCreateFromHEVCParameterSets` were already there for
+the VA-API path. Only HDR detection was AV1-only, and for HEVC it reads the
+transfer function off the format description VideoToolbox has already built
+from the parameter sets, rather than parsing a VUI; the depth comes from
+`general_profile_idc`, which sits at a fixed offset in the SPS.
+
+**Why bother, given AV1 is better per bit.** `VTIsHardwareDecodeSupported`
+says AV1 needs an M3 or later, so the M1 iPad cannot decode it in hardware
+and was stuck on H.264 with none of this. HEVC Main 10 gives it the pieces,
+HDR10 and the rate control, at a bitrate penalty that does not matter at
+50 Mb/s into a 700 Mb/s link.
+
+Coding tools follow the rule §12.4 learned the hard way: claim nothing the
+encoder does not apply. `strong_intra_smoothing_enabled_flag` is HEVC's own
+version of the intra edge filter that drifted the AV1 picture, and is left
+off; SAO is an in-loop filter and waits behind `GM_HEVC_SAO` until it has
+been checked against a reference decode; temporal MVP is off because the
+driver does not report it as ours to set. Unlike the AV1 path, RADV's HEVC
+path does program these into the hardware and clamps them against its caps,
+so the trap is guarded there — but the rule costs nothing to keep.
+
+**The setting.** Since every part costs bits and buys nothing here, how many
+there are is the client's to choose: Settings -> Pipelining parallelism, Auto or
+a count (protocol 0x11 `Parallelism`, `vkencode_set_parallelism`). Auto is each
+codec's default -- AV1 as many tiles as the hardware allows, HEVC one segment.
+The host clamps the count to the hardware and the picture and reports what it
+settled on, which is the number in the stats line's `host in` row (`32 tiles
+(2x16)`, `8 slice segments`), so the setting always answers for itself; `probe
+-P N` does the same from the command line.
+
+Measured on the live host, vkmark's desktop scene at 1920x1080, 60 Hz, 50 Mb/s
+asked, 6 s each, over loopback:
+
+| parts | HEVC | AV1 |
+| --- | --- | --- |
+| 1 | 39.9 Mb/s | 26.5 Mb/s |
+| 8 | 49.1 Mb/s | 24.7 Mb/s |
+| 32 | 52.4 Mb/s | 27.4 Mb/s |
+
+HEVC pays 31% more bits for 32 segments, as §12.6's fixed-q table said it
+would. AV1's numbers are flat because its rate control is holding the asked
+bitrate and paying for the tiles in quantizer instead -- the same cost, moved
+from the bitrate to the picture. Either way nothing is bought: the overlap comes
+from watching the buffer fill, not from cutting the picture up.
+
 ### 12.5 Not done
 
 - **Decoding as it arrives.** VideoToolbox takes whole frames, so the pieces only
@@ -1838,3 +1976,175 @@ is roughly fixed while the encode itself scales.
 PyroWave may still be the cheaper answer at high bitrate: it already sends
 independently decodable packets as they are produced. Compare against it before
 going further.
+
+## 13. PyroWave inter frames
+
+PyroWave stays a fixed-size-per-frame GPU wavelet codec, but a frame can now be
+coded as its difference from a prediction from the previous decoded frame
+(motion compensated, per 32x32 block on or off). There are no keyframes: every
+frame is the same size, and the first frame (or one after the host lost track
+of the client) is intra at that size. The codec work, step by step with each
+step measured, is in PyroWave's tree under `INTER.md` (the patched source this
+repository builds: `build/pyrowave-inter.patch` over upstream 79a3232, applied
+by `build/pyrowave.sh` for the host and `apple/pyrowave.sh` for the clients).
+On the AOM gaming clips it needs 37% fewer bits than intra PyroWave for the same
+PSNR (Dota -70%, StarCraft -63%, Euro Truck -44%, Witcher -7%, Minecraft -1%).
+
+### 13.1 How it runs
+
+- Protocol: Hello bit 4 (plain UDP clients that ask for PyroWave), datagram type
+  10, loss reports type 11 (PROTOCOL.md, "PyroWave inter frames").
+- Stripes (13.3): the frame is coded as horizontal bands, each an image of its
+  own that predicts from the whole previous frame, so encode, network and
+  decode overlap stripe by stripe.
+- Host (`core/pyrowave.c`): `pyrowave_encoder_enable_inter` with the stripe
+  layout. The encoder decodes each stripe it hands out (its reference is what
+  the client has when nothing is lost) and keeps the last 8 frames. The stripes
+  are GPU submissions one after another; `pyrowave_encoder_packetize_stripe`
+  waits only for its own and the stripe goes out at once
+  (`gm_callbacks.pyrowave`), then `pyrowave_encoder_decode_stripe` queues its
+  own decode behind the frame's encode.
+- Client (`apple/PyroWave.swift`): a decoder per stripe; decodes every frame in
+  order from its own previous output, each stripe straight into its rows of the
+  frame (`pyrowave_decoder_decode_gpu_buffer_rows`). Once a stripe's inter
+  packets are in it forms that stripe's prediction
+  (`pyrowave_decoder_prepare_prediction`) while its coefficients arrive. A
+  stripe is decoded when complete, when its last packet is in (packets come in
+  order: the missing ones are lost), or when a later stripe or frame starts; a
+  stripe or frame of which nothing came is decoded from nothing. What it missed
+  goes back (type 11, repeated once a frame until a frame's `repaired` reaches
+  it); the host replays the client's decode with exactly that and predicts from
+  the result. Too old to replay, or a client with no reference (joined late, a
+  gap longer than the host keeps): an intra frame (`KeyframeRequest`).
+- Both GPUs are kept awake while frames flow (13.4): `core/gpuwarm.c` on the
+  host, `apple/GPUWarm.swift` on the client.
+- Settings: "PyroWave inter frames" (Mac and iPad, default on; `--intra-only`),
+  only usable with PyroWave; the AV1/HEVC "frames in pieces" setting likewise
+  only with those. The Hello carries each flag only with its codec.
+
+### 13.2 Measured (2026-11-04)
+
+Cross-GPU (`tools/pwenc.c` on the host's AMD GPU, `tools/pwdec.mm` on the Mac):
+the Mac's decode of the AMD encoder's frames differs from the encoder's own
+decode in 0.01% of luma samples (fp16 transform rounding), not growing over 30
+frames; frame 10's inter packets dropped on the Mac with the loss reported, frame
+11 is back within 0.02%; unreported, 23.8 dB by frame 29 (29.4 with).
+
+Live, the host's test instance (vkmark's desktop scene, gamescope nested) over
+the hotspot, the Mac app in `--probe` (decoding, not presenting: this Mac's
+display was asleep), present -> decoded p50 / p99:
+
+| | host encode (start -> packets) | present -> decoded |
+|---|---|---|
+| 1920x1080 @60, 50 Mb/s, intra | 0.77 ms | 6.6 / 8.5 ms |
+| same, inter | 2.09 (inter packets at 1.62) | 8.6 / 10.4 |
+| 2560x1600 @120, 100 Mb/s, intra | 1.08 | 8.0 / 10.8 |
+| same, inter | 3.23 (2.58) | 10.7 / 13.3 |
+| 3840x2160 @120, 100 Mb/s, intra | 1.70 | 11.0 / 13.4 |
+| same, inter | 6.11 (5.03) | 14.9 / 17.1 |
+
+With every 500th datagram dropped (`GM_DEBUG_DROP=500`, about one frame in six
+damaged): every loss reported and replayed, no intra frame needed, 1080p p99
+11.1 ms (it was 23.9 before a frame was decoded as soon as its last packet
+arrived instead of when the next one began).
+
+So on this GPU inter frames cost 2-4 ms of latency at the same bitrate, almost
+all the host's motion search (six passes over the frame, ~0.7 ms each at 4K):
+the inter packets are ready only ~0.3-1 ms before the rest, so the overlap they
+buy on the client is small next to it. Inter frames buy bits (37%) or quality,
+not latency, until the search is cheaper.
+
+The measurements above are of whole frames, before stripes (13.3).
+
+### 13.3 Stripes: encode, network and decode overlapped
+
+A whole frame overlapped nothing: the motion search, the transform, the rate
+control and the packing each finish the frame before the next starts, and the
+client's inverse transform needs every packet (its coarsest level spans the
+frame). So the frame is cut into horizontal stripes, each coded as a PyroWave
+image of its own: its own transform, rate control, packets and inter packets,
+predicting from anywhere in the whole previous frame (the inter shaders take the
+stripe's row in the reference). The host's GPU does the stripes one after
+another and each goes out as soon as it is done; the client decodes each as it
+lands, straight into its rows of the frame. Bit-exact on both ends as before
+(the Mac tests check the client's decode against the encoder's, stripe by
+stripe), loss replay per stripe.
+
+- Layout: a first stripe of 128 rows (out sooner), then 384, the last taking the
+  rest (128 rows or more); stripe boundaries on 64 rows so every grid lines up
+  (`GM_PYROWAVE_STRIPE_ROWS`, `GM_PYROWAVE_FIRST_ROWS`; 0 rows: one stripe).
+- Rate: each stripe gets the share of the frame's bytes that the rate control
+  would have given it across the whole frame, from the last frame's statistics
+  (the same distortion-per-byte cut in every stripe), at least a quarter of its
+  share by area; the frame's total is exact as before.
+- Cost in bits, Euro Truck at 1080p (PSNR-Y): 384-row stripes -0.01 dB, 256 rows
+  -0.05, 128 rows -0.15. More at low rates on big frames (4K at 104 KB a frame,
+  256 rows: -0.24 dB).
+- Cost in GPU time: a fixed amount per stripe on both ends, so at a light load a
+  frame of 7 stripes takes about what one stripe did, and under a GPU-bound game
+  each stripe's chain of passes waits on the game's work (13.5).
+
+### 13.4 Both GPUs kept awake
+
+Decoding and encoding a stripe at a time are short bursts, and both GPUs' power
+management reads that as a light load and lowers the clock: on the M4 the same
+stripe decoded 4.4x slower in streaming than back to back (inverse transform
+0.39 ms a stripe against 0.12), on the host the first stripe came out after
+1.04 ms against 0.45 with the clock forced up. Neither clock can be set from an
+ordinary process (Metal's performance state assertion needs a private
+entitlement; amdgpu's `power_dpm_force_performance_level` needs root), but both
+follow how busy the GPU is, so each end submits a tiny kernel back to back on a
+low priority queue of its own while frames flow, and stops a second after the
+last: the GPU is never idle in its eyes, the filler does almost nothing, and the
+codec's work goes first. Any gap in the filler (even 0.5 ms) lets the clock
+drop again.
+- Client: `apple/GPUWarm.swift` (256 threads x 100 FMAs a dispatch, two in
+  flight, Metal queue priority 0), setting "Keep the GPU awake for PyroWave"
+  (default on, PyroWave only; `--no-gpu-awake`).
+- Host: `core/gpuwarm.c` (its own Vulkan device, a compute queue at low global
+  priority, 4 workgroups a dispatch), on whenever PyroWave frames are encoded
+  (`GM_PYROWAVE_GPU_WARM=0` turns it off). Under a GPU-bound load it costs
+  ~0.15 ms of encode time; under a light one it saves ~0.9.
+Like Keep Wi-Fi awake, power for latency, only while streaming.
+
+### 13.5 Measured with stripes (2026-11-04)
+
+The host's test instance at 2560x1600 @120, the Mac app in `--probe` (decoding,
+not presenting: this Mac's display was off), present -> decoded p50 / p99, with
+vkcube (a light GPU load) or vkmark's desktop scene (the GPU at 100%):
+
+| | whole frames (13.2) | stripes | stripes, both GPUs awake |
+|---|---|---|---|
+| vkcube, 100 Mb/s | 11.6 (vkmark) | 8.3-9.7 | 4.9-5.5 / 6.0-7.6 |
+| vkcube, 300 Mb/s | | | 6.6 / 9.1 |
+| vkmark, 100 Mb/s | 11.6 / 16.8 | 9.0-9.9 | 7.5-8.1 / 8.9-9.1 |
+| vkmark, 300 Mb/s | 14-14.7 | 10.8 | 8.4-8.6 / 10.0 |
+
+With stripes and both GPUs awake at 100 Mb/s under vkcube: the first stripe out
+0.45 ms after the frame starts on the host, the whole frame 1.65 ms; the last
+packet to the frame decoded 0.6 ms (it was 2.3 for a whole frame). Under vkmark
+the host's encode is the longest stage (the frame's 5 stripes 4-5 ms, against
+2 ms for one stripe on the GPU alone): the game takes the GPU, and every pass of
+every stripe waits for its share. Things tried that did not change that: one
+submission for every stripe, a completion mark polled instead of the fence,
+fewer barriers, the per-band packing and rate analysis in one dispatch each, the
+stripes alternating over two compute queues (all measured, all reverted).
+
+### 13.6 Next
+
+- The host's encode under a GPU-bound game: the motion search over the whole
+  frame at once (fewer, fuller dispatches) before the stripes' backs, or fewer
+  stripes when the GPU is contended.
+- The hotspot carries a frame's stripes slower than one burst: at 100 Mb/s under
+  vkcube a 104 KB frame arrives over ~3.2 ms in stripes (about 280 Mb/s; the
+  host sends each stripe 0.01 ms after it is ready, `GM_DEBUG_SEND`), against
+  1.7-2.2 ms as one burst, and the client sees each stripe land at once and
+  stripes 1-3 together (`GM_DEBUG_TRACE` now records type 10's packet and
+  stripe). Small bursts aggregate worse on the air, which is likely why longer
+  stripes measured better. Keeping the Mac's Wi-Fi awake at 500-2000 Hz instead
+  of 60 changed nothing. Untried: the hotspot's own aggregation settings
+  (mt76), carefully, from the wired network.
+- The client's display stage (decoded -> on screen) was 22 ms in a window on
+  2026-11-04 before the stripes, which is now the biggest part of the total; not
+  looked at here (pacing, DESIGN.md §3.7).
+- The iPad app builds but is not installed (not connected).

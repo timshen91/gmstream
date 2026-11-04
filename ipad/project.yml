@@ -13,6 +13,7 @@ targets:
       # PyroWave's Metal decoder (build.sh checks it out).
       - path: build/pyrowave/metal
         includes: ["*.mm", "*.cpp"]
+      - path: build/pyrowave/pyrowave_inter.cpp
     settings:
       base:
         PRODUCT_NAME: GMStream

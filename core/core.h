@@ -16,6 +16,7 @@ void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 	int bitrate_kbps, int refresh_mhz, int packet_bytes, int flags);
 void encoder_stop(struct gm_encoder *enc);
 void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps);
+void encoder_set_parallelism(struct gm_encoder *enc, unsigned parts);
 void encoder_set_refresh(struct gm_encoder *enc, int refresh_mhz);
 void encoder_request_keyframe(struct gm_encoder *enc);
 // Copies `buffer` (gamescope's composited frame) into a width x height
@@ -37,26 +38,41 @@ struct gm_pyrowave;
 struct gm_pyrowave *pyrowave_create(const struct gm_callbacks *cb);
 void pyrowave_destroy(struct gm_pyrowave *pw);
 void pyrowave_start(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz,
-	int packet_bytes);
+	int packet_bytes, bool inter);
 void pyrowave_stop(struct gm_pyrowave *pw);
 void pyrowave_set_rate(struct gm_pyrowave *pw, int bitrate_kbps, int refresh_mhz);
+// Inter frames: the next frame intra (the client has no reference).
+void pyrowave_request_intra(struct gm_pyrowave *pw);
+
+// core/gpuwarm.c: keeps the GPU's clock up while frames are encoded. NULL if
+// unavailable or turned off; touch() then does nothing.
+struct gm_gpuwarm;
+struct gm_gpuwarm *gpuwarm_create(void);
+void gpuwarm_destroy(struct gm_gpuwarm *w);
+// A frame is being encoded: keep the clock up for the next second.
+void gpuwarm_touch(struct gm_gpuwarm *w);
 // Compositor thread. False if the buffer cannot be encoded (not a dma-buf).
 bool pyrowave_submit(struct gm_pyrowave *pw, struct wlr_buffer *buffer,
 	int width, int height, uint64_t slot_ns);
 void pyrowave_take_stats(struct gm_pyrowave *pw, unsigned *encoded,
 	unsigned *dropped, uint64_t *encode_ns);
 
-/* vkencode.c: AV1 on the Vulkan video encode queue, straight from gamescope's
- * dma-buf, each piece of the bitstream sent as the GPU writes it; its own
- * worker thread. NULL from create when the GPU has no AV1 encode queue (or
- * GM_AV1_VAAPI is set, which keeps the VA-API path as the reference). */
+/* vkencode.c: AV1 or HEVC on the Vulkan video encode queue, straight from
+ * gamescope's dma-buf, each piece of the bitstream sent as the GPU writes it;
+ * its own worker thread. NULL from create when the GPU has no such encode
+ * queue (or GM_AV1_VAAPI is set, which keeps the VA-API path as the
+ * reference). */
 struct gm_vkencode;
 struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb);
 void vkencode_destroy(struct gm_vkencode *vk);
-void vkencode_start(struct gm_vkencode *vk, int bitrate_kbps, int refresh_mhz,
-	int packet_bytes, int flags);
+/* Which codecs this encoder will take, as 1 << GM_CODEC_*; 0 for NULL. */
+unsigned vkencode_codecs(struct gm_vkencode *vk);
+void vkencode_start(struct gm_vkencode *vk, enum gm_codec codec, int bitrate_kbps,
+	int refresh_mhz, int packet_bytes, int flags);
 void vkencode_stop(struct gm_vkencode *vk);
 void vkencode_set_rate(struct gm_vkencode *vk, int bitrate_kbps, int refresh_mhz);
+/* Tiles (AV1) or slice segments (HEVC) per frame; 0 for the codec's default. */
+void vkencode_set_parallelism(struct gm_vkencode *vk, unsigned parts);
 void vkencode_request_keyframe(struct gm_vkencode *vk);
 // Compositor thread. False if the buffer cannot be encoded (not a dma-buf).
 bool vkencode_submit(struct gm_vkencode *vk, struct wlr_buffer *buffer,

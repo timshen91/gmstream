@@ -65,6 +65,7 @@ pub enum Kind {
     Control = 0,
     Mouse = 1,
     Ack = 2,
+    Loss = 3,
 }
 
 fn nonce(kind: Kind, seq: u32) -> Nonce {

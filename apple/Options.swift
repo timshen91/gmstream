@@ -78,10 +78,11 @@ enum MouseMode: Int, CaseIterable {
     var name: String { ["auto", "absolute", "relative"][rawValue] }
 }
 
-/// Whether the client's cursor keeps to the game's clip. Auto: it does, as far as
-/// the game has one and has the mouse. None: it goes anywhere, whatever the game
-/// asks. (The macOS cursor is another matter: it is hidden and captured all
-/// along, Session.wantsCapture.)
+/// Whether the cursor keeps to the game's clip. Auto: it does, as far as the
+/// game has one and has the mouse. None: it goes anywhere in the view, whatever
+/// the game asks. Either way it only applies while the mouse is captured (full
+/// screen): windowed the pointer is the system's and goes where it likes, in
+/// and out of the window (Session.wantsCapture, Session.confined).
 enum Confinement: Int, CaseIterable {
     case auto, none
     var title: String { ["Auto (as the game asks)", "None"][rawValue] }
@@ -115,10 +116,21 @@ struct Options {
     // A tiny datagram to the host 60 times a second, so this Mac's Wi-Fi
     // doesn't doze while only receiving (Connection.keepAwake).
     var keepWiFiAwake = true
+    // PyroWave: keep the GPU's clock up while frames arrive, so each stripe's
+    // decode runs at full speed (GPUWarmer).
+    var keepGPUAwake = true
     // Take each frame in pieces as the host's encoder writes it, so it is on
-    // the wire before it is finished (AV1 only; core/vastream.c). Off: the
+    // the wire before it is finished (AV1 and HEVC; core/vkencode.c). Off: the
     // host sends whole frames, as before.
     var streamFrames = true
+    // PyroWave with inter frames: each frame predicted from the last one, the
+    // client's losses reported back so the host follows (PROTOCOL.md). Off:
+    // every frame stands alone, as before.
+    var pyrowaveInter = true
+    // Each only means something for its own codecs, so each is asked for only
+    // with them (and its setting is greyed out otherwise).
+    static func takesFramesInPieces(_ codec: UInt8) -> Bool { codec == 1 || codec == 2 }
+    static func takesInterFrames(_ codec: UInt8) -> Bool { codec == 3 }
     // Manual pacing. Phase lock (Phase.swift): gamescope produces frames on this display's
     // refresh grid. Off: an empty grid, so gamescope paces itself and frames
     // are shown as they arrive (as on a variable-refresh display).
@@ -134,6 +146,12 @@ struct Options {
     var cursorMode = CursorMode.auto
     var mouseMode = MouseMode.auto
     var confinement = Confinement.auto
+    // How many parts the host cuts each frame into, so that the encode and the
+    // network overlap: AV1 tiles or HEVC slice segments. 0 asks for the
+    // codec's own default (AV1 as many as the hardware allows, HEVC one, which
+    // is what measured best -- see DESIGN.md 12.6). Each part costs bits, so
+    // this is worth turning down as well as up.
+    var parallelism = 0
     var layerKeys: [String: Double] = [:], drawableKeys: [String: Double] = [:] // measuring
     var bgra = false // decoder output BGRA instead of NV12 (measuring)
     // Tell the host this client can show HDR10, when the display it is on can
@@ -154,7 +172,9 @@ struct Options {
         immediateFullScreen = d.bool(forKey: "immediateFullScreen")
         vividColors = d.bool(forKey: "vividColors")
         if d.object(forKey: "keepWiFiAwake") != nil { keepWiFiAwake = d.bool(forKey: "keepWiFiAwake") }
+        if d.object(forKey: "keepGPUAwake") != nil { keepGPUAwake = d.bool(forKey: "keepGPUAwake") }
         if d.object(forKey: "streamFrames") != nil { streamFrames = d.bool(forKey: "streamFrames") }
+        if d.object(forKey: "pyrowaveInter") != nil { pyrowaveInter = d.bool(forKey: "pyrowaveInter") }
         if d.object(forKey: "hdr") != nil { hdr = d.bool(forKey: "hdr") }
         if d.object(forKey: "phaseLock") != nil { phaseLock = d.bool(forKey: "phaseLock") }
         holdFrames = d.bool(forKey: "holdFrames")
@@ -167,6 +187,7 @@ struct Options {
         cursorMode = CursorMode(rawValue: d.integer(forKey: "cursorSetting")) ?? .auto
         mouseMode = MouseMode(rawValue: d.integer(forKey: "mouseMode")) ?? .auto
         confinement = Confinement(rawValue: d.integer(forKey: "cursorConfinement")) ?? .auto
+        parallelism = d.integer(forKey: "parallelism")
 
         var it = args.makeIterator()
         while let a = it.next() {
@@ -189,7 +210,9 @@ struct Options {
             case "--no-vsync": immediateFullScreen = true; pacingMode = .manual
             case "--vivid": vividColors = true
             case "--no-keep-awake": keepWiFiAwake = false
+            case "--no-gpu-awake": keepGPUAwake = false
             case "--whole-frames": streamFrames = false
+            case "--intra-only": pyrowaveInter = false
             case "--no-phase": phaseLock = false
             case "--hold": holdFrames = true; pacingMode = .manual
             case "--no-hold": holdFrames = false; pacingMode = .manual
@@ -210,6 +233,9 @@ struct Options {
             case "--confine":
                 let n = it.next()?.lowercased()
                 confinement = Confinement.allCases.first { $0.name == n } ?? confinement
+            case "--parallelism":
+                let n = it.next()?.lowercased()
+                parallelism = n == "auto" ? 0 : max(0, Int(n ?? "") ?? 0)
             case "--layer": layerKeys = Options.parseKeys(it.next() ?? "")
             case "--drawable": drawableKeys = Options.parseKeys(it.next() ?? "")
             case let s where s.hasPrefix("-"): _ = it.next() // e.g. -NSDocumentRevisionsDebugMode YES
@@ -247,7 +273,9 @@ struct Options {
         d.set(immediateFullScreen, forKey: "immediateFullScreen")
         d.set(vividColors, forKey: "vividColors")
         d.set(keepWiFiAwake, forKey: "keepWiFiAwake")
+        d.set(keepGPUAwake, forKey: "keepGPUAwake")
         d.set(streamFrames, forKey: "streamFrames")
+        d.set(pyrowaveInter, forKey: "pyrowaveInter")
         d.set(phaseLock, forKey: "phaseLock")
         d.set(holdFrames, forKey: "holdFrames")
         d.set(pacingMode.rawValue, forKey: "pacingMode")
@@ -256,6 +284,7 @@ struct Options {
         d.set(cursorMode.rawValue, forKey: "cursorSetting")
         d.set(mouseMode.rawValue, forKey: "mouseMode")
         d.set(confinement.rawValue, forKey: "cursorConfinement")
+        d.set(parallelism, forKey: "parallelism")
     }
 }
 

@@ -28,14 +28,17 @@ use crate::udp;
 // datagrams; older web clients are still served.
 pub const PROTOCOL_VERSION: u16 = 5;
 
-// A PyroWave datagram's header (send_pyrowave).
+// A PyroWave datagram's header (send_pyrowave), and with inter frames
+// (Sink::pyrowave).
 const PYROWAVE_HEADER: usize = 29;
+const PYROWAVE_INTER_HEADER: usize = 43;
 
 // Hello flags.
 const HELLO_ONE_VIDEO_STREAM: u8 = 1;
 const HELLO_VIDEO_DATAGRAMS: u8 = 2;
 const HELLO_VIDEO_CHUNKS: u8 = 4;
 const HELLO_HDR: u8 = 8;
+const HELLO_PYROWAVE_INTER: u8 = 16;
 
 // Client → host control messages.
 const C_HELLO: u8 = 0x01;
@@ -54,6 +57,7 @@ const C_DISPLAY_GRID: u8 = 0x0d;
 const C_VRR_POLICY: u8 = 0x0e;
 const C_TOUCH: u8 = 0x0f;
 const C_AUTH: u8 = 0x10;
+const C_PARALLELISM: u8 = 0x11;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
@@ -69,7 +73,9 @@ const DATAGRAM_VIDEO: u8 = 2;
 const VIDEO_FRAGMENT_HEADER: usize = 9;
 const DATAGRAM_PYROWAVE: u8 = 4;
 const DATAGRAM_VIDEO_CHUNK: u8 = 9;
+const DATAGRAM_PYROWAVE_INTER: u8 = 10;
 const VIDEO_CHUNK_HEADER: usize = 43;
+const CODEC_HEVC: u8 = 1;
 const CODEC_AV1: u8 = 2;
 const CODEC_PYROWAVE: u8 = 3;
 const VIDEO_HEADER: usize = 32;
@@ -199,6 +205,47 @@ impl core::Sink for Hub {
             // client needs a fresh one to decode from.
             client.stats.queue_full.fetch_add(1, Ordering::Relaxed);
             core::request_keyframe();
+        }
+    }
+
+    /// PyroWave packets of a stream with inter frames, one datagram each, out
+    /// as soon as they are queued (an inter frame's inter packets before the rest
+    /// of the frame is even coded).
+    fn pyrowave(&self, p: &core::PyroWavePackets) {
+        let Some(client) = self.client() else { return };
+        let mut rest = p.data();
+        let mut index = p.first;
+        while rest.len() >= 2 {
+            let len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+            let Some(packet) = rest.get(2..2 + len) else { break };
+            let mut d = Vec::with_capacity(PYROWAVE_INTER_HEADER + len);
+            d.push(DATAGRAM_PYROWAVE_INTER);
+            d.extend_from_slice(&p.frame_id.to_le_bytes());
+            d.extend_from_slice(&index.to_le_bytes());
+            d.extend_from_slice(&p.width.to_le_bytes());
+            d.extend_from_slice(&p.height.to_le_bytes());
+            d.extend_from_slice(&p.slot_ns.to_le_bytes());
+            d.extend_from_slice(&p.encoded_ns.to_le_bytes());
+            d.push(p.predicted as u8);
+            d.extend_from_slice(&p.repaired.to_le_bytes());
+            d.push(p.stripe);
+            d.push(p.stripes);
+            d.extend_from_slice(&p.first_rows.to_le_bytes());
+            d.extend_from_slice(&p.stripe_rows.to_le_bytes());
+            d.extend_from_slice(&p.first.to_le_bytes());
+            d.extend_from_slice(&p.count.to_le_bytes());
+            d.push(p.inter);
+            d.extend_from_slice(packet);
+            if client.chunks.try_send(d).is_err() {
+                // The network side is behind: the client misses these and says so.
+                client.stats.queue_full.fetch_add(1, Ordering::Relaxed);
+            }
+            index += 1;
+            rest = &rest[2 + len..];
+        }
+        if p.stripe + 1 == p.stripes {
+            client.stats.encoded.fetch_add(1, Ordering::Relaxed);
+            client.stats.sent.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -498,10 +545,14 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         bail!("{peer}: no common codec (client {mask:#x}, host {:#x})", core::supported_codecs());
     };
     let kbps = kbps.clamp(1000, 500_000);
-    // A frame in pieces as the encoder writes it (core/vastream.c): AV1 only,
-    // and only for a client that asked, since the pieces are a different
-    // datagram.
-    let chunked = wants_chunks && codec == CODEC_AV1;
+    // A frame in pieces as the encoder writes it (core/vkencode.c): the two
+    // codecs the Vulkan encoder takes, and only for a client that asked, since
+    // the pieces are a different datagram. The host falls back to whole frames
+    // on its own if that encoder is not the one running.
+    let chunked = wants_chunks && (codec == CODEC_AV1 || codec == CODEC_HEVC);
+    // PyroWave with inter frames: native clients (plain UDP, where they report
+    // their losses) that asked.
+    let pyrowave_inter = flags & HELLO_PYROWAVE_INTER != 0 && codec == CODEC_PYROWAVE && conn.is_udp();
     // The largest datagram this link carries unfragmented, so a piece of a
     // frame or a PyroWave packet fills one (each datagram has a fixed cost;
     // see core/pyrowave.c). 0: the core's default.
@@ -513,7 +564,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     let packet = match (chunked, link_max) {
         (true, Some(max)) => max.saturating_sub(VIDEO_CHUNK_HEADER),
         (false, Some(max)) if codec == CODEC_PYROWAVE && conn.is_udp() => {
-            max.saturating_sub(PYROWAVE_HEADER)
+            max.saturating_sub(if pyrowave_inter { PYROWAVE_INTER_HEADER } else { PYROWAVE_HEADER })
         }
         _ => 0,
     };
@@ -559,6 +610,9 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     if wants_hdr {
         eprintln!("gmstream: client {n} can show HDR10");
     }
+    if pyrowave_inter {
+        eprintln!("gmstream: client {n} takes PyroWave inter frames");
+    }
     core::stream_start(
         codec,
         width,
@@ -567,7 +621,8 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         kbps,
         packet,
         (if chunked { core::STREAM_CHUNKED } else { 0 })
-            | (if wants_hdr { core::STREAM_HDR } else { 0 }),
+            | (if wants_hdr { core::STREAM_HDR } else { 0 })
+            | (if pyrowave_inter { core::STREAM_PYROWAVE_INTER } else { 0 }),
     );
 
     let writer = tokio::spawn(async move {
@@ -589,8 +644,15 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
                     Err(_) => break,
                 }
             }
+            // Measuring (GM_DEBUG_SEND): a PyroWave stripe's ready -> sent.
+            let traced = std::env::var_os("GM_DEBUG_SEND").is_some() && batch[0].len() > 27 && batch[0][0] == DATAGRAM_PYROWAVE_INTER;
+            let encoded = if traced { u64::from_le_bytes(batch[0][19..27].try_into().unwrap()) } else { 0 };
+            let start = core::now_ns();
             if chunk_conn.send_datagrams_wait(batch).await.is_err() {
                 return;
+            }
+            if traced {
+                SEND_TIMES.lock().unwrap().push((start.saturating_sub(encoded), core::now_ns() - start));
             }
         }
     });
@@ -704,6 +766,9 @@ async fn control_loop(recv: &mut RecvStream, client: &Client) -> Result<()> {
             C_CONFIGURE => core::stream_configure(r.u16()?, r.u16()?, r.u32()?),
             C_KEYFRAME => core::request_keyframe(),
             C_BITRATE => core::set_bitrate(r.u32()?.clamp(1000, 500_000)),
+            // Tiles or slice segments per frame; 0 for the codec's default.
+            // The encoder clamps it to what the hardware and the picture allow.
+            C_PARALLELISM => core::set_parallelism(r.u16()?.min(256)),
             C_KEY => core::key(r.u16()? as u32, r.u8()? != 0),
             C_BUTTON => core::pointer_button(r.u16()? as u32, r.u8()? != 0),
             C_MOTION => core::pointer_motion(r.f32()?, r.f32()?),

@@ -78,6 +78,19 @@ final class FakeHost {
         return nil
     }
 
+    /// The next sealed datagram of this type (nonce kind as in Connection.SeqKind).
+    func receiveDatagram(_ type: UInt8, nonceKind: UInt8, timeout: Double = 2) -> (seq: UInt32, payload: Data)? {
+        while let d = receive(timeout: timeout) {
+            if d[0] == datagramHandshake { answerHandshake(d) }
+            if d[0] == type, let recv {
+                let box = try! AES.GCM.SealedBox(nonce: Self.nonce(nonceKind, d.u32(1)), ciphertext: d.subdata(in: 5..<d.count - tagSize),
+                                                 tag: d.subdata(in: d.count - tagSize..<d.count))
+                return (d.u32(1), try! AES.GCM.open(box, using: recv, authenticating: d.subdata(in: 0..<5)))
+            }
+        }
+        return nil
+    }
+
     /// Tells the client which control datagram comes next.
     func sendAck(next: UInt32) {
         var w = Writer()

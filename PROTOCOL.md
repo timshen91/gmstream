@@ -50,13 +50,17 @@ Unknown types are skipped.
 | 0x0b | GamepadRemove | `u8 index` |
 | 0x0c | Ping | `u64 client_time_us` |
 | 0x0e | VrrPolicy | `u8 policy`: what the client wants of Steam's VRR. 0 = leave Steam's toggle alone (the default); 1 = off: the host reports the client's grid as a fixed refresh, or the stream's rate with no grid, so gamescope calls the display VRR-incapable and Steam greys its toggle; 2 = on: the host sets gamescope's `adaptive_sync` (what Steam's toggle sets) and hands each frame to the encoder at once, stamped with gamescope's commit time (the client holds frames itself). Leaving 2, the host restores `adaptive_sync` from Steam's preference (`GAMESCOPE_VRR_ENABLED`). Cleared when a stream starts or stops. |
+| 0x11 | Parallelism | `u16 parts`: how many parts the host cuts each frame into, so the encode and the network overlap -- AV1 tiles or HEVC slice segments. 0 asks for the codec's default (AV1 as many as the hardware allows, HEVC one). The host clamps it to what the hardware and the picture allow and reports what it settled on in `EncodeFormat`, so the client can show the count it actually got. May be sent at any time; the next frame uses it. |
 | 0x0f | Touch | `u8 id, u8 phase, f32 x, f32 y`: a touchscreen. Phase 0 = down, 1 = moved, 2 = up, 3 = cancel (every touch ends; id and position ignored); x, y normalized 0..1 over the video. Ids are the client's, reused after up. The host's gamescope applies its touch mode (SteamOS: passed through to Steam and the game as a touchscreen). |
 | 0x0d | DisplayGrid | `u64 anchor_ns, u32 interval_ns`: the client display's refresh grid in host CLOCK_MONOTONIC (a vblank and the interval), shifted by the client to set where frames land. The host then reports gamescope's frames as presented on that grid (still as a VRR-capable display, so Steam's VRR toggle stays available; with it off, gamescope paces to the grid). Native clients send it every 500 ms; it is cleared when a stream starts, and by an interval of 0 (a client on a variable-refresh display, which shows frames as they arrive). |
 
 `Hello` must be first. Hello flags: bit 0 = one video stream, bit 1 = video
 datagrams (see Video; if both are set, datagrams win), bit 2 = video chunks
-(AV1 only; see "Video chunks" below), bit 3 = the client can show HDR10 (PQ,
-BT.2020, ten-bit). Bit 3 states what the client is able to display, not what
+(AV1 and HEVC; see "Video chunks" below), bit 3 = the client can show HDR10 (PQ,
+BT.2020, ten-bit), bit 4 = PyroWave inter frames (plain UDP only; see "PyroWave
+inter frames" below). Bits 2 and 4 belong to their codecs: a client sets them
+only when it asks for one of those codecs, and the host ignores them for any
+other codec it settles on. Bit 3 states what the client is able to display, not what
 it wants: whether the session is HDR at all is the host's own setting (on
 SteamOS, Steam's display setting, which drives gamescope). The host sends an
 HDR stream only when both agree, and an eight-bit BT.709 one otherwise, so a
@@ -134,13 +138,14 @@ change always starts with a keyframe.
 
 ## Video chunks
 
-With the Hello flag *video chunks* and the AV1 codec, the host does not wait for
-a frame to finish encoding: it sends each piece of the bitstream as the GPU
-writes it, so most of a frame is on the wire before the encoder is done with it
-(core/vastream.c, DESIGN.md §12). The bytes are the encoder's own, byte for
+With the Hello flag *video chunks* and the AV1 or HEVC codec, the host does not
+wait for a frame to finish encoding: it sends each piece of the bitstream as the
+GPU writes it, so most of a frame is on the wire before the encoder is done with
+it (core/vkencode.c, DESIGN.md §12). The bytes are the encoder's own, byte for
 byte; a frame put back together from its pieces is exactly what a frame sent
 whole would have been. Any other codec, and the first frame of a session, still
-come whole.
+come whole, and so does every frame if the host is not running that encoder --
+asking for pieces is always safe.
 
 ```
 u8  type = 9
@@ -179,8 +184,8 @@ A frame's pieces are at most `max_datagram` minus this 43-byte header.
 
 ## PyroWave
 
-Codec 3 is [PyroWave](https://github.com/Themaister/pyrowave): an intra-only GPU
-wavelet codec whose rate control caps every frame at bitrate / refresh rate
+Codec 3 is [PyroWave](https://github.com/Themaister/pyrowave): a GPU wavelet
+codec, intra-only unless the client asks for inter frames (below), whose rate control caps every frame at bitrate / refresh rate
 bytes, so each frame's transmit time is bounded. YCbCr 4:2:0, BT.709 full
 range. Its frames always go as datagrams, whatever the Hello flags, one
 PyroWave packet per datagram. A packet is at most 1100 bytes, except over
@@ -204,7 +209,76 @@ u64 encoded_ns
 Packets decode independently: a lost one only blurs its part of the frame.
 The client decodes once it has `packet_count` packets of a frame; a frame
 still incomplete when a newer one starts is skipped. Every frame stands
-alone, so there are no keyframe requests.
+alone, so there are no keyframe requests (inter frames, below, differ).
+
+## PyroWave inter frames
+
+With Hello flag bit 4, over plain UDP, a PyroWave frame is coded as its
+difference from a prediction from the previous decoded frame (PyroWave's
+`bitstream/inter.md`, in the tree `build/pyrowave-inter.patch` gives). Every
+frame is still at most bitrate / refresh rate bytes, and there are no
+keyframes: the first frame, and any frame after the host loses track of the
+client, is intra (it predicts from nothing), at the same size as the rest.
+
+The frame is coded in stripes: horizontal bands, each coded as an image of its
+own (its own PyroWave packets, inter packets and share of the frame's bytes)
+that predicts from the whole previous frame. The first stripe is
+`first_rows` tall, the others `stripe_rows`, and the last takes the rest (it is
+never shorter than 128 rows). The host sends each stripe as soon as its GPU has
+finished it, while it codes the next, and the client decodes each as soon as it
+has arrived, into its rows of the frame, while the next is on the way. The
+frame's packets are numbered across its stripes in order.
+
+```
+u8  type = 10
+u32 frame_id
+u16 packet_index      the packet's number in the frame
+u16 width
+u16 height
+u64 slot_ns
+u64 encoded_ns        when this packet's stripe was ready
+u8  flags             bit 0: predicted from the previous frame; else intra
+u32 repaired          the newest frame whose loss report the host has taken in
+u8  stripe            this packet's stripe
+u8  stripes           the frame's
+u16 first_rows        the first stripe's rows
+u16 stripe_rows       every other stripe's but the last's
+u16 stripe_first      the stripe's first packet's number
+u16 stripe_count      the stripe's packets
+u8  stripe_inter      its first stripe_inter packets are inter packets
+... one PyroWave packet
+```
+
+A stripe's inter packets (its prediction map and motion vectors) come first;
+the client forms the stripe's prediction from them while its coefficients
+arrive. A stripe is decoded once all of it is in, once its last packet is (the
+host sends a stripe's packets in order, so the rest are lost), or once a packet
+of a later stripe or frame arrives. The frame's packet count is
+`stripe_first + stripe_count` of its last stripe; a frame whose last stripe
+never came reports the rest as missing.
+
+The client decodes every frame, in order, with whatever arrived of it: a frame
+still incomplete when the next one starts is decoded as it is, and a frame of
+which nothing arrived is decoded from nothing (PyroWave's loss rules make each
+of these exact). It reports what it missed, sealed like a mouse datagram with
+nonce kind 3 and its own sequence numbers:
+
+```
+u8  type = 11         client → host
+u32 sequence
+... sealed: u32 frame_id, u16 packet_count (as the client knows it; 0 if it
+    never learned it), u16 n, then n × (u16 first, u16 length): the missing
+    packets (a length past the end: the rest)
+```
+
+The host keeps its last frames, replays the client's decode of that frame with
+what it missed and of the frames since, and predicts the next frame from what
+the client actually has; later frames carry the frame's id in `repaired`. The
+client repeats a report once a frame until a frame says `repaired` has reached
+it. A report the host can no longer replay (more than ~8 frames old) makes its
+next frame intra. A client with nothing to predict from (it joined late, or
+more frames went missing than the host keeps) sends `KeyframeRequest` and
+decodes nothing until an intra frame comes.
 
 ## Audio
 
@@ -239,6 +313,8 @@ type byte:
 | 7 | mouse (client → host): `u32 sequence` then a sealed payload (below) |
 | 8 | acknowledgement (host → client): `u32 sequence` then a sealed `u32` |
 | 9 | a piece of a frame, as in "Video chunks" above |
+| 10 | a PyroWave inter frame packet, as in "PyroWave inter frames" above |
+| 11 | a PyroWave loss report (client → host), as in "PyroWave inter frames" above |
 
 A session starts with a handshake. Client → host: type 6, an ephemeral X25519
 public key, then zeros up to 129 bytes in all (so a forged request gets back no
@@ -256,7 +332,7 @@ the big-endian sequence number as nonce, the 16-byte tag last, so its payload is
 at most 1379 bytes. A datagram that doesn't open is dropped.
 
 The nonce's first byte says what the number counts, each with its own numbers: 0
-control, 1 mouse, 2 acknowledgement.
+control, 1 mouse, 2 acknowledgement, 3 PyroWave loss report.
 
 Mouse datagrams are not ordered, nor resent: a client sends one per mouse event
 and the host ignores any older than the newest it has seen. A payload of `u8 0, f64

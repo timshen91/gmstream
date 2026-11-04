@@ -1824,6 +1824,7 @@ enum cmd_type {
 	CMD_STREAM_STOP,
 	CMD_KEYFRAME,
 	CMD_BITRATE,
+	CMD_PARALLELISM,
 	CMD_MOTION,
 	CMD_POSITION,
 	CMD_BUTTON,
@@ -1840,6 +1841,7 @@ struct cmd {
 	enum cmd_type type;
 	union {
 		struct { enum gm_codec codec; int w, h, refresh, kbps, packet, flags; } stream;
+		unsigned parallelism;
 		struct { double x, y; int32_t v120_x, v120_y; } motion;
 		struct { uint32_t code; bool pressed; } key;
 		struct { uint8_t pad; struct gm_gamepad_state state; } pad;
@@ -1961,6 +1963,11 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 			encoder_set_bitrate(server->encoder, c->stream.kbps);
 		}
 		break;
+	case CMD_PARALLELISM:
+		if (server->encoder != NULL) {
+			encoder_set_parallelism(server->encoder, c->parallelism);
+		}
+		break;
 	case CMD_MOTION:
 		client_motion(server, c->motion.x, c->motion.y);
 		break;
@@ -2051,6 +2058,10 @@ void gm_request_keyframe(void) {
 
 void gm_set_bitrate(int bitrate_kbps) {
 	push((struct cmd){ .type = CMD_BITRATE, .stream = { .kbps = bitrate_kbps } });
+}
+
+void gm_set_parallelism(unsigned parts) {
+	push((struct cmd){ .type = CMD_PARALLELISM, .parallelism = parts });
 }
 
 uint32_t gm_supported_codecs(void) {

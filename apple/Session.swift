@@ -96,15 +96,19 @@ final class Session: ConnectionDelegate {
     /// whatever cursor there is, if any, is pixels in the video.
     var cursorSource: String { hostCursor != nil ? "hardware" : "remote" }
 
-    /// Whether the cursor keeps to the game's clip right now.
-    var confined: Bool { options.confinement == .auto && gameClip != nil }
+    /// Whether the cursor keeps to the game's clip right now. Only while the
+    /// mouse is captured: uncaptured the pointer is the system's, and our
+    /// cursor follows where it really is rather than stopping without it.
+    var confined: Bool { options.confinement == .auto && gameClip != nil && lockActive }
     /// Motion instead of positions: the setting, or Auto's answer to the game.
     var sendsMotion: Bool { options.mouseMode == .auto ? gameRelative : options.mouseMode == .relative }
 
-    /// While there is a stream the mouse is ours: the system cursor stays still
-    /// and hidden in the view and the app adds up the motion, so it can't reach
-    /// a screen's edge (no Dock, menu bar, hot corner or other display). That
-    /// is the shell's way (capturesMouse), or relative alone where it can't.
+    /// Whether the mouse is ours: the system cursor stays still and hidden in
+    /// the view and the app adds up the motion, so it can't reach a screen's
+    /// edge (no Dock, menu bar, hot corner or other display) and our own cursor
+    /// is drawn into the frame. The shell says when (capturesMouse: full screen
+    /// on the Mac, never on the iPad), and a relative game always needs it,
+    /// since it reads motion and shows no cursor of its own.
     var wantsCapture: Bool {
         (shell?.capturesMouse == true || sendsMotion) && (conn != nil || options.mock)
     }
@@ -139,6 +143,11 @@ final class Session: ConnectionDelegate {
         }
         pyro?.onDecoded = { [renderer] planes, timing in renderer.submit(.planes(planes), timing) }
         pyro?.onIncomplete = { [stats] in stats.gap() }
+        // Inter frames: what never arrived goes back to the host, which replays
+        // this decoder; with nothing to predict from, it is asked for an intra frame.
+        pyro?.onLoss = { [weak self] id, count, ranges in self?.conn?.pyrowaveLoss(frameId: id, count: count, ranges: ranges) }
+        pyro?.onNeedIntra = { [weak self] in self?.conn?.send(Msg.keyframe) }
+        pyro?.keepGPUAwake = options.keepGPUAwake
         renderer.onPresented = { [stages, chart, phase, panel] t in
             stages.add(t)
             phase.presented(t)
@@ -294,6 +303,7 @@ final class Session: ConnectionDelegate {
                 codecMask: clientCodecs, preferred: options.codec)
         c.keepAwake(options.keepWiFiAwake)
         c.send(Msg.vrrPolicy, Data([pacing.steamVRR]))
+        sendParallelism()
     }
 
     func reconnect() {
@@ -348,8 +358,9 @@ final class Session: ConnectionDelegate {
             }
         }
         stats.addBytes(p.payload.count)
-        pyro.packet(p) {
-            FrameTiming(slotNs: p.slotNs, encodedNs: p.encodedNs, received: nowNs()) { conn.toLocal(hostNs: $0) }
+        pyro.packet(p) { first, overlap in
+            FrameTiming(slotNs: p.slotNs, encodedNs: p.encodedNs, received: nowNs(), firstReceived: first,
+                        overlapNs: overlap) { conn.toLocal(hostNs: $0) }
         }
         sizeFromHost(width: Int(p.width), height: Int(p.height))
     }
@@ -508,10 +519,23 @@ final class Session: ConnectionDelegate {
         case .display: sendConfigure()
         case .stats: updateOverlay()
         case .present: applyPresentMode()
-        case .keepAwake: conn?.keepAwake(options.keepWiFiAwake)
+        case .keepAwake:
+            conn?.keepAwake(options.keepWiFiAwake)
+            pyro?.keepGPUAwake = options.keepGPUAwake
         case .cursor: updateCapture()
+        case .parallelism: sendParallelism()
         case .phaseLock: applyPresentMode() // pacing settings: phase lock, hold, auto
         }
+    }
+
+    /// How many parts to cut each frame into, so the encode and the network
+    /// overlap (DESIGN.md 12.6). The host clamps it to what the hardware and
+    /// the picture allow and reports what it settled on, which is the count in
+    /// the stats line's "host in" row.
+    func sendParallelism() {
+        var m = Writer()
+        m.u16(UInt16(clamping: options.parallelism))
+        conn?.send(Msg.parallelism, m.data)
     }
 
     /// The stream's size or refresh to the host (after the view or the
@@ -561,7 +585,8 @@ final class Session: ConnectionDelegate {
         // primaries, checked by eye with GM_MOCK_COLORS=gamut; iPadOS's
         // screenshots clip to sRGB, so they cannot show it).
         renderer.layer.colorspace = options.vividColors ? shell.displayColorSpace : CGColorSpace(name: CGColorSpace.sRGB)
-        shell.cursorChanged()
+        // Full screen is also what decides whether the mouse is ours.
+        updateCapture()
         shell.pacingChanged()
     }
 
@@ -688,6 +713,6 @@ struct HostCursor {
 }
 
 /// What a settings change touches (the apps' settings UIs).
-enum SettingsChange { case connection, bitrate, display, stats, present, keepAwake, phaseLock, cursor }
+enum SettingsChange { case connection, bitrate, display, stats, present, keepAwake, phaseLock, cursor, parallelism }
 
 func fmt(_ v: Double?) -> String { v.map { String(format: "%.1f", $0) } ?? "-" }

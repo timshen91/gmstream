@@ -12,7 +12,7 @@
 //   u16 size     datagram bytes
 //   u32 id       audio sequence; video/PyroWave frame id; control sequence
 //   u16 index    fragment/packet index
-//   u16 count    fragment/packet count
+//   u16 count    fragment/packet count (PyroWave inter frames: the stripe)
 //   u64 host     audio pts / PyroWave encoded (host ns); presented: gamescope
 //                present (local ns, 0 if unknown); clock: this ping's host −
 //                local offset (host's answer − our round trip's midpoint)

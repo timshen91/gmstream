@@ -24,10 +24,13 @@ final class SettingsWindow: NSObject {
     private let immediate = NSButton(checkboxWithTitle: "Vsync off in full screen (may tear)", target: nil, action: nil)
     private let vivid = NSButton(checkboxWithTitle: "Vivid colors (display's full gamut, as on Windows)", target: nil, action: nil)
     private let awake = NSButton(checkboxWithTitle: "Keep Wi-Fi awake (60 tiny packets/s to the host)", target: nil, action: nil)
-    private let streamFrames = NSButton(checkboxWithTitle: "Take AV1 frames as the host encodes them", target: nil, action: nil)
+    private let gpuAwake = NSButton(checkboxWithTitle: "Keep the GPU awake for PyroWave (its clock up: decodes ~3x faster)", target: nil, action: nil)
+    private let streamFrames = NSButton(checkboxWithTitle: "Take AV1 and HEVC frames as the host encodes them", target: nil, action: nil)
+    private let pyrowaveInter = NSButton(checkboxWithTitle: "PyroWave inter frames (predicted from the last)", target: nil, action: nil)
     private let cursorMode = NSPopUpButton()
     private let mouseMode = NSPopUpButton()
     private let confinement = NSPopUpButton()
+    private let parallelism = NSPopUpButton()
     private let pacing = NSButton(checkboxWithTitle: "Pace the host to this display's refreshes (phase lock)", target: nil, action: nil)
     private let hold = NSButton(checkboxWithTitle: "Even out network jitter (fixed delay after the host)", target: nil, action: nil)
     private let pacingMode = NSPopUpButton()
@@ -36,6 +39,10 @@ final class SettingsWindow: NSObject {
     private let forgetHost = NSButton(title: "Forget host's key", target: nil, action: nil)
     private let pacingNote = NSTextField(wrappingLabelWithString: "")
     private static let refreshRates = [30, 60, 90, 120, 144, 165, 240]
+    // AV1 tiles or HEVC slice segments per frame. The hardware's own limits are
+    // lower than the top of this list (2x16 tiles, 128 segments), and the host
+    // clamps to them: the stats line says what it settled on.
+    private static let parallelismCounts = [1, 2, 4, 8, 16, 32, 64, 128]
     private static let codecs: [(name: String, id: UInt8)] =
         [("H.264", 0), ("HEVC", 1)] + (Decoder.hasAV1 ? [("AV1", 2)] : []) + [("PyroWave", 3)]
 
@@ -54,6 +61,8 @@ final class SettingsWindow: NSObject {
         cursorMode.addItems(withTitles: CursorMode.allCases.map(\.title))
         mouseMode.addItems(withTitles: MouseMode.allCases.map(\.title))
         confinement.addItems(withTitles: Confinement.allCases.map(\.title))
+        parallelism.addItem(withTitle: "Auto (as the codec likes it)")
+        parallelism.addItems(withTitles: Self.parallelismCounts.map { "\($0) part\($0 == 1 ? "" : "s") per frame" })
         pacingMode.addItems(withTitles: PacingMode.allCases.map(\.title))
         vrrMode.addItems(withTitles: VRRMode.allCases.map(\.title))
         pacingNote.textColor = .secondaryLabelColor
@@ -66,7 +75,7 @@ final class SettingsWindow: NSObject {
             field.target = self
             field.action = #selector(changed(_:))
         }
-        for control in [codec, refresh, stats, immediate, pacingMode, vrrMode, pacing, hold, vivid, awake, streamFrames, cursorMode, mouseMode, confinement] as [NSControl] {
+        for control in [codec, refresh, stats, immediate, pacingMode, vrrMode, pacing, hold, vivid, awake, gpuAwake, streamFrames, pyrowaveInter, cursorMode, mouseMode, confinement, parallelism] as [NSControl] {
             control.target = self
             control.action = #selector(changed(_:))
         }
@@ -99,10 +108,13 @@ final class SettingsWindow: NSObject {
             row("VRR:", vrrMode, nil),
             [NSGridCell.emptyContentView, vivid],
             [NSGridCell.emptyContentView, awake],
+            [NSGridCell.emptyContentView, gpuAwake],
             [NSGridCell.emptyContentView, streamFrames],
+            [NSGridCell.emptyContentView, pyrowaveInter],
             row("Cursor:", cursorMode, nil),
             row("Mouse:", mouseMode, nil),
             row("Confinement:", confinement, nil),
+            row("Pipelining parallelism:", parallelism, nil),
             [NSTextField(labelWithString: "This device:"), copyKey],
             [NSGridCell.emptyContentView, forgetHost],
         ])
@@ -145,10 +157,14 @@ final class SettingsWindow: NSObject {
         stats.state = options.showStats ? .on : .off
         vivid.state = options.vividColors ? .on : .off
         awake.state = options.keepWiFiAwake ? .on : .off
+        gpuAwake.state = options.keepGPUAwake ? .on : .off
         streamFrames.state = options.streamFrames ? .on : .off
+        pyrowaveInter.state = options.pyrowaveInter ? .on : .off
+        codecChosen(options.codec)
         cursorMode.selectItem(at: options.cursorMode.rawValue)
         mouseMode.selectItem(at: options.mouseMode.rawValue)
         confinement.selectItem(at: options.confinement.rawValue)
+        parallelism.selectItem(at: Self.parallelismCounts.firstIndex(of: options.parallelism).map { $0 + 1 } ?? 0)
         let now = pacingNow()
         pacingMode.selectItem(at: options.pacingMode.rawValue)
         pacing.state = now.phaseLock ? .on : .off
@@ -169,6 +185,13 @@ final class SettingsWindow: NSObject {
         onChange(.connection)
     }
 
+    /// The codec-specific settings, usable only with their codecs.
+    private func codecChosen(_ c: UInt8) {
+        streamFrames.isEnabled = Options.takesFramesInPieces(c)
+        pyrowaveInter.isEnabled = Options.takesInterFrames(c)
+        gpuAwake.isEnabled = c == 3 // PyroWave, the only codec decoded on the GPU
+    }
+
     @objc private func changed(_ sender: NSControl) {
         let change: Change
         switch sender {
@@ -180,6 +203,7 @@ final class SettingsWindow: NSObject {
             options.host = h
             options.port = p
             options.codec = c
+            codecChosen(c)
             change = .connection
         case bitrate:
             guard let m = UInt32(bitrate.stringValue), (1...500).contains(m) else { return load() }
@@ -217,9 +241,15 @@ final class SettingsWindow: NSObject {
         case awake:
             options.keepWiFiAwake = awake.state == .on
             change = .keepAwake
+        case gpuAwake:
+            options.keepGPUAwake = gpuAwake.state == .on
+            change = .keepAwake
         case streamFrames:
             // The host is told in Hello, so the stream starts over.
             options.streamFrames = streamFrames.state == .on
+            change = .connection
+        case pyrowaveInter:
+            options.pyrowaveInter = pyrowaveInter.state == .on
             change = .connection
         case cursorMode:
             options.cursorMode = CursorMode(rawValue: cursorMode.indexOfSelectedItem) ?? .auto
@@ -230,6 +260,10 @@ final class SettingsWindow: NSObject {
         case confinement:
             options.confinement = Confinement(rawValue: confinement.indexOfSelectedItem) ?? .auto
             change = .cursor
+        case parallelism:
+            let i = parallelism.indexOfSelectedItem
+            options.parallelism = i > 0 ? Self.parallelismCounts[i - 1] : 0
+            change = .parallelism
         default:
             options.showStats = stats.state == .on
             change = .stats

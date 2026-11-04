@@ -1,6 +1,14 @@
-// AV1 encoding on the GPU's Vulkan video encode queue, straight from
+// AV1 and HEVC encoding on the GPU's Vulkan video encode queue, straight from
 // gamescope's dma-buf, with each piece of the bitstream sent while the GPU is
 // still writing it (DESIGN.md §12).
+//
+// Both codecs run the same machinery: the dma-buf import, the encoder's own
+// RGB conversion, the bitstream buffer in our pages, gamescope's fence as a
+// device semaphore, the two-slot DPB and the whole piece-streaming path are
+// codec-agnostic, because watching the GPU fill a buffer is a byte-level
+// business. What differs is the header the session is opened with, the
+// per-picture syntax, and how a frame is cut into pieces the encoder finishes
+// one at a time: AV1 tiles (tiles_for) or HEVC slice segments (slices_for).
 //
 // What this does that the VA-API path (encode.c) cannot:
 // - No copy and no conversion pass. The encoder takes gamescope's BGRA image
@@ -29,6 +37,21 @@
 //   hangs it too.
 // - Tile spacing has to be spelled out (no uniform_tile_spacing), and the
 //   number of tiles is ours to pick per frame: see tiles_for().
+//
+// And for HEVC (tools/vkenc again, on this driver):
+// - There are no tiles at all (maxTiles is 1x1). A frame is cut into slice
+//   segments instead, up to 128 of them, and one may start part way along a
+//   row, so they divide evenly. The hardware writes each segment's own header
+//   from a template, so we hand it only the boundaries.
+// - Every segment is independent: the driver does not let us set
+//   dependent_slice_segment_flag, which would have kept the entropy context
+//   across a cut and cost almost nothing. So a segment costs what a tile
+//   costs, plus a header of its own. slices_for() picks how many.
+// - The quantizer is a qp in 0..51, not a q index in 0..255, so the
+//   controller's step is a sixth of AV1's (about six qp to a doubling).
+// - The coded size is the driver's business: the sequence header gets the real
+//   picture size and the driver aligns it up and crops with the conformance
+//   window, so no padding is coded. The AV1 path codes its padding.
 #include <errno.h>
 #include <dlfcn.h>
 #include <math.h>
@@ -139,6 +162,7 @@ struct vkprofile {
 	VkVideoEncodeProfileRgbConversionInfoVALVE rgb;
 	VkVideoEncodeUsageInfoKHR usage;
 	VkVideoEncodeAV1ProfileInfoKHR av1;
+	VkVideoEncodeH265ProfileInfoKHR h265;
 	VkVideoProfileInfoKHR profile;
 	VkVideoProfileListInfoKHR list;
 };
@@ -188,12 +212,20 @@ struct gm_vkencode {
 	uint32_t host_ptr_align;
 
 	VkVideoEncodeAV1CapabilitiesKHR av1_caps;
+	VkVideoEncodeH265CapabilitiesKHR h265_caps;
 	VkVideoEncodeCapabilitiesKHR enc_caps;
 	VkVideoCapabilitiesKHR caps;
 	struct vkprofile prof; // the profile the session and its images were made with
 	VkFormat picture_format; // what gamescope gives us, and what the encoder takes
 	uint32_t src_format_drm; // the same, as gamescope's own fourcc
 	uint8_t told_cols, told_rows; // the tile layout the client has been told
+	uint16_t told_slices; // the slice segment count the client has been told
+
+	// Which codec this encoder could do at all. `hevc` is what the open
+	// session is, and belongs to the worker thread; `want_hevc` is what the
+	// stream asked for, and is read under the lock like the bitrate.
+	bool hevc;
+	unsigned codecs; // 1 << GM_CODEC_*
 
 	pthread_t thread;
 	pthread_mutex_t lock;
@@ -202,6 +234,11 @@ struct gm_vkencode {
 	bool quit, active, keyframe_wanted;
 	struct job pending;
 	int bitrate_kbps, refresh_mhz, packet_bytes;
+	bool want_hevc;
+	// How many parts to cut each frame into (AV1 tiles, HEVC slice segments):
+	// 0 asks for the codec's own default. The client sets it, so it can change
+	// while a stream runs, like the bitrate.
+	unsigned want_parallelism;
 	bool chunked;
 	bool client_hdr; // the client can show HDR10
 	unsigned stats_encoded, stats_dropped, stats_chunks, stats_patched;
@@ -219,8 +256,13 @@ struct gm_vkencode {
 	unsigned session_binds;
 	int coded_width, coded_height; // what the encoder is set up for
 	int want_width, want_height; // what gamescope gives us
+	// The headers that go in front of every keyframe, which the encode
+	// operation does not emit: AV1's sequence header OBU, or HEVC's VPS, SPS
+	// and PPS as Annex B NAL units.
 	uint8_t *seq_obu;
 	size_t seq_size;
+	uint32_t ctb_cols, ctb_rows; // HEVC: the frame in coding tree blocks
+	int32_t poc; // HEVC: picture order count, 0 at the last keyframe
 
 	VkImage dpb;
 	VkImageView dpb_view;
@@ -249,6 +291,12 @@ struct gm_vkencode {
 	bool hw_rate;
 	unsigned rate_gen, rate_applied;
 	unsigned q_applied; // the q index the encoder was last programmed with
+	// The quantizer scales differ by codec: about 58 AV1 q indices to a
+	// doubling of bytes, about 6 HEVC qp. next_q() moves a third of the error
+	// per frame and will not jump more than two thirds of a doubling.
+	unsigned q_per_doubling;
+	unsigned parallelism; // want_parallelism, as the worker last read it
+	bool sao; // HEVC: GM_HEVC_SAO, off until it is measured
 
 	bool debug;
 	FILE *dump; // GM_AV1_DUMP: 120 frames of bitstream, to look at
@@ -264,7 +312,7 @@ struct gm_vkencode {
 // ten-bit format, and the encoder takes that as it is: an eight-bit AV1
 // profile would only accept eight-bit input, which would mean converting.
 
-static void profile_init(struct vkprofile *p, bool ten_bit) {
+static void profile_init(struct vkprofile *p, bool ten_bit, bool hevc) {
 	VkVideoComponentBitDepthFlagsKHR depth = ten_bit
 		? VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR
 		: VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
@@ -279,9 +327,19 @@ static void profile_init(struct vkprofile *p, bool ten_bit) {
 	p->av1 = (VkVideoEncodeAV1ProfileInfoKHR){
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
 		.pNext = &p->usage, .stdProfile = STD_VIDEO_AV1_PROFILE_MAIN };
+	// Main 10 for a ten-bit stream: the eight-bit profile would only take an
+	// eight-bit picture, which would mean converting gamescope's composite.
+	p->h265 = (VkVideoEncodeH265ProfileInfoKHR){
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR,
+		.pNext = &p->usage, .stdProfileIdc = ten_bit
+			? STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+			: STD_VIDEO_H265_PROFILE_IDC_MAIN };
 	p->profile = (VkVideoProfileInfoKHR){
-		.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR, .pNext = &p->av1,
-		.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
+		.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR,
+		.pNext = hevc ? (void *)&p->h265 : (void *)&p->av1,
+		.videoCodecOperation = hevc
+			? VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR
+			: VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
 		.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR,
 		.lumaBitDepth = depth, .chromaBitDepth = depth };
 	p->list = (VkVideoProfileListInfoKHR){
@@ -310,6 +368,10 @@ static bool ten_bit(VkFormat f) {
 
 static uint32_t align_up(uint32_t v, uint32_t a) {
 	return a > 1 ? (v + a - 1) / a * a : v;
+}
+
+static enum gm_codec codec_of(struct gm_vkencode *vk) {
+	return vk->hevc ? GM_CODEC_HEVC : GM_CODEC_AV1;
 }
 
 static uint32_t memory_type(struct gm_vkencode *vk, uint32_t mask,
@@ -410,7 +472,7 @@ static void emit(struct gm_vkencode *vk, struct stream *s, const uint8_t *data,
 			.height = s->height,
 			.keyframe = final && keyframe,
 			.last = final,
-			.codec = GM_CODEC_AV1,
+			.codec = codec_of(vk),
 		};
 		if (s->first_ns == 0) {
 			s->first_ns = gm_now_ns();
@@ -497,9 +559,12 @@ static void tiles_for(struct gm_vkencode *vk, struct tiles *t, int w, int h,
 	// so several small tiles share a datagram. What they do cost is bits --
 	// each one resets the entropy context and cannot predict across its edge.
 	// GM_AV1_TILE_BYTES goes back to sizing them by the frame's budget, which
-	// is how that cost was measured.
+	// is how that cost was measured. The client's pipelining parallelism asks
+	// for a count outright and wins over both.
 	uint32_t want = max_rows * max_cols;
-	if (vk->tile_bytes > 0) {
+	if (vk->parallelism > 0) {
+		want = vk->parallelism;
+	} else if (vk->tile_bytes > 0) {
 		want = expect_bytes / vk->tile_bytes;
 	}
 	if (want < 1) {
@@ -532,6 +597,97 @@ static void tiles_for(struct gm_vkencode *vk, struct tiles *t, int w, int h,
 		.tile_size_bytes_minus_1 = 3,
 		.pMiColStarts = t->col_starts, .pMiRowStarts = t->row_starts,
 		.pWidthInSbsMinus1 = t->col_sizes, .pHeightInSbsMinus1 = t->row_sizes };
+}
+
+/* ---- slice segments ----------------------------------------------------- */
+
+#define MAX_SEGMENTS 128
+struct segments {
+	uint32_t count;
+	StdVideoEncodeH265SliceSegmentHeader hdr[MAX_SEGMENTS];
+	VkVideoEncodeH265NaluSliceSegmentInfoKHR entry[MAX_SEGMENTS];
+};
+
+// How many slice segments a frame is cut into, and where each one starts.
+// They buy what AV1 tiles buy: the encoder finishes one segment's bytes
+// before it starts the next, so the write frontier moves in small steps and
+// most of a frame is on the wire before the encode ends. Pieces are cut by
+// size and not at segment edges, so several small segments share a datagram
+// and nothing is padded.
+//
+// They cost what tiles cost -- each resets the entropy context and cannot
+// predict across its edge -- and, unlike a tile, each carries a slice segment
+// header of its own, a few bytes that at 128 segments add up to a few hundred
+// a frame. GM_HEVC_SLICE_BYTES sizes them by the frame's budget instead of
+// taking the most the hardware allows, which is how that cost is measured.
+//
+// Addresses are in coding tree blocks, in raster order: a segment is a run of
+// the raster, not a rectangle, and may start part way along a row.
+static void slices_for(struct gm_vkencode *vk, struct segments *s,
+		bool keyframe, unsigned q, unsigned expect_bytes) {
+	uint32_t ctbs = vk->ctb_cols * vk->ctb_rows;
+	uint32_t max = vk->h265_caps.maxSliceSegmentCount;
+	if (max > MAX_SEGMENTS) {
+		max = MAX_SEGMENTS;
+	}
+	if (max > ctbs) {
+		max = ctbs;
+	}
+	if (max < 1) {
+		max = 1;
+	}
+	// One segment, because that is what measured best: cutting the frame up
+	// costs and does not buy anything. At a fixed q on vkmark's desktop scene
+	// at 2940x1846, 1 segment gave 7.9 Mb/s, 31 gave 9.2 and 128 gave 10.0,
+	// while the first piece left 3.33, 3.36 and 3.60 ms before the encode
+	// finished. So 27% of the bitrate for no overlap at all.
+	//
+	// The reason is that the hardware's bitstream writer flushes as it goes
+	// whatever the slice structure is, so the frontier moves just as smoothly
+	// through one segment as through a hundred, and every extra segment is an
+	// entropy context reset and a slice header for nothing. Cutting the
+	// picture's dependences is not how this frame gets streamed; watching the
+	// buffer fill is.
+	//
+	// The client's pipelining parallelism asks for a count outright, so that
+	// cost can be seen from the app rather than taken on trust.
+	uint32_t want = 1;
+	if (vk->parallelism > 0) {
+		want = vk->parallelism;
+	} else if (vk->tile_bytes > 0) {
+		want = expect_bytes / vk->tile_bytes;
+	}
+	if (want < 1) {
+		want = 1;
+	}
+	if (want > max) {
+		want = max;
+	}
+	s->count = want;
+	for (uint32_t i = 0; i < want; i++) {
+		s->hdr[i] = (StdVideoEncodeH265SliceSegmentHeader){
+			.flags = { .first_slice_segment_in_pic_flag = i == 0 ? 1u : 0u,
+				// Dependent segments would keep the entropy context across
+				// the cut and cost almost nothing, but this driver does not
+				// report that we may ask for them.
+				.dependent_slice_segment_flag = 0,
+				// Deblocking still crosses the seams, which only changes the
+				// reconstruction both sides compute, never bytes already
+				// written.
+				.slice_loop_filter_across_slices_enabled_flag = 1,
+				.slice_sao_luma_flag = vk->sao ? 1u : 0u,
+				.slice_sao_chroma_flag = vk->sao ? 1u : 0u },
+			.slice_type = keyframe ? STD_VIDEO_H265_SLICE_TYPE_I
+				: STD_VIDEO_H265_SLICE_TYPE_P,
+			.slice_segment_address = ctbs * i / want,
+			.MaxNumMergeCand = 5 };
+		s->entry[i] = (VkVideoEncodeH265NaluSliceSegmentInfoKHR){
+			.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_NALU_SLICE_SEGMENT_INFO_KHR,
+			// One qp for the whole frame: this driver reports neither a
+			// per-segment constant qp nor a slice qp delta we may set.
+			.constantQp = (int32_t)q,
+			.pStdSliceSegmentHeader = &s->hdr[i] };
+	}
 }
 
 /* ---- compositor thread -------------------------------------------------- */
@@ -906,37 +1062,163 @@ static StdVideoAV1ColorConfig color_config_for(bool ten, bool hdr) {
 		.chroma_sample_position = STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN };
 }
 
+// How a frame was cut up, for the stats line and the debug trace. The count
+// comes first, because that is the number worth reading: what the client asked
+// for, after the hardware and the picture clamped it.
+static void parts_text(char *out, size_t n, bool hevc, uint32_t segments,
+		uint32_t cols, uint32_t rows) {
+	if (hevc) {
+		snprintf(out, n, "%u slice segment%s", segments,
+			segments == 1 ? "" : "s");
+		return;
+	}
+	uint32_t tiles = cols * rows;
+	snprintf(out, n, "%u tile%s (%ux%u)", tiles, tiles == 1 ? "" : "s",
+		cols, rows);
+}
+
 // What the encoder takes in and puts out, in words, for the client's stats
-// line. The tile layout goes with it: it follows the frame's budget, so it is
-// worth seeing next to the bitrate.
-static void report_format(struct gm_vkencode *vk, unsigned cols, unsigned rows) {
+// line. How the frame is cut up goes with it (`parts`, "2x16 tiles" or "128
+// slices"): it follows the frame's budget, so it is worth seeing next to the
+// bitrate.
+static void report_format(struct gm_vkencode *vk, const char *parts) {
 	if (vk->cb->encode_format == NULL) {
 		return;
 	}
 	bool ten = ten_bit(vk->picture_format);
-	char text[160];
-	snprintf(text, sizeof(text), "%.4s %u-bit %s, no copy → AV1 %u-bit %s, %ux%u tiles",
+	char text[192];
+	snprintf(text, sizeof(text), "%.4s %u-bit %s, no copy → %s %u-bit %s, %s",
 		(const char *)&vk->src_format_drm, ten ? 10 : 8,
-		hdr_session(vk) ? "BT.2020" : "BT.709", ten ? 10 : 8,
-		hdr_session(vk) ? "PQ" : "BT.709", cols, rows);
+		hdr_session(vk) ? "BT.2020" : "BT.709",
+		vk->hevc ? "HEVC" : "AV1", ten ? 10 : 8,
+		hdr_session(vk) ? "PQ" : "BT.709", parts);
 	vk->cb->encode_format(vk->cb->ctx, text);
+}
+
+// HEVC's session parameters: a video parameter set, a sequence parameter set
+// and a picture parameter set, which the driver turns into the three NAL units
+// that go in front of every keyframe. They point at each other, so they live
+// together in one object the caller keeps on its stack until the session
+// parameters have been created.
+//
+// Claim no coding tool the encoder does not apply. The AV1 path learned that
+// the hard way: a sequence header claiming the intra edge filter, which this
+// encoder never applies to its own reconstruction, drifted the picture into
+// colour casts and confetti over a minute. So what is claimed here is what
+// this driver both reports as ours to set and demonstrably programs into the
+// hardware. The in-loop filters start off: SAO behind GM_HEVC_SAO, and strong
+// intra smoothing -- HEVC's own version of the tool that bit us -- left off
+// until it has been measured. Temporal MVP stays off because the driver does
+// not report it as ours to set at all.
+struct h265_headers {
+	StdVideoH265ProfileTierLevel ptl;
+	StdVideoH265DecPicBufMgr dpbm;
+	StdVideoH265SequenceParameterSetVui vui;
+	StdVideoH265VideoParameterSet vps;
+	StdVideoH265SequenceParameterSet sps;
+	StdVideoH265PictureParameterSet pps;
+	VkVideoEncodeH265SessionParametersAddInfoKHR add;
+	VkVideoEncodeH265SessionParametersCreateInfoKHR create;
+};
+
+static void h265_headers_init(struct gm_vkencode *vk, struct h265_headers *hh,
+		uint32_t w, uint32_t h, bool ten) {
+	bool hdr = hdr_session(vk);
+	*hh = (struct h265_headers){ 0 };
+	hh->ptl = (StdVideoH265ProfileTierLevel){
+		.flags = { .general_progressive_source_flag = 1,
+			.general_frame_only_constraint_flag = 1 },
+		.general_profile_idc = ten ? STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+			: STD_VIDEO_H265_PROFILE_IDC_MAIN,
+		// What the hardware says, when it says anything: this driver reports
+		// level 1.0 for an encoder that takes 8192x4352, i.e. it does not
+		// fill the field in, so claim the top level rather than a false one.
+		.general_level_idc = vk->h265_caps.maxLevelIdc > 0
+			? vk->h265_caps.maxLevelIdc : STD_VIDEO_H265_LEVEL_IDC_6_2 };
+	hh->dpbm = (StdVideoH265DecPicBufMgr){
+		.max_dec_pic_buffering_minus1 = { 1 }, // two slots, taking turns
+		.max_num_reorder_pics = { 0 },         // nothing is ever reordered
+		.max_latency_increase_plus1 = { 0 } };
+	hh->vps = (StdVideoH265VideoParameterSet){
+		.flags = { .vps_temporal_id_nesting_flag = 1 },
+		.pDecPicBufMgr = &hh->dpbm, .pProfileTierLevel = &hh->ptl };
+	// Where a HEVC stream says it is HDR10. The client reads this back off
+	// the format description VideoToolbox builds from these headers, rather
+	// than parsing the sequence header itself.
+	hh->vui = (StdVideoH265SequenceParameterSetVui){
+		.flags = { .video_signal_type_present_flag = 1,
+			.video_full_range_flag = full_range() ? 1u : 0u,
+			.colour_description_present_flag = 1 },
+		.video_format = 5, // unspecified
+		.colour_primaries = hdr ? 9 : 1,          // BT.2020 : BT.709
+		.transfer_characteristics = hdr ? 16 : 1, // ST 2084 (PQ) : BT.709
+		.matrix_coeffs = hdr ? 9 : 1 };           // BT.2020 NCL : BT.709
+	hh->sps = (StdVideoH265SequenceParameterSet){
+		.flags = { .sps_temporal_id_nesting_flag = 1,
+			.amp_enabled_flag = 1,
+			.sample_adaptive_offset_enabled_flag = vk->sao ? 1u : 0u,
+			.conformance_window_flag = w != (uint32_t)vk->want_width ||
+				h != (uint32_t)vk->want_height,
+			.vui_parameters_present_flag = 1 },
+		.chroma_format_idc = STD_VIDEO_H265_CHROMA_FORMAT_IDC_420,
+		.pic_width_in_luma_samples = w,
+		.pic_height_in_luma_samples = h,
+		.bit_depth_luma_minus8 = ten ? 2 : 0,
+		.bit_depth_chroma_minus8 = ten ? 2 : 0,
+		// Eight bits of picture order count, which is plenty for a stream
+		// that never reorders and counts one per frame. Wider would cost
+		// those bits in every slice segment header, and there are up to 128.
+		.log2_max_pic_order_cnt_lsb_minus4 = 4,
+		.max_transform_hierarchy_depth_inter = 3,
+		.max_transform_hierarchy_depth_intra = 3,
+		// Crop the coded picture back to what gamescope gave us. The offsets
+		// count chroma samples, so two luma pixels each. The driver would do
+		// this itself from an unaligned size, but then the coded size would
+		// be its business rather than ours, and a slice segment's address is
+		// counted in blocks of the coded picture.
+		.conf_win_right_offset = (w - (uint32_t)vk->want_width) / 2,
+		.conf_win_bottom_offset = (h - (uint32_t)vk->want_height) / 2,
+		.pProfileTierLevel = &hh->ptl, .pDecPicBufMgr = &hh->dpbm,
+		.pSequenceParameterSetVui = &hh->vui };
+	hh->pps = (StdVideoH265PictureParameterSet){
+		// Deblocking crosses the slice seams, which changes only the
+		// reconstruction both sides compute, never bytes already written.
+		// dependent_slice_segments_enabled_flag is left alone: the driver
+		// sets it itself, and this one does not report it as ours to set.
+		.flags = { .cu_qp_delta_enabled_flag = 1,
+			.pps_loop_filter_across_slices_enabled_flag = 1 },
+		.diff_cu_qp_delta_depth = 0, .init_qp_minus26 = 0,
+		.num_ref_idx_l0_default_active_minus1 = 0,
+		.num_ref_idx_l1_default_active_minus1 = 0 };
+	hh->add = (VkVideoEncodeH265SessionParametersAddInfoKHR){
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR,
+		.stdVPSCount = 1, .pStdVPSs = &hh->vps,
+		.stdSPSCount = 1, .pStdSPSs = &hh->sps,
+		.stdPPSCount = 1, .pStdPPSs = &hh->pps };
+	hh->create = (VkVideoEncodeH265SessionParametersCreateInfoKHR){
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR,
+		.maxStdVPSCount = 1, .maxStdSPSCount = 1, .maxStdPPSCount = 1,
+		.pParametersAddInfo = &hh->add };
 }
 
 static bool session_open(struct gm_vkencode *vk, int width, int height,
 		VkFormat format) {
 	session_free(vk);
 	bool ten = ten_bit(format);
-	profile_init(&vk->prof, ten);
+	profile_init(&vk->prof, ten, vk->hevc);
 	vk->av1_caps = (VkVideoEncodeAV1CapabilitiesKHR){
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR };
+	vk->h265_caps = (VkVideoEncodeH265CapabilitiesKHR){
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR };
 	vk->enc_caps = (VkVideoEncodeCapabilitiesKHR){
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR,
-		.pNext = &vk->av1_caps };
+		.pNext = vk->hevc ? (void *)&vk->h265_caps : (void *)&vk->av1_caps };
 	vk->caps = (VkVideoCapabilitiesKHR){
 		.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, .pNext = &vk->enc_caps };
 	if (vk->vk.GetPhysicalDeviceVideoCapabilitiesKHR(vk->phys, &vk->prof.profile,
 			&vk->caps) != VK_SUCCESS) {
-		wlr_log(WLR_ERROR, "No %u-bit AV1 encoding from an RGB image", ten ? 10 : 8);
+		wlr_log(WLR_ERROR, "No %u-bit %s encoding from an RGB image", ten ? 10 : 8,
+			vk->hevc ? "HEVC" : "AV1");
 		return false;
 	}
 	// The reconstructed pictures are YCbCr at the same depth.
@@ -944,10 +1226,18 @@ static bool session_open(struct gm_vkencode *vk, int width, int height,
 		? VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
 		: VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
 	vk->picture_format = format;
-	uint32_t w = align_up((uint32_t)width, vk->av1_caps.codedPictureAlignment.width);
-	uint32_t h = align_up((uint32_t)height, vk->av1_caps.codedPictureAlignment.height);
+	// AV1 reports its own picture alignment; HEVC has only the general access
+	// granularity, and the driver aligns the sequence header's size itself.
+	VkExtent2D grain = vk->hevc ? vk->caps.pictureAccessGranularity
+		: vk->av1_caps.codedPictureAlignment;
+	uint32_t w = align_up((uint32_t)width, grain.width);
+	uint32_t h = align_up((uint32_t)height, grain.height);
 	vk->want_width = width;
 	vk->want_height = height;
+	// Coding tree blocks are 64x64 on this hardware (ctbSizes says so), and a
+	// slice segment's address is counted in them.
+	vk->ctb_cols = align_up(w, 64) / 64;
+	vk->ctb_rows = align_up(h, 64) / 64;
 
 	VkVideoEncodeSessionRgbConversionCreateInfoVALVE rgb = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_RGB_CONVERSION_CREATE_INFO_VALVE,
@@ -1032,9 +1322,16 @@ static bool session_open(struct gm_vkencode *vk, int width, int height,
 	VkVideoEncodeAV1SessionParametersCreateInfoKHR av1_params = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR,
 		.pStdSequenceHeader = &seq };
+	// Both of these have to outlive the create call below, so they stay in
+	// this frame; only one of them is pointed at.
+	struct h265_headers hh;
+	if (vk->hevc) {
+		h265_headers_init(vk, &hh, w, h, ten);
+	}
 	VkVideoEncodeQualityLevelInfoKHR quality = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_QUALITY_LEVEL_INFO_KHR,
-		.pNext = &av1_params, .qualityLevel = 0 };
+		.pNext = vk->hevc ? (void *)&hh.create : (void *)&av1_params,
+		.qualityLevel = 0 };
 	VkVideoSessionParametersCreateInfoKHR pci = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
 		.pNext = &quality, .videoSession = vk->session };
@@ -1044,10 +1341,16 @@ static bool session_open(struct gm_vkencode *vk, int width, int height,
 		return false;
 	}
 
-	// The sequence header OBU: the encode operation does not emit it, so it is
-	// ours to put in front of every keyframe.
+	// The headers: the encode operation does not emit them, so they are ours
+	// to put in front of every keyframe. AV1 gives back its sequence header
+	// OBU; HEVC gives back the VPS, SPS and PPS as Annex B NAL units, which
+	// is exactly the form the client's decoder wants them in.
+	VkVideoEncodeH265SessionParametersGetInfoKHR h265_get = {
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_GET_INFO_KHR,
+		.writeStdVPS = VK_TRUE, .writeStdSPS = VK_TRUE, .writeStdPPS = VK_TRUE };
 	VkVideoEncodeSessionParametersGetInfoKHR gi = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_PARAMETERS_GET_INFO_KHR,
+		.pNext = vk->hevc ? (void *)&h265_get : NULL,
 		.videoSessionParameters = vk->params };
 	VkVideoEncodeSessionParametersFeedbackInfoKHR fb = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_PARAMETERS_FEEDBACK_INFO_KHR };
@@ -1123,19 +1426,25 @@ static bool session_open(struct gm_vkencode *vk, int width, int height,
 	vk->coded_height = (int)h;
 	vk->largest = 0;
 	lay_pattern(vk);
-	wlr_log(WLR_INFO, "Encoding %u-bit %s AV1 %dx%d (coded %ux%u) on the Vulkan "
+	wlr_log(WLR_INFO, "Encoding %u-bit %s %s %dx%d (coded %ux%u) on the Vulkan "
 		"video encode queue, straight from gamescope's buffer", ten ? 10 : 8,
-		hdr_session(vk) ? "HDR10 (PQ, BT.2020)" : "SDR (BT.709)", width, height, w, h);
-	vk->told_cols = vk->told_rows = 0; // the next inter frame tells the client
+		hdr_session(vk) ? "HDR10 (PQ, BT.2020)" : "SDR (BT.709)",
+		vk->hevc ? "HEVC" : "AV1", width, height, w, h);
+	// The next inter frame tells the client how the frame is cut up.
+	vk->told_cols = vk->told_rows = 0;
+	vk->told_slices = 0;
+	vk->poc = 0;
 	return true;
 }
 
 /* ---- worker thread: one frame ------------------------------------------- */
 
-// The q index for the next frame of this kind, from how big the last one came
-// out. Measured on this encoder: about 58 q indices doubles or halves the
-// bytes, so a whole doubling of error is worth about that much; a third of it
-// per frame converges in two or three frames without hunting.
+// The quantizer for the next frame of this kind, from how big the last one
+// came out. Measured on this encoder: about 58 AV1 q indices doubles or halves
+// the bytes, and HEVC's qp scale is the usual six to a doubling. So a whole
+// doubling of error is worth that much; a third of it per frame converges in
+// two or three frames without hunting, and no frame moves more than two
+// thirds of a doubling.
 static unsigned next_q(struct gm_vkencode *vk, unsigned q, unsigned bytes,
 		unsigned target) {
 	if (bytes == 0 || target == 0) {
@@ -1143,16 +1452,24 @@ static unsigned next_q(struct gm_vkencode *vk, unsigned q, unsigned bytes,
 	}
 	double ratio = (double)bytes / (double)target;
 	double doublings = log2(ratio);
-	int step = (int)(20.0 * doublings);
-	if (step > 40) {
-		step = 40;
+	double scale = (double)vk->q_per_doubling;
+	int step = (int)(scale / 3.0 * doublings);
+	int cap = (int)(scale * 2.0 / 3.0);
+	if (step > cap) {
+		step = cap;
 	}
-	if (step < -40) {
-		step = -40;
+	if (step < -cap) {
+		step = -cap;
 	}
 	int next = (int)q + step;
-	unsigned lo = vk->av1_caps.minQIndex > 1 ? vk->av1_caps.minQIndex : 1;
-	unsigned hi = vk->av1_caps.maxQIndex > 0 ? vk->av1_caps.maxQIndex : 255;
+	unsigned lo, hi;
+	if (vk->hevc) {
+		lo = vk->h265_caps.minQp > 1 ? (unsigned)vk->h265_caps.minQp : 1;
+		hi = vk->h265_caps.maxQp > 0 ? (unsigned)vk->h265_caps.maxQp : 51;
+	} else {
+		lo = vk->av1_caps.minQIndex > 1 ? vk->av1_caps.minQIndex : 1;
+		hi = vk->av1_caps.maxQIndex > 0 ? vk->av1_caps.maxQIndex : 255;
+	}
 	if (next < (int)lo) {
 		next = (int)lo;
 	}
@@ -1192,28 +1509,55 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 	// the last one did. Tiles make a frame bigger, so sizing them by the last
 	// frame's size feeds back on itself and runs away to the maximum.
 	struct tiles tiles;
-	tiles_for(vk, &tiles, vk->coded_width, vk->coded_height,
-		keyframe ? target * 4 : target);
+	struct segments segs;
+	unsigned expect = keyframe ? target * 4 : target;
+	if (vk->hevc) {
+		slices_for(vk, &segs, keyframe, q, expect);
+	} else {
+		tiles_for(vk, &tiles, vk->coded_width, vk->coded_height, expect);
+	}
 	// A keyframe gets its own, larger, layout; the steady state is what the
 	// stats line is about.
-	if (!keyframe && (tiles.info.TileCols != vk->told_cols ||
-			tiles.info.TileRows != vk->told_rows)) {
-		vk->told_cols = tiles.info.TileCols;
-		vk->told_rows = tiles.info.TileRows;
-		report_format(vk, tiles.info.TileCols, tiles.info.TileRows);
+	if (!keyframe) {
+		char parts[32];
+		if (vk->hevc && segs.count != vk->told_slices) {
+			vk->told_slices = (uint16_t)segs.count;
+			parts_text(parts, sizeof(parts), true, segs.count, 0, 0);
+			report_format(vk, parts);
+		} else if (!vk->hevc && (tiles.info.TileCols != vk->told_cols ||
+				tiles.info.TileRows != vk->told_rows)) {
+			vk->told_cols = tiles.info.TileCols;
+			vk->told_rows = tiles.info.TileRows;
+			parts_text(parts, sizeof(parts), false, 0,
+				tiles.info.TileCols, tiles.info.TileRows);
+			report_format(vk, parts);
+		}
 	}
 
 	uint32_t slot = keyframe ? 0 : 1 - vk->ref_slot;
 	uint32_t frame_id = vk->next_frame_id++;
+	// HEVC counts pictures from the last keyframe, and the slice segment
+	// headers carry the low eight bits of it.
+	int32_t poc = keyframe ? 0 : vk->poc + 1;
 
 	bool chunked = vk->cb->video_chunk != NULL && vk->chunked;
 	// Our own bytes first: they are known before the encode, so they are on
 	// the wire while the GPU is still working.
-	uint8_t prefix[64];
+	// AV1 wants a temporal delimiter in front of every frame; HEVC wants
+	// nothing but its parameter sets, and only on a keyframe. Those are
+	// bigger than AV1's sequence header, so this will not fit in 64 bytes.
+	uint8_t prefix[512];
 	unsigned prefix_len = 0;
-	prefix[prefix_len++] = 0x12; // temporal delimiter, has_size_field
-	prefix[prefix_len++] = 0x00;
-	if (keyframe && vk->seq_size + prefix_len <= sizeof(prefix)) {
+	if (!vk->hevc) {
+		prefix[prefix_len++] = 0x12; // temporal delimiter, has_size_field
+		prefix[prefix_len++] = 0x00;
+	}
+	if (keyframe) {
+		if (vk->seq_size + prefix_len > sizeof(prefix)) {
+			wlr_log(WLR_ERROR, "Frame %u: %zu bytes of headers will not fit",
+				frame_id, vk->seq_size);
+			return;
+		}
 		memcpy(prefix + prefix_len, vk->seq_obu, vk->seq_size);
 		prefix_len += (unsigned)vk->seq_size;
 	}
@@ -1293,20 +1637,33 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 	VkVideoEncodeAV1DpbSlotInfoKHR setup_av1 = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_DPB_SLOT_INFO_KHR,
 		.pStdReferenceInfo = &setup_std };
+	StdVideoEncodeH265ReferenceInfo setup_h265_std = {
+		.pic_type = keyframe ? STD_VIDEO_H265_PICTURE_TYPE_IDR
+			: STD_VIDEO_H265_PICTURE_TYPE_P,
+		.PicOrderCntVal = poc };
+	VkVideoEncodeH265DpbSlotInfoKHR setup_h265 = {
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_DPB_SLOT_INFO_KHR,
+		.pStdReferenceInfo = &setup_h265_std };
 	VkVideoReferenceSlotInfoKHR setup = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,
-		.pNext = &setup_av1, .slotIndex = (int32_t)slot,
-		.pPictureResource = &setup_res };
+		.pNext = vk->hevc ? (void *)&setup_h265 : (void *)&setup_av1,
+		.slotIndex = (int32_t)slot, .pPictureResource = &setup_res };
 	StdVideoEncodeAV1ReferenceInfo ref_std = { .RefFrameId = vk->ref_slot,
 		.frame_type = STD_VIDEO_AV1_FRAME_TYPE_INTER,
 		.OrderHint = (uint8_t)(frame_id - 1) };
 	VkVideoEncodeAV1DpbSlotInfoKHR ref_av1 = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_DPB_SLOT_INFO_KHR,
 		.pStdReferenceInfo = &ref_std };
+	StdVideoEncodeH265ReferenceInfo ref_h265_std = {
+		.pic_type = STD_VIDEO_H265_PICTURE_TYPE_P,
+		.PicOrderCntVal = poc - 1 };
+	VkVideoEncodeH265DpbSlotInfoKHR ref_h265 = {
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_DPB_SLOT_INFO_KHR,
+		.pStdReferenceInfo = &ref_h265_std };
 	VkVideoReferenceSlotInfoKHR ref = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,
-		.pNext = &ref_av1, .slotIndex = (int32_t)vk->ref_slot,
-		.pPictureResource = &ref_res };
+		.pNext = vk->hevc ? (void *)&ref_h265 : (void *)&ref_av1,
+		.slotIndex = (int32_t)vk->ref_slot, .pPictureResource = &ref_res };
 	// Begin-coding declares every slot the frame touches: the reference by
 	// index, and the frame's own output slot as not yet in use.
 	VkVideoReferenceSlotInfoKHR slots[2];
@@ -1347,22 +1704,31 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 			.maxFrameSize = { .intraFrameSize = target * 4,
 				.predictiveFrameSize = target * 2,
 				.bipredictiveFrameSize = target } };
+		VkVideoEncodeH265RateControlLayerInfoKHR h265_layer = {
+			.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_RATE_CONTROL_LAYER_INFO_KHR,
+			.useMaxFrameSize = VK_TRUE,
+			.maxFrameSize = { .frameISize = target * 4,
+				.framePSize = target * 2, .frameBSize = target } };
 		VkVideoEncodeRateControlLayerInfoKHR layer = {
 			.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_RATE_CONTROL_LAYER_INFO_KHR,
-			.pNext = &av1_layer,
+			.pNext = vk->hevc ? (void *)&h265_layer : (void *)&av1_layer,
 			.averageBitrate = (uint64_t)bitrate_kbps * 1000,
 			.maxBitrate = (uint64_t)bitrate_kbps * 1000,
 			.frameRateNumerator = fps_milli, .frameRateDenominator = 1000 };
 		VkVideoEncodeAV1RateControlInfoKHR av1_rc = {
 			.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_RATE_CONTROL_INFO_KHR,
 			.gopFrameCount = 60, .keyFramePeriod = 0, .temporalLayerCount = 1 };
+		VkVideoEncodeH265RateControlInfoKHR h265_rc = {
+			.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_RATE_CONTROL_INFO_KHR,
+			.gopFrameCount = 60, .idrPeriod = 0, .consecutiveBFrameCount = 0,
+			.subLayerCount = 1 };
 		VkVideoEncodeRateControlInfoKHR rc = !vk->hw_rate
 			? (VkVideoEncodeRateControlInfoKHR){
 				.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_RATE_CONTROL_INFO_KHR,
 				.rateControlMode = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR }
 			: (VkVideoEncodeRateControlInfoKHR){
 				.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_RATE_CONTROL_INFO_KHR,
-				.pNext = &av1_rc,
+				.pNext = vk->hevc ? (void *)&h265_rc : (void *)&av1_rc,
 				.rateControlMode = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR,
 				.layerCount = 1, .pLayers = &layer,
 				.virtualBufferSizeInMs = 100, .initialVirtualBufferSizeInMs = 50 };
@@ -1420,12 +1786,42 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 		av1_pic.referenceNameSlotIndices[i] =
 			!keyframe && i == 0 ? (int32_t)vk->ref_slot : -1;
 	}
+
+	// The same frame as HEVC: one reference, never reordered, so list 0 holds
+	// the other DPB slot and list 1 is empty. The short-term reference picture
+	// set says the one picture it may predict from is the one before it; a
+	// keyframe is an IDR and carries no set at all.
+	StdVideoEncodeH265ReferenceListsInfo h265_refs = {
+		.num_ref_idx_l0_active_minus1 = 0, .num_ref_idx_l1_active_minus1 = 0 };
+	for (unsigned i = 0; i < STD_VIDEO_H265_MAX_NUM_LIST_REF; i++) {
+		h265_refs.RefPicList0[i] = !keyframe && i == 0
+			? (uint8_t)vk->ref_slot : STD_VIDEO_H265_NO_REFERENCE_PICTURE;
+		h265_refs.RefPicList1[i] = STD_VIDEO_H265_NO_REFERENCE_PICTURE;
+	}
+	StdVideoH265ShortTermRefPicSet h265_strps = {
+		.num_negative_pics = 1, .num_positive_pics = 0,
+		.delta_poc_s0_minus1 = { 0 }, // one before this picture
+		.used_by_curr_pic_s0_flag = 1 };
+	StdVideoEncodeH265PictureInfo h265_std = {
+		.flags = { .IrapPicFlag = keyframe ? 1u : 0u, .is_reference = 1 },
+		.pic_type = keyframe ? STD_VIDEO_H265_PICTURE_TYPE_IDR
+			: STD_VIDEO_H265_PICTURE_TYPE_P,
+		.PicOrderCntVal = poc,
+		.pRefLists = &h265_refs,
+		.pShortTermRefPicSet = keyframe ? NULL : &h265_strps };
+	VkVideoEncodeH265PictureInfoKHR h265_pic = {
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PICTURE_INFO_KHR,
+		.naluSliceSegmentEntryCount = vk->hevc ? segs.count : 0,
+		.pNaluSliceSegmentEntries = vk->hevc ? segs.entry : NULL,
+		.pStdPictureInfo = &h265_std };
+
 	VkVideoPictureResourceInfoKHR src_res = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,
 		.codedExtent = { (uint32_t)vk->coded_width, (uint32_t)vk->coded_height },
 		.imageViewBinding = src->view };
 	VkVideoEncodeInfoKHR info = { .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_INFO_KHR,
-		.pNext = &av1_pic, .dstBuffer = vk->bitstream, .dstBufferOffset = 0,
+		.pNext = vk->hevc ? (void *)&h265_pic : (void *)&av1_pic,
+		.dstBuffer = vk->bitstream, .dstBufferOffset = 0,
 		.dstBufferRange = vk->bs_size, .srcPictureResource = src_res,
 		.pSetupReferenceSlot = &setup,
 		.referenceSlotCount = keyframe ? 0 : 1,
@@ -1529,7 +1925,7 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 		struct gm_video_packet out = { .data = vk->shadow, .len = total,
 			.frame_id = frame_id, .slot_ns = job->slot_ns, .encoded_ns = done,
 			.width = (uint16_t)job->width, .height = (uint16_t)job->height,
-			.keyframe = keyframe, .codec = GM_CODEC_AV1 };
+			.keyframe = keyframe, .codec = codec_of(vk) };
 		vk->cb->video(vk->cb->ctx, &out);
 	}
 
@@ -1585,6 +1981,7 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 	lay_pattern(vk);
 	vk->ref_slot = slot;
 	vk->have_ref = true;
+	vk->poc = poc;
 	// A keyframe is allowed four frames' worth of bytes; an inter frame one.
 	if (vk->pinned_q == 0 && !vk->hw_rate) {
 		if (keyframe) {
@@ -1605,12 +2002,18 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 	if (vk->debug) {
 		uint64_t h = hash64(0xcbf29ce484222325ull, prefix, prefix_len);
 		h = hash64(h, chunked ? vk->shadow : vk->shadow + prefix_len, size);
+		char parts[32];
+		if (vk->hevc) {
+			parts_text(parts, sizeof(parts), true, segs.count, 0, 0);
+		} else {
+			parts_text(parts, sizeof(parts), false, 0,
+				tiles.info.TileCols, tiles.info.TileRows);
+		}
 		fprintf(stderr, "vkencode frame %u %s %u bytes (target %u) in %u pieces, q %u, "
-			"%ux%u tiles, first %.2f ms, done %.2f ms, last piece out %.2f ms "
+			"%s, first %.2f ms, done %.2f ms, last piece out %.2f ms "
 			"(%.2f after the bitstream), %u patched, hash %016llx\n",
 			frame_id, keyframe ? "key" : "inter", total,
-			keyframe ? target * 4 : target, s.index, q,
-			tiles.info.TileCols, tiles.info.TileRows,
+			keyframe ? target * 4 : target, s.index, q, parts,
 			(s.first_ns - submitted) / 1e6, (done - submitted) / 1e6,
 			(sent_last - submitted) / 1e6, (sent_last - done) / 1e6, patched,
 			(unsigned long long)h);
@@ -1635,9 +2038,26 @@ static void *vkencode_thread(void *data) {
 		bool keyframe = vk->keyframe_wanted;
 		vk->keyframe_wanted = false;
 		int bitrate = vk->bitrate_kbps, refresh = vk->refresh_mhz;
+		bool hevc = vk->want_hevc;
+		unsigned parallelism = vk->want_parallelism;
 		vk->packet_bytes = vk->packet_bytes > 0 ? vk->packet_bytes : DEFAULT_PACKET;
 		pthread_mutex_unlock(&vk->lock);
 
+		// A different codec needs a different session, and a quantizer on a
+		// different scale.
+		if (hevc != vk->hevc) {
+			vk->hevc = hevc;
+			vk->q_per_doubling = hevc ? 6 : 58;
+			vk->q_inter = vk->q_key = hevc ? 26 : 128;
+			vk->coded_width = 0;
+		}
+		// A new count re-reports the layout, even where it clamps to the one
+		// already in use, so the stats line always answers for the setting.
+		if (parallelism != vk->parallelism) {
+			vk->parallelism = parallelism;
+			vk->told_cols = vk->told_rows = 0;
+			vk->told_slices = 0;
+		}
 		encode_one(vk, &job, keyframe, bitrate, refresh);
 		job_clear(&job);
 
@@ -1680,18 +2100,31 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 	}
 	vk->cb = cb;
 	vk->packet_bytes = DEFAULT_PACKET;
-	vk->tile_bytes = 0; // a datagram's worth, once the stream's size is known
-	vk->q_inter = vk->q_key = 128;
+	vk->tile_bytes = 0; // as many pieces as the hardware allows
+	vk->q_inter = vk->q_key = 128; // AV1's scale, until a stream asks for HEVC
+	vk->q_per_doubling = 58;
 	const char *pq = getenv("GM_AV1_Q");
+	if (pq == NULL) {
+		pq = getenv("GM_HEVC_Q");
+	}
 	if (pq != NULL && atoi(pq) > 0) {
 		vk->pinned_q = (unsigned)atoi(pq);
 	}
 	const char *rc = getenv("GM_AV1_RC");
 	vk->hw_rate = rc != NULL && strcmp(rc, "vbr") == 0;
+	// Size the frame's pieces by its byte budget instead of taking as many as
+	// the hardware allows. One name per codec, since what they cut up differs.
 	const char *tb = getenv("GM_AV1_TILE_BYTES");
+	if (tb == NULL) {
+		tb = getenv("GM_HEVC_SLICE_BYTES");
+	}
 	if (tb != NULL && atoi(tb) > 0) {
 		vk->tile_bytes = (unsigned)atoi(tb);
 	}
+	// HEVC's sample adaptive offset: an in-loop filter, which is the class of
+	// thing that drifted the AV1 picture when it was claimed and not applied.
+	// Off until it has been measured against a reference decode.
+	vk->sao = getenv("GM_HEVC_SAO") != NULL;
 	vk->debug = getenv("GM_DEBUG_CHUNKS") != NULL;
 	const char *nf = getenv("GM_AV1_DUMP_FRAMES");
 	vk->dump_frames = nf != NULL ? (unsigned)atoi(nf) : 120;
@@ -1726,7 +2159,11 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 		goto err;
 	}
 
-	// The device with a queue family that encodes AV1.
+	// The device with a queue family that encodes AV1 or HEVC.
+	VkVideoCodecOperationFlagsKHR family_ops = 0;
+	const VkVideoCodecOperationFlagsKHR want_ops =
+		VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR |
+		VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR;
 	uint32_t n = 0;
 	vk->vk.EnumeratePhysicalDevices(vk->instance, &n, NULL);
 	VkPhysicalDevice *devs = calloc(n, sizeof(*devs));
@@ -1753,10 +2190,10 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 		vk->vk.GetPhysicalDeviceQueueFamilyProperties2(devs[i], &qn, qf);
 		for (uint32_t q = 0; q < qn; q++) {
 			if ((qf[q].queueFamilyProperties.queueFlags & VK_QUEUE_VIDEO_ENCODE_BIT_KHR) &&
-					(qv[q].videoCodecOperations &
-						VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR)) {
+					(qv[q].videoCodecOperations & want_ops) != 0) {
 				vk->phys = devs[i];
 				vk->family = q;
+				family_ops = qv[q].videoCodecOperations;
 				found = true;
 				break;
 			}
@@ -1766,22 +2203,42 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 	}
 	free(devs);
 	if (!found) {
-		wlr_log(WLR_INFO, "No Vulkan AV1 encode queue on this GPU");
+		wlr_log(WLR_INFO, "No Vulkan AV1 or HEVC encode queue on this GPU");
 		goto err;
 	}
 
-	// Both depths, since gamescope picks the format: eight-bit must work, and
-	// ten-bit is what it composites at whenever it can.
-	profile_init(&vk->prof, false);
+	// Which of the two this GPU will take an RGB image for. Eight bits is the
+	// test, since gamescope picks the format and eight-bit must work; ten-bit
+	// is what it composites at whenever it can, and the session asks again
+	// for the depth it actually gets.
 	VkVideoEncodeAV1CapabilitiesKHR a = {
 		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR };
-	VkVideoEncodeCapabilitiesKHR e = {
-		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR, .pNext = &a };
-	VkVideoCapabilitiesKHR c = {
-		.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, .pNext = &e };
-	if (vk->vk.GetPhysicalDeviceVideoCapabilitiesKHR(vk->phys, &vk->prof.profile, &c)
-			!= VK_SUCCESS) {
-		wlr_log(WLR_INFO, "This GPU will not encode AV1 from an RGB image");
+	VkVideoEncodeH265CapabilitiesKHR hc = {
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR };
+	if (family_ops & VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR) {
+		VkVideoEncodeCapabilitiesKHR e = {
+			.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR, .pNext = &a };
+		VkVideoCapabilitiesKHR c = {
+			.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, .pNext = &e };
+		profile_init(&vk->prof, false, false);
+		if (vk->vk.GetPhysicalDeviceVideoCapabilitiesKHR(vk->phys,
+				&vk->prof.profile, &c) == VK_SUCCESS) {
+			vk->codecs |= 1u << GM_CODEC_AV1;
+		}
+	}
+	if (family_ops & VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
+		VkVideoEncodeCapabilitiesKHR e = {
+			.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR, .pNext = &hc };
+		VkVideoCapabilitiesKHR c = {
+			.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, .pNext = &e };
+		profile_init(&vk->prof, false, true);
+		if (vk->vk.GetPhysicalDeviceVideoCapabilitiesKHR(vk->phys,
+				&vk->prof.profile, &c) == VK_SUCCESS) {
+			vk->codecs |= 1u << GM_CODEC_HEVC;
+		}
+	}
+	if (vk->codecs == 0) {
+		wlr_log(WLR_INFO, "This GPU will not encode AV1 or HEVC from an RGB image");
 		goto err;
 	}
 	vk->vk.GetPhysicalDeviceMemoryProperties(vk->phys, &vk->mem_props);
@@ -1800,6 +2257,7 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 		VK_KHR_VIDEO_QUEUE_EXTENSION_NAME,
 		VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME,
 		VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME,
+		VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME,
 		VK_VALVE_VIDEO_ENCODE_RGB_CONVERSION_EXTENSION_NAME,
 		VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
 		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
@@ -1849,10 +2307,18 @@ struct gm_vkencode *vkencode_create(const struct gm_callbacks *cb) {
 		goto err;
 	}
 
-	wlr_log(WLR_INFO, "Vulkan AV1 encoding on %s (queue family %u, tiles up to "
-		"%ux%u, no smaller than %ux%u)", props.properties.deviceName, vk->family,
-		a.maxTiles.width, a.maxTiles.height, a.minTileSize.width,
-		a.minTileSize.height);
+	wlr_log(WLR_INFO, "Vulkan encoding on %s (queue family %u)",
+		props.properties.deviceName, vk->family);
+	if (vk->codecs & (1u << GM_CODEC_AV1)) {
+		wlr_log(WLR_INFO, "  AV1: tiles up to %ux%u, no smaller than %ux%u, "
+			"q index %u..%u", a.maxTiles.width, a.maxTiles.height,
+			a.minTileSize.width, a.minTileSize.height, a.minQIndex, a.maxQIndex);
+	}
+	if (vk->codecs & (1u << GM_CODEC_HEVC)) {
+		wlr_log(WLR_INFO, "  HEVC: up to %u slice segments, %ux%u tiles, "
+			"qp %d..%d", hc.maxSliceSegmentCount, hc.maxTiles.width,
+			hc.maxTiles.height, hc.minQp, hc.maxQp);
+	}
 	pthread_mutex_init(&vk->lock, NULL);
 	pthread_cond_init(&vk->cond, NULL);
 	if (pthread_create(&vk->thread, NULL, vkencode_thread, vk) != 0) {
@@ -1902,10 +2368,15 @@ void vkencode_destroy(struct gm_vkencode *vk) {
 	free(vk);
 }
 
-void vkencode_start(struct gm_vkencode *vk, int bitrate_kbps, int refresh_mhz,
-		int packet_bytes, int flags) {
+unsigned vkencode_codecs(struct gm_vkencode *vk) {
+	return vk == NULL ? 0 : vk->codecs;
+}
+
+void vkencode_start(struct gm_vkencode *vk, enum gm_codec codec, int bitrate_kbps,
+		int refresh_mhz, int packet_bytes, int flags) {
 	pthread_mutex_lock(&vk->lock);
 	vk->active = true;
+	vk->want_hevc = codec == GM_CODEC_HEVC;
 	vk->keyframe_wanted = true;
 	vk->bitrate_kbps = bitrate_kbps;
 	vk->refresh_mhz = refresh_mhz;
@@ -1924,6 +2395,18 @@ void vkencode_stop(struct gm_vkencode *vk) {
 	pthread_mutex_lock(&vk->lock);
 	vk->active = false;
 	job_clear(&vk->pending);
+	pthread_mutex_unlock(&vk->lock);
+}
+
+// How many tiles or slice segments a frame is cut into: 0 for the codec's
+// default (AV1 as many as the hardware allows, HEVC one). Clamped by the
+// hardware and the picture when it is used, not here.
+void vkencode_set_parallelism(struct gm_vkencode *vk, unsigned parts) {
+	if (vk == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&vk->lock);
+	vk->want_parallelism = parts;
 	pthread_mutex_unlock(&vk->lock);
 }
 

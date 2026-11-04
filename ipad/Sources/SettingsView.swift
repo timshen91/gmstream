@@ -47,7 +47,13 @@ struct SettingsView: View {
                     Toggle("Show stats overlay", isOn: $o.showStats)
                     Toggle("Vivid colors (the display's full gamut)", isOn: $o.vividColors)
                     Toggle("Keep Wi-Fi awake (60 tiny packets/s to the host)", isOn: $o.keepWiFiAwake)
-                    Toggle("Take AV1 frames as the host encodes them", isOn: $o.streamFrames)
+                    // Each only with its own codecs.
+                    Toggle("Take AV1 and HEVC frames as the host encodes them", isOn: $o.streamFrames)
+                        .disabled(!Options.takesFramesInPieces(o.codec))
+                    Toggle("PyroWave inter frames (predicted from the last)", isOn: $o.pyrowaveInter)
+                        .disabled(!Options.takesInterFrames(o.codec))
+                    Toggle("Keep the GPU awake for PyroWave (decodes ~3x faster)", isOn: $o.keepGPUAwake)
+                        .disabled(o.codec != 3)
                 }
                 Section {
                     Picker("Cursor", selection: $o.cursorMode) {
@@ -101,9 +107,9 @@ struct SettingsView: View {
         if n.refresh != old.refresh || n.sizeText != old.sizeText { changes.append(.display) }
         if n.showStats != old.showStats { changes.append(.stats) }
         if n.vividColors != old.vividColors { changes.append(.present) }
-        if n.keepWiFiAwake != old.keepWiFiAwake { changes.append(.keepAwake) }
+        if n.keepWiFiAwake != old.keepWiFiAwake || n.keepGPUAwake != old.keepGPUAwake { changes.append(.keepAwake) }
         // The host is told in Hello, so the stream starts over.
-        if n.streamFrames != old.streamFrames { changes.append(.connection) }
+        if n.streamFrames != old.streamFrames || n.pyrowaveInter != old.pyrowaveInter { changes.append(.connection) }
         if n.cursorMode != old.cursorMode || n.mouseMode != old.mouseMode { changes.append(.cursor) }
         if n.pacingMode != old.pacingMode || n.phaseLock != old.phaseLock || n.holdFrames != old.holdFrames { changes.append(.phaseLock) }
         options = n

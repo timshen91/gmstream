@@ -201,7 +201,9 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(session.confined, "relative says nothing about the clip")
         XCTAssertTrue(session.sendsMotion, "Auto, relative")
         session.cursorClip(CGRect(x: 0, y: 0, width: 10, height: 10))
-        XCTAssertTrue(session.confined, "Auto, a clip")
+        XCTAssertFalse(session.confined, "a clip, but the pointer is the system's")
+        session.lockActive = true
+        XCTAssertTrue(session.confined, "Auto, a clip, captured")
         options.confinement = .none
         XCTAssertFalse(session.confined, "None stands, whatever the game asks")
         options.mouseMode = .absolute
@@ -217,8 +219,24 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(session.confined)
         options.mouseMode = .absolute
         session.cursorClip(CGRect(x: 0, y: 0, width: 10, height: 10))
+        session.lockActive = true
         XCTAssertFalse(session.sendsMotion)
         XCTAssertTrue(session.confined)
+    }
+
+    /// Windowed the pointer is macOS's and goes where it likes, in and out of
+    /// the window, so a clip is not ours to hold: our cursor follows where the
+    /// mouse really is instead of stopping without it.
+    func testAClipOnlyConfinesWhileTheMouseIsCaptured() {
+        session.streamSize = CGSize(width: 1920, height: 1080)
+        let view = CGSize(width: 1920, height: 1080)
+        session.cursorClip(CGRect(x: 100, y: 100, width: 200, height: 200))
+        XCTAssertFalse(session.confined, "uncaptured: the system's pointer")
+        XCTAssertEqual(session.cursorArea(in: view), session.videoRect(in: view),
+                       "so the cursor is drawn anywhere in the video")
+        session.lockActive = true
+        XCTAssertTrue(session.confined, "captured: the clip is ours to hold")
+        XCTAssertEqual(session.cursorArea(in: view), CGRect(x: 100, y: 100, width: 200, height: 200))
     }
 
     func testTheCursorFollowsGamescopeUnlessSetOtherwise() {
@@ -249,6 +267,7 @@ final class SessionTests: XCTestCase {
         let view = CGSize(width: 1920, height: 1200) // half size, letterboxed: y 60...1140
         XCTAssertEqual(session.cursorArea(in: view), session.videoRect(in: view), "no clip: all of it")
         session.cursorClip(CGRect(x: 483, y: 3, width: 2874, height: 2154)) // WC3's on a 4K stream
+        session.lockActive = true // a clip is only held while the mouse is ours
         let r = session.cursorArea(in: view)
         XCTAssertEqual(r.minX, 241.5, accuracy: 1e-9)
         XCTAssertEqual(r.minY, 61.5, accuracy: 1e-9)

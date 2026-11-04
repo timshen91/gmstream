@@ -105,6 +105,12 @@ async fn main() -> Result<()> {
         v if v.is_empty() => None,
         v => Some(v.parse()?),
     };
+    // -P N: tiles (AV1) or slice segments (HEVC) per frame, 0 for the codec's
+    // default. The host reports what it settled on in its 0x88 format line.
+    let parallelism: Option<u16> = match opt("-P", "") {
+        v if v.is_empty() => None,
+        v => Some(v.parse()?),
+    };
     // -1 FLAGS: Hello flags, 1 = all video on one stream (as WebKit clients
     // do), 2 = video as datagrams.
     let flags: u8 = opt("-1", "0").parse()?;
@@ -153,6 +159,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = vrr {
         send.write_all(&message(0x0e, &[v])).await?;
+    }
+    if let Some(n) = parallelism {
+        send.write_all(&message(0x11, &n.to_le_bytes())).await?;
     }
     // Read the rest of the control stream (cursor, lock state) in the background.
     let host_msgs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));

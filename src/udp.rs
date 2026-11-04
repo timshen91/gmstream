@@ -32,6 +32,7 @@ pub const DATAGRAM_CONTROL: u8 = 3;
 const DATAGRAM_HANDSHAKE: u8 = 6;
 const DATAGRAM_MOUSE: u8 = 7;
 const DATAGRAM_ACK: u8 = 8;
+const DATAGRAM_PYROWAVE_LOSS: u8 = 11;
 const MOUSE_MOTION: u8 = 0;
 const MOUSE_POSITION: u8 = 1;
 /// Largest datagram payload we send: fits a 1500-byte Ethernet/Wi-Fi MTU
@@ -91,6 +92,22 @@ impl Route {
                 core::pointer_position(x as f64, y as f64);
             }
             _ => {}
+        }
+    }
+
+    /// A PyroWave loss report: `u32 frame_id, u16 count, u16 n`, then n (first,
+    /// length) ranges of missing packets. Reports are repeated until the host's
+    /// frames say they were taken in, so neither order nor loss matters.
+    fn pyrowave_loss(&mut self, m: &[u8]) {
+        if !self.mouse_on.load(Ordering::Relaxed) || m.len() < 8 {
+            return;
+        }
+        let frame_id = u32::from_le_bytes(m[0..4].try_into().unwrap());
+        let count = u16::from_le_bytes([m[4], m[5]]);
+        let n = u16::from_le_bytes([m[6], m[7]]) as usize;
+        let ranges: Vec<u16> = m[8..].chunks_exact(2).take(2 * n).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        if ranges.len() == 2 * n {
+            core::pyrowave_loss(frame_id, count, &ranges);
         }
     }
 
@@ -283,12 +300,22 @@ where
             let _ = socket.try_send_to(&handshakes[&addr].reply, addr);
             continue;
         }
-        if n < CONTROL_HEADER + auth::TAG_SIZE || (buf[0] != DATAGRAM_CONTROL && buf[0] != DATAGRAM_MOUSE) {
+        if n < CONTROL_HEADER + auth::TAG_SIZE
+            || (buf[0] != DATAGRAM_CONTROL && buf[0] != DATAGRAM_MOUSE && buf[0] != DATAGRAM_PYROWAVE_LOSS)
+        {
             continue;
         }
         let seq = u32::from_le_bytes(buf[1..5].try_into().unwrap());
         let (header, sealed) = buf[..n].split_at(CONTROL_HEADER);
         let mut map = routes.lock().unwrap();
+        if header[0] == DATAGRAM_PYROWAVE_LOSS {
+            if let Some(route) = map.get_mut(&addr) {
+                if let Some(m) = route.keys.open(Kind::Loss, header, seq, sealed) {
+                    route.pyrowave_loss(&m);
+                }
+            }
+            continue;
+        }
         if header[0] == DATAGRAM_MOUSE {
             if let Some(route) = map.get_mut(&addr) {
                 if let Some(m) = route.keys.open(Kind::Mouse, header, seq, sealed) {

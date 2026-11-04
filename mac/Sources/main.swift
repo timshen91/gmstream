@@ -19,6 +19,7 @@
 
 import AppKit
 import GameController
+import Metal
 
 // MARK: - Probe mode
 
@@ -37,6 +38,46 @@ final class Probe: ConnectionDelegate {
 
     init(conn: Connection) { self.conn = conn }
 
+    // PyroWave frames are decoded, as the app does (inter frames need it: the
+    // losses are reported back from the decoder), just not shown.
+    private let lock = NSLock()
+    private var decoded: [(total: Double, decode: Double, early: Double)] = []
+    var losses = 0, intraRequests = 0
+    lazy var pyro: PyroWaveDecoder? = {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
+              let d = PyroWaveDecoder(device: device, queue: queue) else { return nil }
+        d.onLoss = { [weak self] id, count, ranges in
+            self?.losses += 1
+            self?.conn.pyrowaveLoss(frameId: id, count: count, ranges: ranges)
+        }
+        d.onNeedIntra = { [weak self] in self?.intraRequests += 1; self?.conn.send(Msg.keyframe) }
+        d.keepGPUAwake = options.keepGPUAwake
+        d.onDecoded = { [weak self] _, t in
+            guard let self, let present = t.presentLocal else { return }
+            // present → decoded, last packet → decoded, and how long before the
+            // last packet the first (inter frames: the inter packets) arrived.
+            let ms = { (a: UInt64, b: UInt64) in Double(Int64(a) - Int64(b)) / 1e6 }
+            self.lock.lock()
+            self.decoded.append((ms(t.decoded, present), ms(t.decoded, t.received),
+                                 t.firstReceived > 0 ? ms(t.received, t.firstReceived) : 0))
+            self.lock.unlock()
+        }
+        return d
+    }()
+
+    /// The last second's decodes: count, p50 / p99 of each.
+    func takeDecoded() -> String {
+        lock.lock()
+        let d = decoded
+        decoded.removeAll()
+        lock.unlock()
+        guard !d.isEmpty else { return "decoded 0" }
+        let pct = { (v: [Double], q: Double) in v.sorted()[Int(Double(v.count - 1) * q)] }
+        let f = { (v: [Double]) in String(format: "%.2f/%.2f", pct(v, 0.5), pct(v, 0.99)) }
+        return "decoded \(d.count)  present→decoded \(f(d.map(\.total))) ms  last packet→decoded \(f(d.map(\.decode))) ms  " +
+            "first→last packet \(f(d.map(\.early))) ms"
+    }
+
     func received(frame f: Frame) {
         guard gate.admit(f, requestKeyframe: { conn.send(Msg.keyframe) }, stats: stats) else { return }
         let net = conn.toLocal(hostNs: f.encodedNs).map { Double(Int64(f.receivedNs) - Int64($0)) / 1e6 }
@@ -45,6 +86,10 @@ final class Probe: ConnectionDelegate {
     }
     func pyrowave(_ p: PyroWavePacket) {
         if p.index == p.count - 1 { stats.add(bytes: p.payload.count, netMs: nil, totalMs: nil) } else { stats.addBytes(p.payload.count) }
+        pyro?.packet(p) { [conn] first, overlap in
+            FrameTiming(slotNs: p.slotNs, encodedNs: p.encodedNs, received: p.receivedNs, firstReceived: first,
+                        overlapNs: overlap) { conn.toLocal(hostNs: $0) }
+        }
     }
     func helloAck(codec: UInt8) { ack = true; print("connected, codec \(codec)") }
     func cursor(width: Int, height: Int, hotX: Int, hotY: Int, rgba: Data) {}
@@ -72,6 +117,10 @@ if let seconds = options.probe {
                   "encoded→received \(fmt(s.net)) ms  present→received \(fmt(s.total)) ms (max \(fmt(s.totalMax)))  " +
                   "rtt \(fmt(Double(conn.rttNs) / 1e6)) ms  audio \(probe.audioPackets) packets \(probe.audioSamples / 2) frames decoded")
             probe.audioPackets = 0; probe.audioSamples = 0
+            if options.codec == 3 {
+                print("  \(probe.takeDecoded())  losses reported \(probe.losses)  intra asked \(probe.intraRequests)")
+                if getenv("PYROWAVE_TIMESTAMPS") != nil { probe.pyro?.reportPerformance() }
+            }
         }
         pinger.invalidate()
         conn.stop()
@@ -110,6 +159,20 @@ final class StreamView: NSView {
 
     // Keys: Controller.takeKeyboard takes them before they get here.
     override func keyDown(with e: NSEvent) {}
+
+    // Whether the pointer is over the view decides whose cursor is shown
+    // (Controller.updateCursor), so the view has to be told it crossed.
+    private var tracking: NSTrackingArea?
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = tracking { removeTrackingArea(t) }
+        let t = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(t)
+        tracking = t
+    }
+    override func mouseEntered(with e: NSEvent) { controller?.pointerOver(true) }
+    override func mouseExited(with e: NSEvent) { controller?.pointerOver(false) }
 
     override func mouseMoved(with e: NSEvent) { controller?.moved(e) }
     override func mouseDragged(with e: NSEvent) { controller?.moved(e) }
@@ -206,7 +269,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
     var focused: Bool { window.isKeyWindow }
     func status(_ line: String) { window.title = "GMStream — \(line)" }
     func cursorChanged() { makeCursor() }
-    var capturesMouse: Bool { true }
+    // Full screen: the mouse is ours, the macOS cursor is hidden and ours is
+    // drawn into the frame. Windowed: the macOS cursor is the cursor and the
+    // pointer stays the system's, free to leave the window. A relative game
+    // captures either way, through Session.sendsMotion: it has no cursor
+    // position to show, only motion to send.
+    var capturesMouse: Bool { fullScreen }
     func pacingChanged() { settings.load() }
 
     func setPointerLock(_ on: Bool) {
@@ -230,6 +298,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
             warpMouse(to: capturedPoint.value)
             CGAssociateMouseAndMouseCursorPosition(1) // or macOS ignores the mouse for 0.25 s after a warp
         }
+        updateCursor()
+    }
+
+    /// Whether the pointer is over the view, which only matters while it is
+    /// the system's (windowed): it is what says whose cursor to show.
+    private(set) var pointerOverView = false
+    func pointerOver(_ inside: Bool) {
+        guard inside != pointerOverView else { return }
+        pointerOverView = inside
+        logCursor("pointer \(inside ? "in" : "out")")
         updateCursor()
     }
 
@@ -380,6 +458,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
                 renderer.cursorMoved()
                 return
             }
+        } else {
+            // Not captured (windowed): the system moves the pointer and ours
+            // is drawn where it really is, so it goes in and out of the window
+            // with it. No clip is held here -- the pointer is not ours to
+            // stop, and pinning our cursor on a clip edge while the hand went
+            // somewhere else shows a cursor that is not where the mouse is.
+            capturedPoint.value = p
         }
         if !session.lockActive && session.wantsCapture && window.isKeyWindow {
             // The system cursor is out of the view; in it, it's ours.
@@ -433,18 +518,22 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, Sessi
         localCursor = (cursor, texture)
     }
 
-    /// After any change to the cursor, the capture, focus or the window's
-    /// place. The system cursor is hidden whenever the mouse is captured and
-    /// never used otherwise; ours is drawn into every frame. NSCursor.hide()
-    /// nests, so one flag owns it.
+    /// After any change to the cursor, the capture, focus, the pointer
+    /// crossing the view's edge or the window's place. Over the stream the
+    /// cursor is always ours, drawn into the frame, and the macOS one is
+    /// hidden: captured (full screen) that is the whole time, since the
+    /// pointer cannot leave; windowed the pointer is the system's and may go
+    /// anywhere, so ours is drawn while it is over the view and macOS's comes
+    /// back outside. NSCursor.hide() nests, so one flag owns it.
     func updateCursor() {
         let captured = session.lockActive && window.isKeyWindow
-        if captured != cursorHidden {
-            cursorHidden = captured
-            if captured { NSCursor.hide() } else { NSCursor.unhide() }
+        let ours = window.isKeyWindow && session.conn != nil && (captured || pointerOverView)
+        if ours != cursorHidden {
+            cursorHidden = ours
+            if ours { NSCursor.hide() } else { NSCursor.unhide() }
         }
-        session.cursorMode = localCursor == nil ? "hidden" : "drawn"
-        guard captured, let texture = localCursor?.texture else {
+        session.cursorMode = !ours ? "system" : (localCursor == nil ? "hidden" : "drawn")
+        guard ours, let texture = localCursor?.texture else {
             renderer.setCursor(nil)
             return
         }

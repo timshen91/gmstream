@@ -680,9 +680,7 @@ struct gm_encoder *encoder_create(int drm_fd, const struct gm_callbacks *cb) {
 	if (getenv("GM_AV1_VAAPI") == NULL) {
 		enc->vk = vkencode_create(cb);
 	}
-	if (enc->vk != NULL) {
-		enc->supported |= 1u << GM_CODEC_AV1;
-	}
+	enc->supported |= vkencode_codecs(enc->vk);
 
 	pthread_mutex_init(&enc->lock, NULL);
 	pthread_cond_init(&enc->cond, NULL);
@@ -737,14 +735,16 @@ uint32_t encoder_supported_codecs(struct gm_encoder *enc) {
 
 void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 		int bitrate_kbps, int refresh_mhz, int packet_bytes, int flags) {
-	// Pieces of a frame are an AV1 thing: it is the only codec whose
-	// bitstream the GPU writes into a buffer we can watch.
-	bool vk_av1 = codec == GM_CODEC_AV1 && enc->vk != NULL;
-	vastream_configure(enc->cb, codec == GM_CODEC_AV1 && !vk_av1 &&
+	// Pieces of a frame come from the Vulkan encoder, which is the only path
+	// whose bitstream the GPU writes into a buffer we can watch. It takes AV1
+	// and HEVC; the VA-API path stays the reference for both.
+	bool vk_native = enc->vk != NULL &&
+		(vkencode_codecs(enc->vk) & (1u << codec)) != 0;
+	vastream_configure(enc->cb, codec == GM_CODEC_AV1 && !vk_native &&
 		(flags & GM_STREAM_CHUNKED) != 0, (unsigned)packet_bytes);
-	enc->vk_active = vk_av1;
-	if (vk_av1) {
-		vkencode_start(enc->vk, bitrate_kbps, refresh_mhz, packet_bytes, flags);
+	enc->vk_active = vk_native;
+	if (vk_native) {
+		vkencode_start(enc->vk, codec, bitrate_kbps, refresh_mhz, packet_bytes, flags);
 		if (enc->pw != NULL) {
 			pyrowave_stop(enc->pw);
 		}
@@ -761,7 +761,8 @@ void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 	}
 	enc->pw_active = codec == GM_CODEC_PYROWAVE && enc->pw != NULL;
 	if (enc->pw_active) {
-		pyrowave_start(enc->pw, bitrate_kbps, refresh_mhz, packet_bytes);
+		pyrowave_start(enc->pw, bitrate_kbps, refresh_mhz, packet_bytes,
+			(flags & GM_STREAM_PYROWAVE_INTER) != 0);
 		pthread_mutex_lock(&enc->lock);
 		enc->active = false; // the VA-API worker closes its session
 		av_frame_free(&enc->pending.frame);
@@ -798,6 +799,13 @@ void encoder_stop(struct gm_encoder *enc) {
 	pthread_mutex_unlock(&enc->lock);
 }
 
+// Only the Vulkan encoder cuts a frame up: the VA-API path takes whatever
+// FFmpeg's defaults give it, and PyroWave's units are its wavelet subbands,
+// which are not ours to choose.
+void encoder_set_parallelism(struct gm_encoder *enc, unsigned parts) {
+	vkencode_set_parallelism(enc->vk, parts);
+}
+
 void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps) {
 	if (enc->pw != NULL) {
 		pyrowave_set_rate(enc->pw, bitrate_kbps, 0);
@@ -831,6 +839,9 @@ void encoder_set_refresh(struct gm_encoder *enc, int refresh_mhz) {
 void encoder_request_keyframe(struct gm_encoder *enc) {
 	if (enc->vk != NULL) {
 		vkencode_request_keyframe(enc->vk);
+	}
+	if (enc->pw != NULL) {
+		pyrowave_request_intra(enc->pw); // inter frames: the client has nothing to predict from
 	}
 	pthread_mutex_lock(&enc->lock);
 	enc->keyframe = true;

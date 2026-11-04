@@ -110,10 +110,10 @@ final class Decoder {
     /// the stats line: the two have to agree or VideoToolbox converts.
     private(set) var inputSummary = "no stream"
 
-    private func summarize(_ codec: Codec, _ config: AV1Config?) {
+    private func summarize(_ codec: Codec, _ config: AV1Config?, tenBit: Bool = false) {
         let stream = switch codec {
         case .h264: "H.264 8-bit"
-        case .hevc: "HEVC 8-bit"
+        case .hevc: "HEVC \(tenBit ? 10 : 8)-bit \(hdr ? "PQ" : "BT.709")"
         case .av1: config.map { "AV1 \($0.tenBit ? 10 : 8)-bit \($0.transfer == 16 ? "PQ" : "BT.709")" }
             ?? "AV1"
         }
@@ -278,7 +278,27 @@ final class Decoder {
             : CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                 allocator: kCFAllocatorDefault, parameterSetCount: params.count, parameterSetPointers: pointers,
                 parameterSetSizes: sizes, nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &format)
-        return status == noErr ? format : nil
+        guard status == noErr, let format else { return nil }
+        // Whether a HEVC stream is HDR10 comes out of the description
+        // VideoToolbox just built: it has read the sequence header's colour
+        // description already, so there is no VUI to parse here.
+        hdr = codec == .hevc && (CMFormatDescriptionGetExtension(format,
+            extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String)
+            == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+        summarize(codec, nil, tenBit: codec == .hevc && hevcProfileIdc(params) == 2)
+        return format
+    }
+
+    /// HEVC's profile, which says the depth: 1 is Main (eight-bit), 2 is
+    /// Main 10. It sits at a fixed place in the sequence parameter set -- two
+    /// bytes of NAL header, a byte of ids and flags, then profile_space, tier
+    /// and profile_idc -- so this needs no bitstream parser, and no emulation
+    /// prevention byte can reach that far (the first two bytes are not zero).
+    private func hevcProfileIdc(_ params: [Data]) -> UInt8? {
+        for nal in params where nal.count > 3 && (nal[nal.startIndex] >> 1) & 0x3f == 33 {
+            return nal[nal.startIndex + 3] & 0x1f
+        }
+        return nil
     }
 }
 

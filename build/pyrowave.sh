@@ -1,16 +1,19 @@
 #!/bin/sh
-# PyroWave (github.com/Themaister/pyrowave, MIT): GPU wavelet intra codec with
-# exact per-frame size control. Static libraries and the C API header into
+# PyroWave (github.com/Themaister/pyrowave, MIT): GPU wavelet codec with exact
+# per-frame size control, with inter frames added (pyrowave-inter.patch, next
+# to this script; bitstream/inter.md in the patched tree). Static libraries and the C API header into
 # $P (default /opt/gm). Run from build/deps.sh; needs cmake, ninja and a C++
 # compiler. Vulkan is loaded at run time (volk), so nothing links against it.
 set -eu
 P=${P:-/opt/gm}
 PYROWAVE_COMMIT=79a3232
+here=$(cd "$(dirname "$0")" && pwd)
 cd "${TMPDIR:-/tmp}"
 rm -rf pyrowave
 git clone -q https://github.com/Themaister/pyrowave.git pyrowave
 cd pyrowave
 git -c advice.detachedHead=false checkout -q $PYROWAVE_COMMIT
+git apply "$here/pyrowave-inter.patch"
 bash checkout_granite.sh > /dev/null
 cmake -S . -B b -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 ninja -C b pyrowave-shared

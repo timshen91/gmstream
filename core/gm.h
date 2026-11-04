@@ -67,6 +67,30 @@ struct gm_video_chunk {
 	enum gm_codec codec;
 };
 
+// PyroWave with inter frames (PROTOCOL.md, "PyroWave inter frames"): some of a
+// frame's packets, each after a u16 length. An inter frame's inter packets
+// (the prediction map and the motion vectors) come first, on their own, as soon
+// as the GPU has decided them; `count` is 0 there (the total is not known until
+// the rest is coded) and set in the rest.
+// One stripe of a frame (a horizontal band coded as an image of its own),
+// handed over as soon as the GPU has finished it.
+struct gm_pyrowave_packets {
+	const uint8_t *data;
+	size_t len;
+	uint32_t frame_id;
+	uint16_t first; // the stripe's first packet's number in the frame (all stripes' count in order)
+	uint16_t count; // the stripe's packets
+	uint8_t stripe, stripes;
+	uint16_t first_rows; // the first stripe's rows
+	uint16_t stripe_rows; // every other stripe's but the last's, which takes the rest
+	uint8_t inter; // the stripe's first packets that are inter packets
+	bool predicted; // from the previous frame; else intra (the client starts over)
+	uint32_t repaired; // the newest frame whose loss report the encoder has taken in
+	uint64_t slot_ns;
+	uint64_t encoded_ns; // when these packets were ready
+	uint16_t width, height;
+};
+
 struct gm_cursor {
 	const uint8_t *rgba; // straight alpha, width*height*4; NULL: hidden
 	uint16_t width, height;
@@ -93,6 +117,8 @@ struct gm_callbacks {
 	// buffer gamescope hands over and what the encoder makes of it). For the
 	// client's stats line; nothing depends on the wording.
 	void (*encode_format)(void *ctx, const char *text);
+	// PyroWave packets of a stream with inter frames (GM_STREAM_PYROWAVE_INTER).
+	void (*pyrowave)(void *ctx, const struct gm_pyrowave_packets *packets);
 };
 
 // Blocks until the child exits or gm_quit() is called. Returns an exit code.
@@ -115,6 +141,10 @@ enum gm_stream_flags {
 	// drives gamescope's hdr_enabled). The host only needs to know not to
 	// send HDR to a client that cannot show it.
 	GM_STREAM_HDR = 1 << 1,
+	// PyroWave with inter frames: each frame predicted from the client's
+	// previous decoded one, packets through gm_callbacks.pyrowave, losses
+	// reported back (gm_pyrowave_loss).
+	GM_STREAM_PYROWAVE_INTER = 1 << 2,
 };
 
 // Streaming. Start resizes the screen to the client's mode and encodes every
@@ -135,7 +165,14 @@ void gm_set_display_grid(uint64_t anchor_ns, uint64_t interval_ns);
 // a stream starts or stops.
 void gm_set_vrr_policy(int policy);
 void gm_request_keyframe(void);
+// PyroWave inter frames: the client missed packets of a frame. `count` is the
+// frame's packets as the client knows them (0: it never learned the total);
+// ranges are (first, length) pairs of missing packet indices, a length past the
+// end meaning the rest. Any thread.
+void gm_pyrowave_loss(uint32_t frame_id, uint16_t count, const uint16_t *ranges, size_t n_ranges);
 void gm_set_bitrate(int bitrate_kbps);
+// Tiles (AV1) or slice segments (HEVC) per frame; 0 for the codec's default.
+void gm_set_parallelism(unsigned parts);
 // Which codecs this GPU can encode (bit 1 << enum gm_codec). Valid once
 // gm_run has started the compositor; 0 before.
 uint32_t gm_supported_codecs(void);

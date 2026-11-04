@@ -244,7 +244,7 @@ final class PyroWaveDecoderTests: XCTestCase {
         var planes: [MTLTexture] = []
         decoder.onDecoded = { p, t in planes = p; XCTAssertGreaterThanOrEqual(t.decoded, t.decodeStart); done.fulfill() }
         decoder.onIncomplete = { XCTFail("incomplete") }
-        for i in parts.indices.reversed() { decoder.packet(packet(1, i, of: parts)) { timing(present: 1) } } // any order
+        for i in parts.indices.reversed() { decoder.packet(packet(1, i, of: parts)) { _, _ in timing(present: 1) } } // any order
         wait(for: [done], timeout: 5)
         XCTAssertEqual(planes.map(\.width), [width, width / 2, width / 2])
         XCTAssertEqual(planes.map(\.height), [height, height / 2, height / 2])
@@ -259,13 +259,274 @@ final class PyroWaveDecoderTests: XCTestCase {
         let done = expectation(description: "decoded")
         decoder.onDecoded = { _, _ in decoded += 1; done.fulfill() }
         decoder.onIncomplete = { incomplete += 1 }
-        decoder.packet(packet(1, 0, of: a)) { timing(present: 1) }
-        for i in b.indices { decoder.packet(packet(2, i, of: b)) { timing(present: 2) } }
-        for i in a.indices.dropFirst() { decoder.packet(packet(1, i, of: a)) { timing(present: 1) } } // stale now
+        decoder.packet(packet(1, 0, of: a)) { _, _ in timing(present: 1) }
+        for i in b.indices { decoder.packet(packet(2, i, of: b)) { _, _ in timing(present: 2) } }
+        for i in a.indices.dropFirst() { decoder.packet(packet(1, i, of: a)) { _, _ in timing(present: 1) } } // stale now
         wait(for: [done], timeout: 5)
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         XCTAssertEqual(decoded, 1)
         XCTAssertEqual(incomplete, 1)
+    }
+}
+
+/// Inter frames in stripes (PROTOCOL.md, "PyroWave inter frames"): the host
+/// codes each frame as two 128-row stripes, each an image of its own (an encoder
+/// each) predicting from its own decode of the whole last frame, as
+/// pyrowave_encoder_packetize_stripe hands them out.
+final class PyroWaveStripeTests: XCTestCase {
+    let width = 256, height = 256, rows = 128
+    var stripes: Int { height / rows }
+    var device: MTLDevice!
+    var decoder: PyroWaveDecoder!
+    var pw: pyrowave_device!
+    let queue = MTLCreateSystemDefaultDevice()!.makeCommandQueue()!
+    // The host: an encoder and a decoder per stripe, its decoded frames.
+    var encoders: [pyrowave_encoder] = []
+    var hostDecoders: [pyrowave_decoder] = []
+    var hostStripePlanes: [[MTLTexture]] = []
+    var hostPlanes: [[MTLTexture]] = []
+    var luma: [UInt8] = []
+
+    func planes(_ w: Int, _ h: Int) -> [MTLTexture] {
+        [(w, h), (w / 2, h / 2), (w / 2, h / 2)].map { w, h in
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: w, height: h, mipmapped: false)
+            desc.usage = [.shaderRead, .shaderWrite]
+            desc.storageMode = .private
+            return device.makeTexture(descriptor: desc)!
+        }
+    }
+
+    override func setUpWithError() throws {
+        device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        guard let d = PyroWaveDecoder(device: device, queue: device.makeCommandQueue()!) else { throw XCTSkip("PyroWave unsupported here") }
+        decoder = d
+        var info = pyrowave_device_create_info(mtl_device: Unmanaged.passUnretained(device as AnyObject).toOpaque(),
+                                               message_callback: nil, message_userdata: nil)
+        var dev: pyrowave_device?
+        XCTAssertEqual(pyrowave_device_create(&info, &dev), PYROWAVE_SUCCESS)
+        pw = dev
+        for _ in 0..<stripes {
+            var e = pyrowave_encoder_create_info(device: pw, width: Int32(width), height: Int32(rows), chroma: PYROWAVE_CHROMA_SUBSAMPLING_420)
+            var enc: pyrowave_encoder?
+            XCTAssertEqual(pyrowave_encoder_create(&e, &enc), PYROWAVE_SUCCESS)
+            encoders.append(enc!)
+            var di = pyrowave_decoder_create_info(device: pw, width: Int32(width), height: Int32(rows), chroma: PYROWAVE_CHROMA_SUBSAMPLING_420)
+            var hd: pyrowave_decoder?
+            XCTAssertEqual(pyrowave_decoder_create(&di, &hd), PYROWAVE_SUCCESS)
+            hostDecoders.append(hd!)
+            hostStripePlanes.append(planes(width, rows))
+        }
+        hostPlanes = (0..<2).map { _ in planes(width, height) }
+    }
+
+    override func tearDown() {
+        for d in hostDecoders { pyrowave_decoder_destroy(d) }
+        for e in encoders { pyrowave_encoder_destroy(e) }
+        if let pw { pyrowave_device_destroy(pw) }
+    }
+
+    let ptr = { (o: AnyObject) in Unmanaged.passUnretained(o).toOpaque() }
+
+    /// Frame `n` of a picture moving 2 pixels a frame: each stripe's packets, and
+    /// whether it is predicted.
+    func encodeFrame(_ n: Int) throws -> (stripes: [[Data]], predicted: Bool) {
+        let predicted = n > 0
+        luma = (0..<width * height).map { i in UInt8((i % width + 2 * n + (i / width) * 2) & 0xff) }
+        var out: [[Data]] = []
+        let cb = queue.makeCommandBuffer()!
+        for k in 0..<stripes {
+            let encoder = encoders[k], y0 = k * rows
+            if predicted {
+                let r = hostPlanes[(n - 1) & 1]
+                var ref = pyrowave_gpu_buffers(planes: (ptr(r[0]), ptr(r[1]), ptr(r[2])))
+                withUnsafePointer(to: &ref) { _ = pyrowave_encoder_set_reference_stripe(encoder, OpaquePointer($0), Int32(y0)) } // declared before its struct
+                pyrowave_decoder_set_reference_stripe(hostDecoders[k], &ref, Int32(y0))
+            } else {
+                pyrowave_encoder_set_reference_stripe(encoder, nil, 0)
+                pyrowave_decoder_set_reference_stripe(hostDecoders[k], nil, Int32(y0))
+            }
+            var y = Array(luma[y0 * width..<(y0 + rows) * width])
+            var cbp = [UInt8](repeating: 100, count: width * rows / 4), crp = [UInt8](repeating: 150, count: width * rows / 4)
+            let (w, h) = (width, rows)
+            let r = y.withUnsafeMutableBytes { yp in
+                cbp.withUnsafeMutableBytes { cbb in
+                    crp.withUnsafeMutableBytes { crb in
+                        var input = pyrowave_cpu_buffer(data: (yp.baseAddress, cbb.baseAddress, crb.baseAddress),
+                                                        row_stride_in_bytes: (w, w / 2, w / 2),
+                                                        plane_size_in_bytes: (w * h, w * h / 4, w * h / 4),
+                                                        width: Int32(w), height: Int32(h), format: PYROWAVE_CPU_BUFFER_FORMAT_YUV420P)
+                        var rate = pyrowave_rate_control(maximum_bitstream_size: 100_000)
+                        return pyrowave_encoder_encode_cpu(encoder, &input, &rate)
+                    }
+                }
+            }
+            guard r == PYROWAVE_SUCCESS else { throw XCTSkip("encode: \(r)") }
+            var count = 0
+            XCTAssertEqual(pyrowave_encoder_compute_num_packets(encoder, 1400, &count), PYROWAVE_SUCCESS)
+            var packets = [pyrowave_packet](repeating: pyrowave_packet(), count: count)
+            var bits = [UInt8](repeating: 0, count: 400_000)
+            var got = 0
+            XCTAssertEqual(pyrowave_encoder_packetize(encoder, &packets, 1400, &got, &bits, bits.count), PYROWAVE_SUCCESS)
+            let parts = packets.prefix(got).map { Data(bits[$0.offset..<$0.offset + $0.size]) }
+            XCTAssertGreaterThan(parts.count, 1)
+            out.append(parts)
+            // The host's own decode of the stripe, into its frame.
+            let hd = hostDecoders[k]
+            pyrowave_decoder_clear(hd)
+            for p in parts { p.withUnsafeBytes { _ = pyrowave_decoder_push_packet(hd, $0.baseAddress, $0.count) } }
+            let s = hostStripePlanes[k]
+            var buffers = pyrowave_gpu_buffers(planes: (ptr(s[0]), ptr(s[1]), ptr(s[2])))
+            XCTAssertEqual(pyrowave_decoder_decode_gpu_buffer(hd, ptr(cb), &buffers), PYROWAVE_SUCCESS)
+            let blit = cb.makeBlitCommandEncoder()!
+            for c in 0..<3 {
+                blit.copy(from: s[c], sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: s[c].width, height: s[c].height, depth: 1), to: hostPlanes[n & 1][c],
+                          destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: c == 0 ? y0 : y0 / 2, z: 0))
+            }
+            blit.endEncoding()
+        }
+        cb.commit()
+        cb.waitUntilCompleted()
+        return (out, predicted)
+    }
+
+    /// Frame f's packets as the host numbers them: every stripe's, in order.
+    func packets(_ id: UInt32, _ f: (stripes: [[Data]], predicted: Bool), repaired: UInt32 = 0) -> [PyroWavePacket] {
+        var all: [PyroWavePacket] = []
+        let total = f.stripes.map(\.count).reduce(0, +)
+        var first = 0
+        for (k, parts) in f.stripes.enumerated() {
+            for (i, part) in parts.enumerated() {
+                var p = PyroWavePacket(frameId: id, index: first + i, count: k + 1 == f.stripes.count ? total : 0,
+                                       width: width, height: height, slotNs: 1, encodedNs: 2, payload: part,
+                                       receivedNs: 3, readNs: 4)
+                p.inter = true
+                p.predicted = f.predicted
+                p.repaired = repaired
+                p.stripe = k
+                p.stripes = f.stripes.count
+                p.firstRows = rows
+                p.stripeRows = rows
+                p.stripeFirst = first
+                p.stripeCount = parts.count
+                // Inter packets: extended, code 1 (bitstream/inter.md).
+                p.stripeInter = parts.prefix { $0[3] & 0x80 != 0 && ($0.u32(4) >> 24) & 3 == 1 }.count
+                all.append(p)
+            }
+            first += parts.count
+        }
+        return all
+    }
+
+    /// The luma plane of a decoded frame.
+    func readLuma(_ planes: [MTLTexture]) -> [UInt8] {
+        let buffer = device.makeBuffer(length: width * height, options: .storageModeShared)!
+        let cb = queue.makeCommandBuffer()!
+        let blit = cb.makeBlitCommandEncoder()!
+        blit.copy(from: planes[0], sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: width, height: height, depth: 1), to: buffer, destinationOffset: 0,
+                  destinationBytesPerRow: width, destinationBytesPerImage: width * height)
+        blit.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        return Array(UnsafeBufferPointer(start: buffer.contents().assumingMemoryBound(to: UInt8.self), count: width * height))
+    }
+
+    func send(_ ps: [PyroWavePacket]) {
+        for p in ps { decoder.packet(p) { _, _ in timing(present: 1) } }
+    }
+
+    func testStripesDecodeInOrderFromTheLastFrame() throws {
+        let frames = try (0..<4).map { try encodeFrame($0) }
+        var planes: [[MTLTexture]] = []
+        let done = expectation(description: "decoded")
+        done.expectedFulfillmentCount = frames.count
+        decoder.onDecoded = { p, _ in planes.append(p); done.fulfill() }
+        decoder.onLoss = { id, _, _ in XCTFail("no loss, but frame \(id) reported") }
+        decoder.onNeedIntra = { XCTFail("needs no intra frame") }
+        for (n, f) in frames.enumerated() { send(packets(UInt32(10 + n), f)) }
+        wait(for: [done], timeout: 5)
+        let decoded = readLuma(planes.last!)
+        XCTAssertEqual(decoded, readLuma(hostPlanes[3 & 1]), "the host's own decode, exactly")
+        let error = zip(decoded, luma).map { abs(Int($0) - Int($1)) }.reduce(0, +) / luma.count
+        XCTAssertLessThan(error, 3, "the last frame, predicted three times over: mean luma error \(error)")
+    }
+
+    func testAStripeIsDecodedOnceItIsIn() throws {
+        let frames = try (0..<2).map { try encodeFrame($0) }
+        var decoded = 0
+        decoder.onDecoded = { _, _ in decoded += 1 }
+        send(packets(10, frames[0]))
+        let second = packets(11, frames[1])
+        send(Array(second.prefix(frames[1].stripes[0].count))) // only its first stripe
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(decoded, 1, "the frame is shown once all its stripes are in")
+        send(Array(second.dropFirst(frames[1].stripes[0].count)))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(decoded, 2)
+    }
+
+    func testALostPacketIsReportedUntilTheHostTakesItIn() throws {
+        let frames = try (0..<5).map { try encodeFrame($0) }
+        var losses: [(UInt32, Int, [(Int, Int)])] = []
+        var decoded = 0, incomplete = 0
+        decoder.onDecoded = { _, _ in decoded += 1 }
+        decoder.onIncomplete = { incomplete += 1 }
+        decoder.onLoss = { losses.append(($0, $1, $2)) }
+        for (n, f) in frames.enumerated() {
+            var ps = packets(UInt32(10 + n), f, repaired: n == 4 ? 11 : 0)
+            if n == 1 { ps.remove(at: 0) } // frame 11's first packet is lost
+            send(ps)
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(incomplete, 1)
+        XCTAssertEqual(decoded, 5, "the incomplete frame is decoded with what came: the next one predicts from it")
+        XCTAssertEqual(losses.map(\.0), [11, 11, 11],
+                       "reported once frame 11 was decoded, again as frames 12 and 13 began; frame 14 says the host has it")
+        XCTAssertEqual(losses.first?.1, frames[1].stripes.map(\.count).reduce(0, +))
+        XCTAssertEqual(losses.first?.2.map { [$0.0, $0.1] }, [[0, 1]])
+    }
+
+    func testALostLastStripeIsReportedAsTheRest() throws {
+        let frames = try (0..<3).map { try encodeFrame($0) }
+        var losses: [(UInt32, Int, [(Int, Int)])] = []
+        var decoded = 0
+        decoder.onDecoded = { _, _ in decoded += 1 }
+        decoder.onLoss = { losses.append(($0, $1, $2)) }
+        send(packets(10, frames[0]))
+        send(Array(packets(11, frames[1]).prefix(frames[1].stripes[0].count)))
+        send(packets(12, frames[2]))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(decoded, 3)
+        XCTAssertEqual(losses.first?.0, 11)
+        XCTAssertEqual(losses.first?.1, 0, "the frame's packet count never came")
+        XCTAssertEqual(losses.first?.2.map { [$0.0, $0.1] }, [[frames[1].stripes[0].count, 0xffff]])
+    }
+
+    func testAMissingFrameIsDecodedFromNothingAndReported() throws {
+        let frames = try (0..<3).map { try encodeFrame($0) }
+        var losses: [(UInt32, Int, [(Int, Int)])] = []
+        var decoded = 0
+        decoder.onDecoded = { _, _ in decoded += 1 }
+        decoder.onLoss = { losses.append(($0, $1, $2)) }
+        send(packets(10, frames[0]))
+        send(packets(12, frames[2]))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(decoded, 2, "the bridged frame is decoded, not shown")
+        XCTAssertEqual(losses.map(\.0), [11])
+        XCTAssertEqual(losses.first?.2.map { [$0.0, $0.1] }, [[0, 0xffff]], "all of it")
+    }
+
+    func testAPredictedFrameWithNothingBeforeItAsksForAnIntraFrame() throws {
+        let frames = try (0..<2).map { try encodeFrame($0) }
+        var needed = 0, decoded = 0
+        decoder.onNeedIntra = { needed += 1 }
+        decoder.onDecoded = { _, _ in decoded += 1 }
+        send(packets(11, frames[1]))
+        send(packets(12, frames[0]))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(needed, 1, "once, not per packet")
+        XCTAssertEqual(decoded, 1, "the intra frame")
     }
 }
 

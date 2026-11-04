@@ -15,7 +15,7 @@ mkdir -p build
 pw=build/pyrowave
 pyrowave_checkout $pw
 mkdir -p build/pw-obj
-for f in $pw/metal/*.mm $pw/metal/*.cpp; do
+for f in $pw/metal/*.mm $pw/metal/*.cpp $pw/pyrowave_inter.cpp; do
 	o=build/pw-obj/$(basename "$f").o
 	[ "$o" -nt "$f" ] || clang++ -c -O2 -std=c++17 -fobjc-arc -arch arm64 -mmacosx-version-min=14.0 \
 		-I$pw/metal -I$pw/metal/shaders "$f" -o "$o"
