@@ -17,6 +17,7 @@ void encoder_start(struct gm_encoder *enc, enum gm_codec codec,
 void encoder_stop(struct gm_encoder *enc);
 void encoder_set_bitrate(struct gm_encoder *enc, int bitrate_kbps);
 void encoder_set_parallelism(struct gm_encoder *enc, unsigned parts);
+void encoder_set_rotation(struct gm_encoder *enc, unsigned rotation);
 void encoder_set_refresh(struct gm_encoder *enc, int refresh_mhz);
 void encoder_request_keyframe(struct gm_encoder *enc);
 // Copies `buffer` (gamescope's composited frame) into a width x height
@@ -66,6 +67,9 @@ void rtenc_stop(struct gm_rtenc *rt);
 void rtenc_set_rate(struct gm_rtenc *rt, int bitrate_kbps, int refresh_mhz);
 // Stripes per frame; 0 for ours.
 void rtenc_set_stripes(struct gm_rtenc *rt, unsigned stripes);
+// Quarter turns of the picture before encoding (0, 1 or 3), for a client
+// whose panel scans the picture's columns: its stripes are then scan lines.
+void rtenc_set_rotation(struct gm_rtenc *rt, unsigned rotation);
 // The next frame intra (the client has nothing to predict from).
 void rtenc_request_intra(struct gm_rtenc *rt);
 // Compositor thread. False if the buffer cannot be encoded (not a dma-buf).

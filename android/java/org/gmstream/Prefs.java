@@ -18,7 +18,7 @@ final class Prefs {
     int parallelism = 0;    // AV1 tiles / HEVC slice segments, 0 = the host's default
     int stripes = 0;        // Riptide stripes, 0 = the host's default
     int pacing = 0;         // 0 Auto (phase lock), 1 Low latency
-    boolean scanout = false; // Riptide: frames written into the buffer on screen (experimental)
+    boolean scanout = true; // frames composed into the buffer the panel reads next (compositor.h)
     boolean touchscreen = true; // fingers are a touchscreen on the host; off: a mouse
 
     static final String[] CODECS = {"H.264", "HEVC", "AV1", "Riptide"};

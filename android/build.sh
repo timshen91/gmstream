@@ -38,17 +38,17 @@ for c in monocypher monocypher-ed25519; do
 	$CC $CFLAGS -c jni/third_party/monocypher/$c.c -o $OUT/obj/$c.o
 	objs="$objs $OUT/obj/$c.o"
 done
-srcs="crypto conn phase stats presenter video audio session"
+srcs="crypto conn phase stats panel presenter video audio session"
 extra_libs=""
 if [ -z "$GM_RIPTIDE" ] && command -v cmake >/dev/null && command -v ninja >/dev/null; then GM_RIPTIDE=1; fi
 if [ "$GM_RIPTIDE" = 1 ]; then
 	sh ./riptide.sh
-	srcs="$srcs riptide_client gpuwarm"
+	srcs="$srcs riptide_client gpuwarm gpu compositor"
 	R=$OUT/riptide G=../riptide/Granite
 	extra_libs="$R/libriptide.a $R/Granite/vulkan/libgranite-vulkan.a $R/Granite/math/libgranite-math.a $R/Granite/util/libgranite-util.a $R/Granite/third_party/libgranite-volk.a"
 	RIPTIDE_FLAGS="-DGM_RIPTIDE=1 -DVK_USE_PLATFORM_ANDROID_KHR -DANDROID -DNDEBUG -DGRANITE_SHIPPING -DGRANITE_RENDERDOC_CAPTURE -DRIPTIDE_PRECISION=1 -I$G/application/global -I$G/third_party/renderdoc -I../riptide -I$G/vulkan -I$G/util -I$G/math -I$G/third_party/volk -I$G/third_party/khronos/vulkan-headers/include"
 else
-	srcs="$srcs riptide_stub"
+	srcs="$srcs riptide_stub compositor_stub"
 fi
 for s in $srcs; do
 	$CXX $CFLAGS $RIPTIDE_FLAGS -Ijni -std=c++17 -c jni/$s.cpp -o $OUT/obj/$s.o

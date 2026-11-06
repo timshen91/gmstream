@@ -546,6 +546,14 @@ typedef struct riptide_scaled_encode_info
 
 	// Bit depth whose narrow range code values are used. 0 means 8. Must be 8 to 16 for narrow range.
 	uint32_t ycbcr_range_bit_depth;
+
+	// Quarter turns of the input before encoding (0, 1 or 3; R8_UNORM planes only).
+	// With 1 or 3 the encoder is the input's size turned (its width is the
+	// input's height): pixel (x, y) of the encoded picture is input pixel
+	// (y, W - 1 - x) for 1, (H - 1 - y, x) for 3, W x H the encoded size. For a
+	// client whose panel scans the picture's columns: the stripes are then
+	// bands of its scan lines.
+	uint32_t rotation;
 } riptide_scaled_encode_info;
 
 RIPTIDE_PUBLIC_API riptide_result

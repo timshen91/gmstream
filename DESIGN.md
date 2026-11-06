@@ -601,15 +601,45 @@ shows a buffer at) and 2.5 ms the margin before its latch, which the phase lock
 aims at (`Session::to_latch_grid`; aimed at the refresh, as on macOS, frames
 waited 4.6). Riptide 17.7 ms, its decode 4.2 ms on Adreno's compute path
 (inter frames cannot use PyroWave's fragment path; 7.6 before the GPU was kept
-awake). Riptide's scanout mode writes each frame into a front buffer kept on a
-display plane and committed every refresh, skipping the latch: **6.9 ms p50,
-7.1 p99**. It needs the buffer drawn in the panel's portrait orientation (the
-display engine rotates only compressed buffers; otherwise SurfaceFlinger
-composites on the GPU and the mode does nothing). On this chip's command-mode
-panel the present fence is the start of the transfer to the panel and the
-transfer takes ~7.7 ms of the period (Qualcomm's driver source, and release
-fences measured 0.62 ms before the next present). What root would add, and the
-root service to hold it: `android/ROOT.md`.
+awake).
+
+On this chip's command-mode panel the present fence is the start of the
+transfer to the panel, and the transfer reads the buffer row by row for ~7.7
+ms of the 8.33 ms period, from a prefetch 0.34 ms before the present
+(`android/jni/panel.h`: Qualcomm's driver formulas on the panel's device-tree
+timing, checked against the release fences). Scanout mode
+(`android/jni/compositor.h`) works to that schedule instead of
+SurfaceFlinger's latch:
+
+- A ring of three RGBA buffers in the panel's orientation (the display engine
+  rotates only compressed buffers) is committed one per refresh, with no
+  fence, for the refresh a latch ahead (frame timelines); each buffer is read
+  during its own refresh only, so it can be written any time in the ~17 ms
+  between. SurfaceFlinger keeps it on a display plane and shows every commit
+  at the refresh it was committed for (predicted to 0.05 ms).
+- Whole frames (AV1/HEVC/H.264, the decoder's own buffer through its YCbCr
+  conversion): a compute pass on the GPU's compute queue (its own family, high
+  priority) writes the newest ready frame into the buffer due next, just
+  before its prefetch. AV1, vkcube: 8.2 / 8.7 ms p50 / p99 host present ->
+  transfer start (16.3 through SurfaceFlinger).
+- Streamed (Riptide): the panel scans the landscape picture's columns, so a
+  stripe of picture rows covers every scan line and nothing could overlap the
+  scan. The client asks the host to encode the picture turned to the panel
+  (`Rotation`, PROTOCOL.md; `riptide_scaled_encode_info.rotation`, a transpose
+  after the colour conversion), so stripes are bands of scan lines, and each
+  stripe is composed into the buffer of a refresh claimed for the frame as
+  soon as it is decoded. Stripe 0 has to be in by the prefetch, each later
+  one only by the time the scan reaches its rows: the decode of the rest runs
+  inside the scan (the last stripe typically finishes as the transfer
+  starts). A newer frame takes over a refresh an older one is waiting for (so
+  one late frame does not push every later one a refresh back), and the
+  phase lock steers the host on each frame's slack against those deadlines.
+  vkcube, 1920x1080 120 fps, 100 Mb/s: **5.9 / 6.5 ms p50 / p99** host present
+  -> transfer start (17.7 through SurfaceFlinger); what is left is stripe 0's
+  own path (encode, network, decode of 128 rows: Riptide's smallest stripe)
+  and the margin.
+
+What root would add, and the root service to hold it: `android/ROOT.md`.
 
 ## 4. gamescope facts this design depends on
 

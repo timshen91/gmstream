@@ -63,6 +63,14 @@ void StageStats::drop()
 	dropped_++;
 }
 
+void StageStats::tear(int row)
+{
+	std::lock_guard<std::mutex> g(lock_);
+	torn_++;
+	tear_min_ = std::min(tear_min_, row);
+	tear_max_ = std::max(tear_max_, row);
+}
+
 StageStats::Taken StageStats::take()
 {
 	std::lock_guard<std::mutex> g(lock_);
@@ -86,7 +94,12 @@ StageStats::Taken StageStats::take()
 	}
 	out.shown = shown_;
 	out.dropped = dropped_;
-	shown_ = dropped_ = 0;
+	out.torn = torn_;
+	out.tear_min = torn_ ? tear_min_ : 0;
+	out.tear_max = torn_ ? tear_max_ : 0;
+	shown_ = dropped_ = torn_ = 0;
+	tear_min_ = 1 << 30;
+	tear_max_ = -1;
 	return out;
 }
 

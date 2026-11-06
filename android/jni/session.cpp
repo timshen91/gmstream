@@ -19,8 +19,10 @@
 #include <thread>
 
 #include "audio.h"
+#include "compositor.h"
 #include "conn.h"
 #include "log.h"
+#include "panel.h"
 #include "phase.h"
 #include "riptide_client.h"
 #include "stats.h"
@@ -42,7 +44,7 @@ struct Options {
 	bool keep_awake = true, keep_gpu_awake = true;
 	int pacing = 0; // 0 auto (phase lock), 1 low latency
 	int rotation = 0; // the display's (Surface.ROTATION_*)
-	bool scanout = false; // Riptide: frames written into the buffer on screen (experimental)
+	bool scanout = true; // frames composed into the buffer the panel reads next (compositor.h)
 };
 
 class Session : public ConnectionListener {
@@ -65,10 +67,22 @@ public:
 			stages_.drop();
 			phase_.dropped(to_latch_grid(t));
 		};
+		// A torn frame missed its transfer, as far as the lock is concerned:
+		// it steers the host's frames earlier until they stop tearing.
+		compositor_.on_presented = presenter_.on_presented;
+		compositor_.on_slack = [this](double ns) { phase_.slack(ns); };
+		compositor_.on_dropped = presenter_.on_dropped;
+		compositor_.on_torn = [this](const FrameTiming &t, int row) {
+			stages_.tear(row);
+			FrameTiming m = to_latch_grid(t);
+			m.presented = 0;
+			phase_.dropped(m);
+		};
 		video_.on_size = [this](int w, int h) { stream_size(w, h); };
 		riptide_.on_dropped = [this](const FrameTiming &t) { stages_.drop(); phase_.dropped(t); };
 		riptide_.on_size = [this](int w, int h) { stream_size(w, h); };
 		riptide_.set_presenter(&presenter_);
+		riptide_.set_compositor(&compositor_, compositor_.gpu());
 		riptide_.on_loss = [this](uint32_t id, int count, const std::vector<std::pair<int, int>> &r) {
 			std::lock_guard<std::mutex> g(conn_lock_);
 			if (conn_)
@@ -77,14 +91,6 @@ public:
 		riptide_.on_need_intra = [this] { send(msg::keyframe); };
 		riptide_.on_gap = [this] { through_.gap(); };
 		LOGI("this device's key: %s", id_.authorized_line("android").c_str());
-		AHardwareBuffer_Desc d = {};
-		d.width = 1920;
-		d.height = 1080;
-		d.layers = 1;
-		d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
-		d.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
-		          AHARDWAREBUFFER_USAGE_FRONT_BUFFER;
-		LOGI("front buffer (RGBA8, overlay): %s", AHardwareBuffer_isSupported(&d) ? "supported" : "not supported");
 	}
 
 	~Session() override
@@ -101,6 +107,7 @@ public:
 		opt_ = o;
 		running_ = true;
 		phase_.restart(o.refresh_hz);
+		presenter_.set_schedule(PanelSchedule::load(o.refresh_hz));
 		ticker_ = std::thread([this] { run(); });
 	}
 
@@ -245,6 +252,15 @@ private:
 	}
 	void stream_size(int w, int h)
 	{
+		// Scanout mode: the compositor, for pictures of this size (the
+		// decoders call this before their first frame of a new size).
+		// A Riptide picture that comes taller than wide is the one we asked to
+		// be turned to the panel (connect): streamed, a stripe at a time.
+		bool turned = opt_.scanout && stream_codec_ == 4 && (opt_.rotation == 1 || opt_.rotation == 3) && h > w;
+		if (opt_.scanout && !compositor_.start(w, h, opt_.rotation, turned))
+			LOGW("scanout: no compositor, frames go through SurfaceFlinger");
+		if (turned)
+			std::swap(w, h); // the picture's own orientation, for the window
 		if (w == stream_w_ && h == stream_h_)
 			return;
 		stream_w_ = w;
@@ -264,17 +280,24 @@ private:
 	{
 		// A frame is ready when its pixels are, not when the CPU handed it
 		// over: Riptide's last stripe and RGB pass are still on the GPU then.
-		if (t.decoded > t.submitted)
+		// (Streamed frames say when they were ready themselves: when stripe 0
+		// would have had to be done for every stripe to make its rows.)
+		if (!compositor_.streaming() && t.decoded > t.submitted)
 			t.submitted = t.decoded;
-		std::lock_guard<std::mutex> g(pipe_lock_);
-		if (presenter_.front())
+		if (compositor_.running()) {
+			// Scanout: the cut-off is the compositor's sample point for a
+			// refresh (latched), the same distance before every transfer.
+			if (t.presented && t.latched)
+				t.presented = t.latched + uint64_t(1e9 / opt_.refresh_hz);
 			return t;
+		}
+		std::lock_guard<std::mutex> g(pipe_lock_);
 		if (t.latched && t.presented > t.latched) {
 			pipe_.push_back(double(t.presented - t.latched));
 			if (pipe_.size() > 120)
 				pipe_.erase(pipe_.begin());
 		}
-		if (pipe_.size() < 10 || !t.presented || presenter_.front())
+		if (pipe_.size() < 10 || !t.presented)
 			return t; // scanout mode: the cut-off is the refresh itself
 		std::vector<double> s = pipe_;
 		std::nth_element(s.begin(), s.begin() + long(s.size() / 2), s.end());
@@ -297,7 +320,8 @@ private:
 	std::mutex conn_lock_;
 	std::unique_ptr<Connection> conn_;
 	Presenter presenter_;
-	VideoDecoder video_{presenter_};
+	Compositor compositor_{presenter_}; // owns the GPU: before Riptide, which uses it
+	VideoDecoder video_{presenter_, compositor_};
 	RiptideClient riptide_;
 	std::unique_ptr<AudioPlayer> audio_;
 	PhaseLock phase_{120};
@@ -375,10 +399,11 @@ void Session::connect()
 		conn_->keep_awake(opt_.keep_awake);
 	}
 	riptide_.set_keep_gpu_awake(opt_.keep_gpu_awake);
-	riptide_.set_scanout(opt_.scanout);
+
 	riptide_.set_rotation(opt_.rotation);
-	if (!opt_.scanout)
-		presenter_.set_front(nullptr, 0, 0);
+	// Scanout starts with the stream's size (stream_size).
+	compositor_.stop();
+	stream_w_ = stream_h_ = 0;
 	riptide_.reset();
 	video_.reset();
 	if (!audio_)
@@ -388,6 +413,11 @@ void Session::connect()
 	int parts = (opt_.codec == 1 || opt_.codec == 2) ? opt_.parallelism : opt_.codec == 4 ? opt_.stripes : 0;
 	par.u16(uint16_t(std::clamp(parts, 0, 65535)));
 	send(msg::parallelism, par.d);
+	// Scanout on a panel that scans the picture's columns: Riptide's picture
+	// turned so that its stripes are bands of scan lines (streamed into the
+	// buffer on screen as each is decoded). Other codecs ignore it.
+	if (opt_.scanout && (opt_.rotation == 1 || opt_.rotation == 3))
+		send(msg::rotation, {uint8_t(opt_.rotation)});
 	status("");
 }
 
@@ -523,6 +553,17 @@ std::string Session::stats()
 		std::lock_guard<std::mutex> g(conn_lock_);
 		if (conn_)
 			rtt = conn_->rtt_ns();
+	}
+	if (compositor_.running()) {
+		out += presenter_.schedule().summary() + "\n";
+		out += presenter_.ring_summary() + "\n" + compositor_.summary() + "\n";
+		snprintf(line, sizeof(line), "scanout: torn %d", st.torn);
+		out += line;
+		if (st.torn) {
+			snprintf(line, sizeof(line), " (rows %d-%d of %d)", st.tear_min, st.tear_max, presenter_.schedule().rows);
+			out += line;
+		}
+		out += "\n";
 	}
 	snprintf(line, sizeof(line), "rtt %.1f ms  dropped %d  gaps %d\naudio %s", rtt / 1e6, st.dropped, gaps,
 	         audio_ && audio_->ok() ? (std::to_string(int(audio_->buffered_ms())) + " ms buffered").c_str() : "no output");

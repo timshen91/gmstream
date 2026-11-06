@@ -14,12 +14,17 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
+
+#include <android/choreographer.h>
 
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
 #include <android/surface_control.h>
 
+#include "panel.h"
 #include "timing.h"
 
 namespace gm {
@@ -27,6 +32,8 @@ namespace gm {
 class Presenter {
 public:
 	std::function<void(const FrameTiming &)> on_presented, on_dropped;
+	void set_schedule(const PanelSchedule &s) { schedule_ = s; }
+	const PanelSchedule &schedule() const { return schedule_; }
 
 	~Presenter();
 	// The SurfaceView's window (nullptr: gone). Takes its own reference.
@@ -39,17 +46,24 @@ public:
 	             std::function<void(int)> release, int32_t dataspace, int32_t transform = 0);
 	void skip_one() { skip_ = true; }
 
-	// Scanout mode (experimental): one buffer stays on the display plane and
-	// frames are written into it in place; a commit goes in every refresh so
-	// the (command-mode) panel is sent the buffer as it is at each refresh,
-	// and a frame finished before that refresh's push is shown at it,
-	// without waiting for SurfaceFlinger's latch. set_front(nullptr) ends it.
-	void set_front(AHardwareBuffer *buf, int crop_w, int crop_h, int32_t transform = 0);
-	bool front() const { return front_buf_ != nullptr; }
-	// A frame written into the front buffer; `fence` (owned) signals when it is.
-	void front_written(FrameTiming t, int fence);
-	void front_complete(ASurfaceTransactionStats *stats); // SurfaceFlinger's thread
-	void front_tick_public() { front_tick(); }
+	// Scanout ring (compositor.h): `bufs` are committed in turn, one per
+	// refresh, each for a refresh SurfaceFlinger's latch ahead (frame
+	// timelines), with no fence: the compositor writes each just before the
+	// panel reads it. Empty: off.
+	void set_ring(std::vector<AHardwareBuffer *> bufs, int crop_w, int crop_h, int32_t transform);
+	bool ring() const { return ring_on_; }
+	struct Commit {
+		uint64_t seq;
+		int buffer;
+		uint64_t predicted; // its present (transfer start), from the frame timeline and what came before
+	};
+	// Committed and not yet presented, oldest first.
+	std::vector<Commit> upcoming();
+	// Each commit's real present (0: never presented); SurfaceFlinger's thread.
+	std::function<void(uint64_t seq, int buffer, uint64_t present)> on_ring_presented;
+	void ring_tick(const AChoreographerFrameCallbackData *data); // the vsync thread
+	void ring_complete(uint64_t seq, ASurfaceTransactionStats *stats); // SurfaceFlinger's thread
+	std::string ring_summary();
 	// SurfaceFlinger's thread.
 	void complete(uint64_t seq, ASurfaceTransactionStats *stats);
 
@@ -64,16 +78,20 @@ private:
 	};
 	void settle();
 
-	void front_tick();
-	void front_loop();
-	AHardwareBuffer *front_buf_ = nullptr;
-	int front_w_ = 0, front_h_ = 0;
-	std::thread front_thread_;
-	std::atomic<bool> front_run_{false};
-	void *front_looper_ = nullptr;
-	struct Written { FrameTiming t; int fence; uint64_t done; };
-	std::deque<Written> written_;
-	std::deque<uint64_t> presents_; // recent refreshes the buffer was sent at
+	void ring_loop();
+	PanelSchedule schedule_;
+	std::vector<AHardwareBuffer *> ring_bufs_;
+	std::atomic<bool> ring_on_{false}, ring_run_{false};
+	int ring_w_ = 0, ring_h_ = 0;
+	int32_t ring_transform_ = 0;
+	std::thread ring_thread_;
+	void *ring_looper_ = nullptr;
+	uint64_t ring_seq_ = 0;
+	struct Pending { Commit c; uint64_t expected; };
+	std::deque<Pending> ring_pending_;
+	std::vector<double> ring_offsets_; // present - the timeline's expected present, ns
+	double ring_offset_ = 0;
+	int ring_slips_ = 0, ring_lost_ = 0;
 
 	std::mutex lock_;
 	ANativeWindow *parent_ = nullptr;
@@ -82,7 +100,7 @@ private:
 	std::deque<InFlight> flight_;
 	bool skip_ = false;
 	int last_w_ = 0, last_h_ = 0, view_w_ = 0, view_h_ = 0;
-	int32_t last_dataspace_ = -1, last_transform_ = -1, front_transform_ = 0;
+	int32_t last_dataspace_ = -1, last_transform_ = -1;
 	uint64_t last_present_ = 0; // the previous transaction's present (debug: release timing)
 };
 

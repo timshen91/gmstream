@@ -153,6 +153,9 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         }
     }
 
+    /** The refresh of the mode asked for: the display may not have switched to it yet when a stream starts. */
+    private float fastestHz;
+
     /** The display's mode with the highest refresh at its full size. */
     private void preferFastestMode(Window w) {
         Display d = getDisplay();
@@ -162,6 +165,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
             if (m.getRefreshRate() > best.getRefreshRate() + 0.5f
                 || m.getPhysicalWidth() * m.getPhysicalHeight() > best.getPhysicalWidth() * best.getPhysicalHeight()) best = m;
         }
+        fastestHz = best.getRefreshRate();
         WindowManager.LayoutParams a = w.getAttributes();
         a.preferredDisplayModeId = best.getModeId();
         w.setAttributes(a);
@@ -209,7 +213,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
             Rect b = getWindowManager().getCurrentWindowMetrics().getBounds();
             size = new int[] {Math.max(b.width(), b.height()), Math.min(b.width(), b.height())};
         }
-        double hz = prefs.refresh > 0 ? prefs.refresh : getDisplay().getRefreshRate();
+        double hz = prefs.refresh > 0 ? prefs.refresh : fastestHz > 0 ? fastestHz : getDisplay().getRefreshRate();
         Native.start(h, prefs.host.trim(), prefs.port, prefs.codec, prefs.mbps, size[0], size[1], hz,
             prefs.streamFrames, prefs.parallelism, prefs.stripes, prefs.keepWiFiAwake, prefs.keepGPUAwake, prefs.pacing,
             prefs.scanout, getDisplay().getRotation());
@@ -247,7 +251,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         Surface s = holder.getSurface();
-        s.setFrameRate(getDisplay().getRefreshRate(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+        s.setFrameRate(fastestHz > 0 ? fastestHz : getDisplay().getRefreshRate(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
             Surface.CHANGE_FRAME_RATE_ALWAYS);
         Native.setSurface(h, s);
     }
@@ -609,7 +613,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         l.addView(awake);
         CheckBox gpu = check("Keep the GPU awake for Riptide", prefs.keepGPUAwake);
         l.addView(gpu);
-        CheckBox scan = check("Riptide: write frames into the buffer on screen (experimental; may tear)", prefs.scanout);
+        CheckBox scan = check("Scanout: frames go straight into the buffer the panel reads next, not through SurfaceFlinger", prefs.scanout);
         l.addView(scan);
         CheckBox touch = check("Fingers are a touchscreen (off: a mouse)", prefs.touchscreen);
         l.addView(touch);

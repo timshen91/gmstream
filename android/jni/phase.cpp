@@ -48,6 +48,8 @@ void PhaseLock::restart(double refresh_hz)
 
 void PhaseLock::start_sweep()
 {
+	slack_steps_ = 0;
+	slack_.clear();
 	sweeping_ = true;
 	sweep_.clear();
 	has_target_ = false;
@@ -71,6 +73,12 @@ bool PhaseLock::late(const FrameTiming &t, double &out)
 		return false;
 	out = double(int64_t(t.submitted) - int64_t(t.present_local));
 	return true;
+}
+
+void PhaseLock::slack(double ns)
+{
+	std::lock_guard<std::mutex> g(lock_);
+	slack_.push_back(ns);
 }
 
 void PhaseLock::dropped(const FrameTiming &t)
@@ -143,8 +151,38 @@ bool PhaseLock::step(uint64_t &anchor, uint64_t &interval_out)
 		interval_out = uint64_t(t);
 		return true;
 	};
-	if (steps_ <= settle_steps || d.size() < 10)
+	if (steps_ <= settle_steps || d.size() < 10) {
+		slack_.clear();
 		return result();
+	}
+	if (slack_.size() >= 20) {
+		// Streamed frames: each says how much later it could have come and
+		// still gone out whole at its refresh (Compositor::on_slack). Move the
+		// host's frames later until the earliest percent of them have just a
+		// small margin left; back at once on one that tore or went late. (No
+		// sweep: the slack is what the sweep would look for.)
+		std::vector<double> s = slack_;
+		slack_.clear();
+		std::sort(s.begin(), s.end());
+		double low = s[s.size() / 100], least = s.front();
+		static constexpr double keep = 0.5e6;
+		// A larger shift moves the host's frames earlier (measured: +2 ms of
+		// shift gave +2 ms of slack). Gently: a step sees ~60 frames, and
+		// their earliest percent is one or two of them.
+		double move = std::clamp((keep - low) * 0.3, -0.5e6, 0.5e6);
+		shift_ += move;
+		sweeping_ = false;
+		has_target_ = true;
+		target_ = low;
+		expected_ = double(std::count_if(s.begin(), s.end(), [](double x) { return x >= 0; })) / double(s.size());
+		slack_steps_++;
+		if (debug_phase())
+			LOGI("phase: streamed, slack p1 %.2f min %.2f p50 %.2f ms, shift %+.2f (moved %+.2f)", low / 1e6,
+			     least / 1e6, s[s.size() / 2] / 1e6, shift_ / 1e6, move / 1e6);
+		since_ = now_ns() + 100000000ull;
+		return result();
+	}
+	slack_.clear();
 	if (sweeping_) {
 		double display = d[d.size() / 2];
 		sweep_.push_back({shift_, display, drops * 30 < int(d.size())});
@@ -273,6 +311,9 @@ std::string PhaseLock::summary()
 	if (sweeping_)
 		snprintf(b, sizeof(b), "phase: sweeping %zu/%d, shift %+.1f ms, refresh %.3f ms", sweep_.size(),
 		         int(std::ceil(interval() / sweep_step)), shift_ / 1e6, interval() / 1e6);
+	else if (slack_steps_ > 0)
+		snprintf(b, sizeof(b), "phase: streamed, shift %+.1f ms, refresh %.3f ms, slack p1 %.2f ms, %.1f%% untorn",
+		         shift_ / 1e6, interval() / 1e6, target_ / 1e6, expected_ * 100);
 	else if (has_target_)
 		snprintf(b, sizeof(b), "phase: locked, shift %+.1f ms, refresh %.3f ms, host lead %.2f ms, %.0f%% shown expected",
 		         shift_ / 1e6, interval() / 1e6, target_ / 1e6, expected_ * 100);

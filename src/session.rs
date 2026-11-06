@@ -60,6 +60,7 @@ const C_PARALLELISM: u8 = 0x11;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
+const C_ROTATION: u8 = 0x12;
 const H_RELATIVE: u8 = 0x83;
 const H_CURSOR_CLIP: u8 = 0x87;
 const H_ENCODE_FORMAT: u8 = 0x88;
@@ -833,3 +834,9 @@ fn steam_vrr(policy: u8) {
     }
     eprintln!("gmstream: Steam VRR {}", ["left to Steam", "off (fixed refresh)", "on"][policy as usize]);
 }
+            C_ROTATION => {
+                let q = r.u8()?;
+                if q == 0 || q == 1 || q == 3 {
+                    core::set_rotation(q);
+                }
+            }

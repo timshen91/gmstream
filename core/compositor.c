@@ -2047,6 +2047,7 @@ void gm_set_vrr_policy(int policy) {
 	push((struct cmd){ .type = CMD_VRR_POLICY, .vrr_policy = policy });
 }
 
+	CMD_ROTATION,
 void gm_set_display_grid(uint64_t anchor_ns, uint64_t interval_ns) {
 	push((struct cmd){ .type = CMD_DISPLAY_GRID,
 		.grid = { anchor_ns, interval_ns } });
@@ -2193,6 +2194,11 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 		}
 	} else {
 		wlr_log(WLR_INFO, "Panel: no seat session; streams only");
+	case CMD_ROTATION:
+		if (server->encoder != NULL) {
+			encoder_set_rotation(server->encoder, c->parallelism);
+		}
+		break;
 	}
 	server.renderer = wlr_renderer_autocreate(server.backend);
 	if (server.renderer == NULL) {
@@ -2289,6 +2295,10 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 	create_linux_dmabuf(&server);
 
 	setenv("WAYLAND_DISPLAY", socket, true);
+void gm_set_rotation(unsigned rotation) {
+	push((struct cmd){ .type = CMD_ROTATION, .parallelism = rotation });
+}
+
 	wlr_log(WLR_INFO, "Running on WAYLAND_DISPLAY=%s", socket);
 
 	server.pace_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);

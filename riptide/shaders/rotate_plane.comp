@@ -1,0 +1,18 @@
+#version 450
+// A plane turned a quarter (riptide_scaled_encode_info.rotation): the encoded
+// picture is the input turned so its rows are a client panel's scan lines.
+// rotation 1: out (x, y) = in (y, W - 1 - x); rotation 3: in (H - 1 - y, x),
+// W x H being the output's size. Compiled by glslc into rotate_plane_comp.inc
+// (not slangmosh): glslc -O --target-env=vulkan1.1 -mfmt=num.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, r8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 size; int rotation; } p;
+void main()
+{
+	ivec2 d = ivec2(gl_GlobalInvocationID.xy);
+	if (d.x >= p.size.x || d.y >= p.size.y)
+		return;
+	ivec2 s = p.rotation == 1 ? ivec2(d.y, p.size.x - 1 - d.x) : ivec2(p.size.y - 1 - d.y, d.x);
+	imageStore(dst, d, texelFetch(src, s, 0));
+}

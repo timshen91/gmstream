@@ -831,6 +831,13 @@ void encoder_stop(struct gm_encoder *enc) {
 // VA-API path takes whatever FFmpeg's defaults give it, and PyroWave's units
 // are its wavelet subbands, which are not ours to choose. Each applies it to
 // its own codec.
+// Riptide only: the picture turned for the client's panel (rtenc_set_rotation).
+void encoder_set_rotation(struct gm_encoder *enc, unsigned rotation) {
+	if (enc->rt != NULL) {
+		rtenc_set_rotation(enc->rt, rotation);
+	}
+}
+
 void encoder_set_parallelism(struct gm_encoder *enc, unsigned parts) {
 	vkencode_set_parallelism(enc->vk, parts);
 	if (enc->rt != NULL) {

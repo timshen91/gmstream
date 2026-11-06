@@ -22,9 +22,11 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
-#include "context.hpp"
-#include "device.hpp"
 #include "riptide_decoder.hpp"
+#include "thread_id.hpp"
+
+#include "compositor.h"
+#include "gpu.h"
 
 #include "gpuwarm.h"
 #include "log.h"
@@ -58,16 +60,16 @@ static const uint32_t debug_frag[] = {
 };
 
 static constexpr int max_bridge = 6; // frames decoded from nothing to bridge a gap (the host keeps ~8)
-static constexpr int ring_size = 4;  // frames' planes: the one decoding, its reference, slack
+static constexpr int ring_size = 5;  // frames' planes: the one decoding, its reference, the compositor's, slack
 static constexpr int out_count = 4;  // RGB buffers out to SurfaceFlinger
 
 struct RiptideClient::Impl {
 	RiptideClient &owner;
 	Presenter *presenter = nullptr;
+	Compositor *compositor = nullptr;
+	Gpu *gpu = nullptr;
 	bool tried = false, ok = false;
-	Context context;
-	std::unique_ptr<Device> dev;
-	PFN_vkGetAndroidHardwareBufferPropertiesANDROID get_ahb_props = nullptr;
+	Device *dev = nullptr;
 	Program *program = nullptr, *program_r90 = nullptr, *program_r270 = nullptr;
 	int rotation = 0, out_rotation = 0; // Surface.ROTATION_*: asked for; what the buffers were made for
 
@@ -124,7 +126,6 @@ struct RiptideClient::Impl {
 	int out_w = 0, out_h = 0;
 	bool skip = false;
 	bool keep_awake = true;
-	bool scanout = false, out_scanout = false; // asked for; what the buffers were made for
 	GpuWarm warm;
 
 	explicit Impl(RiptideClient &o) : owner(o) {}
@@ -146,6 +147,7 @@ struct RiptideClient::Impl {
 	void begin_frame(bool predicted);
 	void decode_stripe(InterFrame &f, int k, bool last_of_frame);
 	void end_frame(InterFrame *f, CommandBufferHandle &cmd);
+	int export_fence();
 	void finish(InterFrame &f);
 	void done(InterFrame &f);
 	void report(uint32_t id, int count, const std::vector<std::pair<int, int>> &ranges);
@@ -158,33 +160,11 @@ bool RiptideClient::Impl::init()
 	if (tried)
 		return ok;
 	tried = true;
-	if (!Context::init_loader(nullptr)) {
-		LOGW("riptide: no Vulkan loader");
+	if (!gpu || !gpu->init())
 		return false;
-	}
-	context.set_num_thread_indices(1);
-	context.set_system_handles({});
-	VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
-	app.apiVersion = VK_API_VERSION_1_3;
-	app.pApplicationName = "gmstream";
-	app.pEngineName = "Granite";
-	context.set_application_info(&app);
-	static const char *dev_ext[] = {
-		VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
-		VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
-		VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
-	};
-	if (!context.init_instance_and_device(nullptr, 0, dev_ext, 3, 0)) {
-		LOGW("riptide: cannot create a Vulkan device");
-		return false;
-	}
-	ContextOptions opts = {};
-	opts.memory_priorities = false;
-	opts.lean_memory_mode = true;
-	dev = std::make_unique<Device>();
-	dev->set_context(context, opts);
-	get_ahb_props = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
-		vkGetDeviceProcAddr(dev->get_device(), "vkGetAndroidHardwareBufferPropertiesANDROID"));
+	dev = gpu->dev.get();
+	// Granite's per-thread pools: this (the network) thread is its thread 0.
+	Util::register_thread_index(0);
 	ResourceLayout vl = {}, fl = {};
 	fl.sets[0].sampled_image_mask = 7;
 	fl.sets[0].fp_mask = 7;
@@ -197,10 +177,10 @@ bool RiptideClient::Impl::init()
 		program = dev->request_program(yuv_vert, sizeof(yuv_vert), yuv_frag, sizeof(yuv_frag), &vl, &fl);
 	program_r90 = dev->request_program(yuv_r90_vert, sizeof(yuv_r90_vert), yuv_frag, sizeof(yuv_frag), &vl, &fl);
 	program_r270 = dev->request_program(yuv_r270_vert, sizeof(yuv_r270_vert), yuv_frag, sizeof(yuv_frag), &vl, &fl);
-	ok = get_ahb_props && program && program_r90 && program_r270;
+	ok = program && program_r90 && program_r270;
 	auto &props = dev->get_gpu_properties();
 	LOGI("riptide: %s, Vulkan %u.%u%s", props.deviceName, VK_VERSION_MAJOR(props.apiVersion),
-	     VK_VERSION_MINOR(props.apiVersion), ok ? "" : " (no AHardwareBuffer interop)");
+	     VK_VERSION_MINOR(props.apiVersion), ok ? "" : " (no programs)");
 	return ok;
 }
 
@@ -236,17 +216,15 @@ void RiptideClient::Impl::teardown()
 		for (auto &p : r)
 			p.reset();
 	free_out();
-	program = nullptr;
-	dev.reset();
+	program = program_r90 = program_r270 = nullptr;
+	dev = nullptr; // the device is the Gpu's
 }
 
 // An RGBA buffer SurfaceFlinger can scan out, as a Vulkan image we render into.
 bool RiptideClient::Impl::ensure_out(int w, int h)
 {
-	if (w == out_w && h == out_h && scanout == out_scanout && rotation == out_rotation)
+	if (w == out_w && h == out_h && rotation == out_rotation)
 		return true;
-	if (presenter)
-		presenter->set_front(nullptr, 0, 0);
 	free_out();
 	VkDevice vk = dev->get_device();
 	// Drawn in the panel's orientation: a quarter turn swaps the sides.
@@ -259,12 +237,12 @@ bool RiptideClient::Impl::ensure_out(int w, int h)
 		d.layers = 1;
 		d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
 		d.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-		          AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY | (scanout ? AHARDWAREBUFFER_USAGE_FRONT_BUFFER : 0);
+		          AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
 		if (AHardwareBuffer_allocate(&d, &o.ahb) != 0)
 			return false;
 		VkAndroidHardwareBufferFormatPropertiesANDROID fmt = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
 		VkAndroidHardwareBufferPropertiesANDROID props = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, &fmt};
-		if (get_ahb_props(vk, o.ahb, &props) != VK_SUCCESS)
+		if (gpu->get_ahb_props(vk, o.ahb, &props) != VK_SUCCESS)
 			return false;
 		VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
 		ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
@@ -306,7 +284,6 @@ bool RiptideClient::Impl::ensure_out(int w, int h)
 	}
 	out_w = w;
 	out_h = h;
-	out_scanout = scanout;
 	out_rotation = rotation;
 	return true;
 }
@@ -317,6 +294,8 @@ static ImageHandle make_plane(Device &dev, int w, int h)
 	info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
 	info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	info.layout = ImageLayout::General;
+	// Read by the compositor on the compute queue as well.
+	info.misc = IMAGE_MISC_CONCURRENT_QUEUE_GRAPHICS_BIT | IMAGE_MISC_CONCURRENT_QUEUE_ASYNC_COMPUTE_BIT;
 	return dev.create_image(info);
 }
 
@@ -338,6 +317,8 @@ bool RiptideClient::Impl::ensure(const RiptidePacket &p)
 	has_last = false;
 	in_frame = false;
 	if (resized) {
+		if (compositor)
+			compositor->forget_planes();
 		for (auto &r : ring)
 			for (int c = 0; c < 3; c++)
 				r[c] = make_plane(*dev, c ? width / 2 : width, c ? height / 2 : height);
@@ -349,11 +330,15 @@ bool RiptideClient::Impl::ensure(const RiptidePacket &p)
 		s.y = k == 0 ? 0 : first + (k - 1) * rows;
 		s.h = k + 1 == p.stripes ? height - s.y : k == 0 ? first : rows;
 		if (s.h < 2 || s.h % 2) {
+			static int said = -1;
+			if (said != s.h)
+				LOGE("riptide: stripe %d of a %dx%d picture would be %d rows", k, width, height, s.h);
+			said = s.h;
 			stripes.clear();
 			return false;
 		}
 		s.dec = std::make_unique<Riptide::Decoder>();
-		if (!s.dec->init(dev.get(), width, s.h, Riptide::ChromaSubsampling::Chroma420, false)) {
+		if (!s.dec->init(dev, width, s.h, Riptide::ChromaSubsampling::Chroma420, false)) {
 			LOGE("riptide: decoder init failed (%dx%d)", width, s.h);
 			stripes.clear();
 			return false;
@@ -362,7 +347,7 @@ bool RiptideClient::Impl::ensure(const RiptidePacket &p)
 			s.planes[c] = make_plane(*dev, c ? width / 2 : width, c ? s.h / 2 : s.h);
 		stripes.push_back(std::move(s));
 	}
-	if (!ensure_out(width, height)) {
+	if (!(compositor && compositor->running()) && !ensure_out(width, height)) {
 		LOGE("riptide: no output buffers");
 		stripes.clear();
 		return false;
@@ -467,11 +452,40 @@ void RiptideClient::Impl::decode_stripe(InterFrame &f, int k, bool last_of_frame
 	auto &st = f.stripes[size_t(k)];
 	if (!decoded || st.first < 0 || st.received_count < st.count)
 		f.lost = true;
+	if (compositor && compositor->streaming() && f.has_timing) {
+		// Streaming (the picture is turned to the panel: a stripe is a band of
+		// its scan lines): the stripe's rows go into the buffer on screen as
+		// soon as they are decoded.
+		dev->submit(cmd);
+		VkImageView views[3];
+		for (int c = 0; c < 3; c++)
+			views[c] = ring[current][c]->get_view().get_view().view;
+		FrameTiming t = f.timing;
+		t.decode_start = f.decode_start;
+		compositor->stream_stripe(f.id, k, int(stripes.size()), views, width, height, s.y, s.h, export_fence(), t);
+		if (last_of_frame) {
+			reference = current;
+			current = -1;
+			dev->next_frame_context();
+		}
+		return;
+	}
 	if (last_of_frame)
 		end_frame(&f, cmd);
 	else
 		dev->submit(cmd);
 	TRACE("riptide: stripe %d submitted", k);
+}
+
+// A sync fd that signals when everything submitted so far is done (-1: none).
+int RiptideClient::Impl::export_fence()
+{
+	auto sem = dev->request_semaphore_external(VK_SEMAPHORE_TYPE_BINARY, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+	if (!sem)
+		return -1;
+	dev->submit_empty(CommandBuffer::Type::Generic, nullptr, sem.get());
+	auto h = sem->export_to_handle();
+	return h ? int(h.handle) : -1;
 }
 
 // The frame is decoded: the next one's reference, and (with a timing) shown.
@@ -489,19 +503,30 @@ void RiptideClient::Impl::end_frame(InterFrame *f, CommandBufferHandle &cmd)
 		return;
 	}
 	TRACE("riptide: frame %u to the screen", f->id);
+	if (compositor && compositor->running()) {
+		// Scanout: the planes to the compositor, ready when this signals.
+		dev->submit(cmd);
+		int fence = export_fence();
+		if (fence < 0)
+			dev->wait_idle();
+		dev->next_frame_context();
+		VkImageView views[3];
+		for (int c = 0; c < 3; c++)
+			views[c] = ring[reference][c]->get_view().get_view().view;
+		FrameTiming t = f->timing;
+		t.decode_start = f->decode_start;
+		compositor->submit_planes(views, width, height, fence, t);
+		return;
+	}
 	if (out_w != width || out_h != height) {
 		// Made with the layout (ensure): never here, with a command buffer open.
 		dev->submit(cmd);
 		dev->next_frame_context();
 		return;
 	}
-	// A buffer the screen is done with (scanout mode: always the one on screen).
+	// A buffer the screen is done with.
 	int slot = -1, wait_fd = -1;
-	if (scanout && out_scanout) {
-		slot = 0;
-		if (!presenter->front())
-			presenter->set_front(outs[0].ahb, width, height, buffer_transform());
-	} else {
+	{
 		std::lock_guard<std::mutex> g(out_lock);
 		for (int i = 0; i < out_count; i++)
 			if (!outs[i].busy) {
@@ -553,7 +578,7 @@ void RiptideClient::Impl::end_frame(InterFrame *f, CommandBufferHandle &cmd)
 	b.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
 	b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-	b.srcQueueFamilyIndex = context.get_queue_info().family_indices[QUEUE_INDEX_GRAPHICS];
+	b.srcQueueFamilyIndex = gpu->graphics_family();
 	b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
 	b.image = o.image;
 	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -580,10 +605,6 @@ void RiptideClient::Impl::end_frame(InterFrame *f, CommandBufferHandle &cmd)
 	TRACE("riptide: next frame context");
 	FrameTiming t = f->timing;
 	t.decode_start = f->decode_start;
-	if (scanout && out_scanout) {
-		presenter->front_written(t, fence);
-		return;
-	}
 	Impl *self = this;
 	presenter->present(o.ahb, fence, width, height, t, [self, slot](int release) {
 		std::lock_guard<std::mutex> g(self->out_lock);
@@ -664,6 +685,12 @@ void RiptideClient::Impl::packet(const RiptidePacket &p, bool known, int64_t off
 {
 	if (!init())
 		return;
+	// Each connection has its own network thread: Granite's thread 0 is whichever one this is.
+	static thread_local bool registered = false;
+	if (!registered) {
+		Util::register_thread_index(0);
+		registered = true;
+	}
 	if (keep_awake)
 		warm.touch();
 	// Reports the host has taken in, or made moot by starting over; the rest
@@ -752,7 +779,11 @@ void RiptideClient::reset()
 }
 void RiptideClient::skip_one() { impl_->skip = true; }
 void RiptideClient::set_keep_gpu_awake(bool on) { impl_->keep_awake = on; }
-void RiptideClient::set_scanout(bool on) { impl_->scanout = on; }
+void RiptideClient::set_compositor(Compositor *c, Gpu *g)
+{
+	impl_->compositor = c;
+	impl_->gpu = g;
+}
 void RiptideClient::set_rotation(int r) { impl_->rotation = r & 3; }
 std::string RiptideClient::summary()
 {

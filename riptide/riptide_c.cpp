@@ -875,6 +875,8 @@ struct riptide_encoder_opaque
 
 	// For scaling path.
 	ImageHandle scaler_planes[3];
+	ImageHandle turn_planes[3]; // the input scaled before it is turned (rotation)
+	Program *turn_program = nullptr;
 	VideoScaler scaler;
 	QueryPoolHandle frame_start; // measuring: the scaled encode's first GPU command
 	QueryPoolHandle host_start, stripe0_end; // measuring: the encode call (host), stripe 0's last GPU command
@@ -973,6 +975,18 @@ riptide_encoder_create(const riptide_encoder_create_info *info, riptide_encoder 
 	ResourceLayout layout;
 	Shaders<> shaders(info->device->device, layout, 0);
 	enc->scaler.set_program(shaders.scaler);
+
+	static const uint32_t rotate_plane[] = {
+#include "shaders/rotate_plane_comp.inc"
+	};
+	ResourceLayout turn = {};
+	turn.sets[0].sampled_image_mask = 1;
+	turn.sets[0].fp_mask = 1;
+	turn.sets[0].storage_image_mask = 2;
+	turn.sets[0].meta[0].array_size = 1;
+	turn.sets[0].meta[1].array_size = 1;
+	turn.push_constant_size = 12;
+	enc->turn_program = info->device->device.request_program(rotate_plane, sizeof(rotate_plane), &turn);
 
 	*encoder = enc;
 	return RIPTIDE_SUCCESS;
@@ -1343,6 +1357,12 @@ riptide_encoder_encode_gpu_scaled(riptide_encoder encoder,
 		(ycbcr_range_bit_depth < 8 || ycbcr_range_bit_depth > 16))
 		return RIPTIDE_ERROR_INVALID_ARGUMENT;
 
+	uint32_t rotation = scaling_info->rotation;
+	if (rotation != 0 && rotation != 1 && rotation != 3)
+		return RIPTIDE_ERROR_INVALID_ARGUMENT;
+	if (rotation && (scaling_info->intermediate_plane_format != VK_FORMAT_R8_UNORM || !encoder->turn_program))
+		return RIPTIDE_ERROR_INVALID_ARGUMENT;
+
 	auto *device = encoder->device;
 	riptide_host_mark(0);
 	device->next_frame_context();
@@ -1372,6 +1392,28 @@ riptide_encoder_encode_gpu_scaled(riptide_encoder encoder,
 		if (!plane)
 			return RIPTIDE_ERROR_OUT_OF_DEVICE_MEMORY;
 
+	// Turned: the scaler writes the picture as it comes (the encoder's size
+	// with its sides swapped), and a pass turns each plane into scaler_planes.
+	if (rotation && !encoder->turn_planes[0])
+	{
+		auto info = ImageCreateInfo::immutable_2d_image(
+			encoder->height, encoder->width, scaling_info->intermediate_plane_format);
+		info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+		info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+		encoder->turn_planes[0] = encoder->device->create_image(info);
+		if (encoder->chroma == ChromaSubsampling::Chroma420)
+		{
+			info.width /= 2;
+			info.height /= 2;
+		}
+		encoder->turn_planes[1] = encoder->device->create_image(info);
+		encoder->turn_planes[2] = encoder->device->create_image(info);
+		for (auto &plane : encoder->turn_planes)
+			if (!plane)
+				return RIPTIDE_ERROR_OUT_OF_DEVICE_MEMORY;
+	}
+	ImageHandle *scaled = rotation ? encoder->turn_planes : encoder->scaler_planes;
+
 	riptide_device_wait_semaphore(device, encoder->rt_device->queue_type, acquire, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
 	auto cmd =
@@ -1399,7 +1441,7 @@ riptide_encoder_encode_gpu_scaled(riptide_encoder encoder,
 	}
 	for (int i = 0; i < 3; i++)
 	{
-		cmd->image_barrier(*encoder->scaler_planes[i], VK_IMAGE_LAYOUT_UNDEFINED,
+		cmd->image_barrier(*scaled[i], VK_IMAGE_LAYOUT_UNDEFINED,
 						   VK_IMAGE_LAYOUT_GENERAL,
 						   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
 						   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
@@ -1455,7 +1497,7 @@ riptide_encoder_encode_gpu_scaled(riptide_encoder encoder,
 		for (int i = 0; i < 3; i++)
 		{
 			info.input = wrapped.planes[i];
-			info.output_planes[0] = &encoder->scaler_planes[i]->get_view();
+			info.output_planes[0] = &scaled[i]->get_view();
 			encoder->scaler.rescale(*cmd, info);
 
 			if (i == 0)
@@ -1479,7 +1521,7 @@ riptide_encoder_encode_gpu_scaled(riptide_encoder encoder,
 
 		info.input = wrapped_view.get();
 		for (int i = 0; i < 3; i++)
-			info.output_planes[i] = &encoder->scaler_planes[i]->get_view();
+			info.output_planes[i] = &scaled[i]->get_view();
 		info.num_output_planes = 3;
 		encoder->scaler.rescale(*cmd, info);
 	}
@@ -1488,6 +1530,31 @@ riptide_encoder_encode_gpu_scaled(riptide_encoder encoder,
 		// Could be supported if need be, but let's not unless we can prove we need it ...
 		device->submit_discard(cmd);
 		return RIPTIDE_ERROR_INVALID_ARGUMENT;
+	}
+
+	if (rotation)
+	{
+		for (int i = 0; i < 3; i++)
+		{
+			cmd->image_barrier(*encoder->turn_planes[i],
+			                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+			                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+			                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+			cmd->image_barrier(*encoder->scaler_planes[i], VK_IMAGE_LAYOUT_UNDEFINED,
+			                   VK_IMAGE_LAYOUT_GENERAL,
+			                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+			                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+		}
+		cmd->set_program(encoder->turn_program);
+		for (int i = 0; i < 3; i++)
+		{
+			auto &out = *encoder->scaler_planes[i];
+			int32_t push[3] = { int32_t(out.get_width()), int32_t(out.get_height()), int32_t(rotation) };
+			cmd->set_texture(0, 0, encoder->turn_planes[i]->get_view(), StockSampler::NearestClamp);
+			cmd->set_storage_texture(0, 1, out.get_view());
+			cmd->push_constants(push, 0, sizeof(push));
+			cmd->dispatch((out.get_width() + 7) / 8, (out.get_height() + 7) / 8, 1);
+		}
 	}
 
 	for (int i = 0; i < 3; i++)

@@ -17,15 +17,16 @@ public:
 	static const std::vector<std::string> &names();
 	void add(const FrameTiming &t);
 	void drop();
+	void tear(int row);
 	struct Row { std::string name; bool has; double p50, p99, max; };
-	struct Taken { std::vector<Row> rows; int shown = 0, dropped = 0; };
+	struct Taken { std::vector<Row> rows; int shown = 0, dropped = 0, torn = 0, tear_min = 0, tear_max = 0; };
 	Taken take();
 
 private:
 	std::mutex lock_;
 	struct Entry { uint64_t at; std::vector<double> v; std::vector<bool> has; };
 	std::vector<Entry> frames_;
-	int shown_ = 0, dropped_ = 0;
+	int shown_ = 0, dropped_ = 0, torn_ = 0, tear_min_ = 1 << 30, tear_max_ = -1;
 	uint64_t last_presented_ = 0, last_present_ = 0;
 };
 

@@ -71,6 +71,7 @@ void VideoDecoder::destroy()
 	AMediaCodec_stop(codec_);
 	AMediaCodec_delete(codec_);
 	codec_ = nullptr;
+	compositor_.forget_images(); // gives back the images it holds, while the reader is there
 	std::shared_ptr<ReaderState> st;
 	{
 		std::lock_guard<std::mutex> g(state_lock_);
@@ -281,6 +282,16 @@ void VideoDecoder::image_available(AImageReader *r)
 	}
 	if (!p.t.decoded)
 		p.t.decoded = now_ns();
+	if (compositor_.running()) {
+		// Scanout: the compositor samples the picture into the buffer the
+		// panel reads next (its acquire fence says when it is decoded).
+		compositor_.submit_image(ahb, fence, p.w, p.h, p.t, [img, state] {
+			std::lock_guard<std::mutex> g(state->lock);
+			if (state->alive)
+				AImage_delete(img);
+		});
+		return;
+	}
 	presenter_.present(ahb, fence, p.w, p.h, p.t, [img, state](int release) {
 		std::lock_guard<std::mutex> g(state->lock);
 		if (state->alive)

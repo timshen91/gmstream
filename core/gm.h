@@ -167,6 +167,9 @@ void gm_set_bitrate(int bitrate_kbps);
 // How many parts the encoder cuts a frame into: tiles (AV1), slice segments
 // (HEVC) or stripes (Riptide); 0 for the codec's default.
 void gm_set_parallelism(unsigned parts);
+// Riptide: quarter turns of the picture for the client's panel (0, 1 or 3;
+// riptide_scaled_encode_info.rotation). Reset when a stream starts.
+void gm_set_rotation(unsigned rotation);
 // Which codecs this GPU can encode (bit 1 << enum gm_codec). Valid once
 // gm_run has started the compositor; 0 before.
 uint32_t gm_supported_codecs(void);

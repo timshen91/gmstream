@@ -110,6 +110,7 @@ struct gm_rtenc {
 	struct job pending;
 	int bitrate_kbps, refresh_mhz, packet_bytes;
 	unsigned stripes; // the client's choice (rtenc_set_stripes); 0: ours
+	unsigned rotation; // quarter turns the client asked for (rtenc_set_rotation)
 	bool intra_requested;
 	struct loss losses[MAX_LOSSES];
 	int n_losses;
@@ -123,6 +124,7 @@ struct gm_rtenc {
 	size_t inter_packet;
 	unsigned inter_stripes; // what it was set up for
 	int stripe_rows, first_rows;
+	bool turned; // what the encoder was made for
 	struct frame_entry frames[FRAME_MAP];
 	uint32_t repaired; // newest frame id whose loss report was taken in
 	uint8_t *received;
@@ -377,8 +379,8 @@ static void emit(struct gm_rtenc *pw, struct job *job, uint32_t frame_id, const 
 		.repaired = pw->repaired,
 		.slot_ns = job->slot_ns,
 		.encoded_ns = ready_ns,
-		.width = (uint16_t)job->width,
-		.height = (uint16_t)job->height,
+		.width = (uint16_t)pw->enc_width, // the encoded picture's (turned, with rotation)
+		.height = (uint16_t)pw->enc_height,
 	};
 	pw->cb->riptide(pw->cb->ctx, &out);
 }
@@ -438,15 +440,23 @@ static void stripe_layout(int height, unsigned stripes, int *first, int *rows) {
 }
 
 static void encode_one(struct gm_rtenc *pw, struct job *job, int bitrate_kbps,
-		int refresh_mhz, size_t packet, unsigned stripes) {
+		int refresh_mhz, size_t packet, unsigned stripes, unsigned rotation) {
 	riptide_image image = import_dmabuf(pw, &job->buf);
-	if (image == NULL || !ensure_encoder(pw, job->width, job->height)) {
+	// Turned for the client's panel (rtenc_set_rotation): the encoded picture's
+	// sides are swapped, and its stripes are bands of the panel's scan lines.
+	bool turned = rotation == 1 || rotation == 3;
+	int enc_w = turned ? job->height : job->width, enc_h = turned ? job->width : job->height;
+	if (turned != pw->turned) {
+		pw->inter_on = false; // stripes again, on the other side
+		pw->turned = turned; // and ensure_encoder makes a new encoder for the new size
+	}
+	if (image == NULL || !ensure_encoder(pw, enc_w, enc_h)) {
 		return;
 	}
 	gpuwarm_touch(pw->warm);
 	if (!pw->inter_on || packet != pw->inter_packet || stripes != pw->inter_stripes) {
 		int first, rows;
-		stripe_layout(job->height, stripes, &first, &rows);
+		stripe_layout(enc_h, stripes, &first, &rows);
 		riptide_inter_info ii = { .enable = true, .packet_boundary = packet, .history = INTER_HISTORY,
 			.stripe_rows = rows, .first_stripe_rows = first };
 		pw->inter_on = riptide_encoder_enable_inter(pw->encoder, &ii) == RIPTIDE_SUCCESS;
@@ -461,8 +471,8 @@ static void encode_one(struct gm_rtenc *pw, struct job *job, int bitrate_kbps,
 		memset(pw->frames, 0, sizeof(pw->frames));
 		int count = riptide_encoder_get_stripe_count(pw->encoder);
 		char text[64];
-		snprintf(text, sizeof(text), "%d stripes (%d, then %d rows)", count, first ? first : job->height,
-			rows ? rows : job->height);
+		snprintf(text, sizeof(text), "%d stripes (%d, then %d rows)%s", count, first ? first : enc_h,
+			rows ? rows : enc_h, turned ? ", turned for the panel" : "");
 		pw->cb->encode_format(pw->cb->ctx, text);
 		wlr_log(WLR_INFO, "Riptide: %s", text);
 	}
@@ -523,6 +533,7 @@ static void encode_one(struct gm_rtenc *pw, struct job *job, int bitrate_kbps,
 		uint32_t number = 0;
 		riptide_encoder_get_frame_info(pw->encoder, &number, &predicted);
 		int stripes = riptide_encoder_get_stripe_count(pw->encoder);
+		.rotation = turned ? rotation : 0,
 		size_t cap = budget / 256 + 1024;
 		pw->packets = grow(pw->packets, &pw->packets_cap, cap, sizeof(*pw->packets));
 		pw->bitstream = grow(pw->bitstream, &pw->bitstream_cap, budget + 65536, 1);
@@ -592,9 +603,9 @@ static void *worker(void *data) {
 		pw->pending.valid = false;
 		int bitrate = pw->bitrate_kbps, refresh = pw->refresh_mhz;
 		size_t packet = pw->packet_bytes > 0 ? (size_t)pw->packet_bytes : DEFAULT_PACKET;
-		unsigned stripes = pw->stripes;
+		unsigned stripes = pw->stripes, rotation = pw->rotation;
 		pthread_mutex_unlock(&pw->lock);
-		encode_one(pw, &job, bitrate, refresh, packet, stripes);
+		encode_one(pw, &job, bitrate, refresh, packet, stripes, rotation);
 		job_clear(&job);
 		pthread_mutex_lock(&pw->lock);
 	}
@@ -711,6 +722,7 @@ void rtenc_stop(struct gm_rtenc *pw) {
 	job_clear(&pw->pending);
 	pthread_mutex_unlock(&pw->lock);
 }
+	pw->rotation = 0; // until this client asks
 
 void rtenc_set_rate(struct gm_rtenc *pw, int bitrate_kbps, int refresh_mhz) {
 	pthread_mutex_lock(&pw->lock);
@@ -742,6 +754,12 @@ void rtenc_take_stats(struct gm_rtenc *pw, unsigned *encoded,
 	*dropped = pw->stats_dropped;
 	*encode_ns = pw->stats_encode_ns;
 	pw->stats_encoded = pw->stats_dropped = 0;
+void rtenc_set_rotation(struct gm_rtenc *pw, unsigned rotation) {
+	pthread_mutex_lock(&pw->lock);
+	pw->rotation = rotation;
+	pthread_mutex_unlock(&pw->lock);
+}
+
 	pw->stats_encode_ns = 0;
 	pthread_mutex_unlock(&pw->lock);
 }

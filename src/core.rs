@@ -154,6 +154,7 @@ unsafe extern "C" {
     fn gm_set_vrr_policy(policy: c_int);
     fn gm_set_bitrate(kbps: c_int);
     fn gm_set_parallelism(parts: c_uint);
+    fn gm_set_rotation(rotation: c_uint);
     fn gm_supported_codecs() -> u32;
     fn gm_pointer_motion(dx: f64, dy: f64);
     fn gm_pointer_position(x: f64, y: f64);
@@ -330,6 +331,11 @@ pub fn set_bitrate(kbps: u32) {
 pub fn set_parallelism(parts: u16) {
     unsafe { gm_set_parallelism(parts as c_uint) }
 }
+/// Riptide: quarter turns of the picture for the client's panel (0, 1 or 3).
+pub fn set_rotation(rotation: u8) {
+    unsafe { gm_set_rotation(rotation as c_uint) }
+}
+
 pub fn supported_codecs() -> u32 {
     unsafe { gm_supported_codecs() }
 }

@@ -1,6 +1,8 @@
 #include "presenter.h"
 
 #include <cerrno>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -52,166 +54,175 @@ static uint64_t signal_time(int fd, int wait_ms = 50)
 
 Presenter::~Presenter()
 {
-	set_front(nullptr, 0, 0);
+	set_ring({}, 0, 0, 0);
 	set_window(nullptr);
 }
 
-// ---- Scanout mode -------------------------------------------------------------
+// ---- Scanout ring -------------------------------------------------------------
 
-void Presenter::set_front(AHardwareBuffer *buf, int crop_w, int crop_h, int32_t transform)
+void Presenter::set_ring(std::vector<AHardwareBuffer *> bufs, int crop_w, int crop_h, int32_t transform)
 {
-	if (buf == front_buf_)
-		return;
-	if (front_thread_.joinable()) {
-		front_run_ = false;
-		if (front_looper_)
-			ALooper_wake(static_cast<ALooper *>(front_looper_));
-		front_thread_.join();
+	if (ring_thread_.joinable()) {
+		ring_run_ = false;
+		if (ring_looper_)
+			ALooper_wake(static_cast<ALooper *>(ring_looper_));
+		ring_thread_.join();
 	}
 	{
 		std::lock_guard<std::mutex> g(lock_);
-		front_buf_ = buf;
-		front_w_ = crop_w;
-		front_h_ = crop_h;
-		front_transform_ = transform;
-		for (auto &w : written_)
-			if (w.fence >= 0)
-				close(w.fence);
-		written_.clear();
-		presents_.clear();
+		ring_bufs_ = std::move(bufs);
+		ring_w_ = crop_w;
+		ring_h_ = crop_h;
+		ring_transform_ = transform;
+		ring_pending_.clear();
+		ring_offsets_.clear();
+		ring_offset_ = 0;
+		ring_slips_ = ring_lost_ = 0;
 		last_w_ = last_h_ = 0; // geometry again
+		ring_on_ = !ring_bufs_.empty();
 	}
-	if (!buf)
+	if (!ring_on_)
 		return;
-	front_run_ = true;
-	front_thread_ = std::thread([this] { front_loop(); });
-	LOGI("presenter: scanout mode (frames written into the buffer on screen)");
+	ring_run_ = true;
+	ring_thread_ = std::thread([this] { ring_loop(); });
+	LOGI("presenter: scanout ring of %zu buffers", ring_bufs_.size());
 }
 
 static thread_local AChoreographer *t_choreographer;
 
-static void on_vsync(const AChoreographerFrameCallbackData *, void *data)
+static void on_vsync(const AChoreographerFrameCallbackData *data, void *ctx)
 {
-	auto *p = static_cast<Presenter *>(data);
-	p->front_tick_public();
-	AChoreographer_postVsyncCallback(t_choreographer, on_vsync, data);
+	auto *p = static_cast<Presenter *>(ctx);
+	p->ring_tick(data);
+	AChoreographer_postVsyncCallback(t_choreographer, on_vsync, ctx);
 }
 
-void Presenter::front_loop()
+void Presenter::ring_loop()
 {
 	ALooper *l = ALooper_prepare(0);
-	front_looper_ = l;
+	ring_looper_ = l;
 	t_choreographer = AChoreographer_getInstance();
 	AChoreographer_postVsyncCallback(t_choreographer, on_vsync, this);
-	while (front_run_)
+	while (ring_run_)
 		ALooper_pollOnce(100, nullptr, nullptr, nullptr);
-	front_looper_ = nullptr;
+	ring_looper_ = nullptr;
 }
 
-static void on_front_complete(void *ctx, ASurfaceTransactionStats *stats)
+struct RingCtx {
+	Presenter *p;
+	uint64_t seq;
+};
+
+static void on_ring_complete(void *ctx, ASurfaceTransactionStats *stats)
 {
-	static_cast<Presenter *>(ctx)->front_complete(stats);
+	auto *c = static_cast<RingCtx *>(ctx);
+	c->p->ring_complete(c->seq, stats);
+	delete c;
 }
 
-// Every refresh: the same buffer again, all of it damaged, so the panel is
-// sent what the buffer holds at that refresh.
-void Presenter::front_tick()
+// Every refresh: the next buffer of the ring, for the frame timeline
+// SurfaceFlinger prefers (it latches it in time for that timeline's present).
+// The buffer's content is not there yet: the compositor writes it just
+// before its transfer, long after the latch.
+void Presenter::ring_tick(const AChoreographerFrameCallbackData *data)
 {
 	std::lock_guard<std::mutex> g(lock_);
-	if (!sc_ || !front_buf_ || !front_run_)
+	if (!sc_ || ring_bufs_.empty() || !ring_run_)
 		return;
+	size_t i = AChoreographerFrameCallbackData_getPreferredFrameTimelineIndex(data);
+	AVsyncId vsync = AChoreographerFrameCallbackData_getFrameTimelineVsyncId(data, i);
+	int64_t expected = AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos(data, i);
 	ASurfaceTransaction *txn = ASurfaceTransaction_create();
 	int vw = ANativeWindow_getWidth(parent_), vh = ANativeWindow_getHeight(parent_);
-	if (front_w_ != last_w_ || front_h_ != last_h_ || vw != view_w_ || vh != view_h_ ||
-	    front_transform_ != last_transform_) {
-		ASurfaceTransaction_setBufferTransform(txn, sc_, front_transform_);
-		last_transform_ = front_transform_;
-		ARect crop{0, 0, front_w_, front_h_};
+	if (ring_w_ != last_w_ || ring_h_ != last_h_ || vw != view_w_ || vh != view_h_) {
+		ASurfaceTransaction_setBufferTransform(txn, sc_, ring_transform_);
+		last_transform_ = ring_transform_;
+		ARect crop{0, 0, ring_w_, ring_h_};
 		ASurfaceTransaction_setCrop(txn, sc_, crop);
 		ASurfaceTransaction_setPosition(txn, sc_, 0, 0);
-		ASurfaceTransaction_setScale(txn, sc_, float(vw) / float(front_w_), float(vh) / float(front_h_));
+		ASurfaceTransaction_setScale(txn, sc_, float(vw) / float(ring_w_), float(vh) / float(ring_h_));
 		ASurfaceTransaction_setVisibility(txn, sc_, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
 		ASurfaceTransaction_setBufferTransparency(txn, sc_, ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
 		ASurfaceTransaction_setBufferDataSpace(txn, sc_, ADATASPACE_SRGB);
-		last_w_ = front_w_;
-		last_h_ = front_h_;
+		last_dataspace_ = ADATASPACE_SRGB;
+		last_w_ = ring_w_;
+		last_h_ = ring_h_;
 		view_w_ = vw;
 		view_h_ = vh;
 	}
-	ASurfaceTransaction_setBuffer(txn, sc_, front_buf_, -1);
-	ARect all{0, 0, front_w_, front_h_};
-	ASurfaceTransaction_setDamageRegion(txn, sc_, &all, 1);
-	ASurfaceTransaction_setOnComplete(txn, this, on_front_complete);
+	uint64_t seq = ++ring_seq_;
+	int b = int(seq % ring_bufs_.size());
+	ASurfaceTransaction_setBuffer(txn, sc_, ring_bufs_[size_t(b)], -1);
+	ASurfaceTransaction_setFrameTimeline(txn, vsync);
+	ASurfaceTransaction_setOnComplete(txn, new RingCtx{this, seq}, on_ring_complete);
 	ASurfaceTransaction_apply(txn);
 	ASurfaceTransaction_delete(txn);
+	ring_pending_.push_back({{seq, b, uint64_t(double(expected) + ring_offset_)}, uint64_t(expected)});
+	while (ring_pending_.size() > 8)
+		ring_pending_.pop_front(); // never completed
 }
 
-void Presenter::front_written(FrameTiming t, int fence)
+std::vector<Presenter::Commit> Presenter::upcoming()
 {
 	std::lock_guard<std::mutex> g(lock_);
-	t.submitted = now_ns();
-	written_.push_back({t, fence, 0});
-	while (written_.size() > 16) {
-		if (written_.front().fence >= 0)
-			close(written_.front().fence);
-		written_.pop_front();
-	}
+	std::vector<Commit> out;
+	for (auto &p : ring_pending_)
+		out.push_back({p.c.seq, p.c.buffer, uint64_t(double(p.expected) + ring_offset_)});
+	return out;
 }
 
-// A refresh the buffer was sent at: each frame written before it (and not
-// overwritten by the next before it) was shown at it.
-void Presenter::front_complete(ASurfaceTransactionStats *stats)
+void Presenter::ring_complete(uint64_t seq, ASurfaceTransactionStats *stats)
 {
 	int present_fd = ASurfaceTransactionStats_getPresentFenceFd(stats);
 	uint64_t present = signal_time(present_fd);
 	if (present_fd >= 0)
 		close(present_fd);
-	std::vector<std::pair<FrameTiming, bool>> out;
+	int buffer = -1;
 	{
 		std::lock_guard<std::mutex> g(lock_);
 		if (sc_) {
 			int rel = ASurfaceTransactionStats_getPreviousReleaseFenceFd(stats, sc_);
 			if (rel >= 0)
-				close(rel);
+				close(rel); // nothing waits on these: the compositor works to the schedule
 		}
-		if (!present)
-			return;
-		presents_.push_back(present);
-		while (presents_.size() > 8)
-			presents_.pop_front();
-		for (auto &w : written_)
-			if (!w.done && w.fence >= 0) {
-				w.done = signal_time(w.fence, 0);
-				if (w.done) {
-					close(w.fence);
-					w.fence = -1;
+		for (auto it = ring_pending_.begin(); it != ring_pending_.end(); ++it) {
+			if (it->c.seq != seq)
+				continue;
+			buffer = it->c.buffer;
+			if (present) {
+				// The timeline's expected present against the present fence
+				// (the transfer's start): a fixed offset, measured.
+				double off = double(int64_t(present - it->expected));
+				double period = schedule_.period_ns;
+				if (ring_offsets_.size() >= 8 && std::fabs(off - ring_offset_) > period / 2)
+					ring_slips_++; // shown a refresh away from the one it was committed for
+				else {
+					ring_offsets_.push_back(off);
+					if (ring_offsets_.size() > 240)
+						ring_offsets_.erase(ring_offsets_.begin());
+					std::vector<double> s = ring_offsets_;
+					std::nth_element(s.begin(), s.begin() + long(s.size() / 2), s.end());
+					ring_offset_ = s[s.size() / 2];
 				}
+			} else {
+				ring_lost_++;
 			}
-		while (!written_.empty() && written_.front().done) {
-			Written &a = written_.front();
-			uint64_t shown_at = 0;
-			for (uint64_t p : presents_)
-				if (p > a.done) {
-					shown_at = p;
-					break;
-				}
-			if (!shown_at)
-				break; // not sent yet
-			bool overwritten = written_.size() > 1 && written_[1].done && written_[1].done < shown_at;
-			if (written_.size() > 1 && !written_[1].done)
-				break; // the next one may still beat this refresh
-			a.t.decoded = a.t.decoded ? a.t.decoded : a.done;
-			a.t.presented = overwritten ? 0 : shown_at;
-			out.emplace_back(a.t, !overwritten);
-			written_.pop_front();
+			ring_pending_.erase(it);
+			break;
 		}
 	}
-	for (auto &[t, shown] : out) {
-		if (shown && on_presented)
-			on_presented(t);
-		else if (!shown && on_dropped)
-			on_dropped(t);
-	}
+	if (buffer >= 0 && on_ring_presented)
+		on_ring_presented(seq, buffer, present);
+}
+
+std::string Presenter::ring_summary()
+{
+	std::lock_guard<std::mutex> g(lock_);
+	char b[160];
+	snprintf(b, sizeof(b), "ring: %zu buffers, present = timeline %+.2f ms, slipped %d, lost %d",
+	         ring_bufs_.size(), ring_offset_ / 1e6, ring_slips_, ring_lost_);
+	ring_slips_ = ring_lost_ = 0;
+	return b;
 }
 
 void Presenter::set_window(ANativeWindow *parent)

@@ -19,6 +19,9 @@ public:
 	void restart(double refresh_hz = 0);
 	void presented(const FrameTiming &t);
 	void dropped(const FrameTiming &t);
+	// Streamed frames (compositor.h): how much earlier than needed each was
+	// ready (negative: torn). With these the lock steers on them directly.
+	void slack(double ns);
 	// Every half second: the grid to send (a recent refresh, ours, shifted; and
 	// the interval), false until a frame has been shown.
 	bool step(uint64_t &anchor, uint64_t &interval);
@@ -53,6 +56,8 @@ private:
 	std::vector<double> bin_all_, bin_dropped_;
 	std::vector<double> recent_;
 	double margin_ = 3e6;
+	std::vector<double> slack_; // this step's streamed frames
+	int slack_steps_ = 0;
 	int drops_ = 0;
 };
 

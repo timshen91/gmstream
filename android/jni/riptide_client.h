@@ -37,8 +37,9 @@ public:
 	void reset();
 	void skip_one();
 	void set_keep_gpu_awake(bool on);
-	// Scanout mode (Presenter::set_front): frames written into the buffer on screen.
-	void set_scanout(bool on);
+	// The GPU (shared with the compositor), and the compositor: while it runs,
+	// frames go to it (scanout mode) instead of through SurfaceFlinger.
+	void set_compositor(class Compositor *c, struct Gpu *g);
 	// The display's rotation (Surface.ROTATION_*): output is drawn in the panel's own orientation.
 	void set_rotation(int r);
 	std::string summary();

@@ -28,7 +28,8 @@ namespace msg {
 // Client -> host.
 constexpr uint8_t hello = 0x01, configure = 0x02, keyframe = 0x03, bitrate = 0x04, key = 0x05, button = 0x06,
                   motion = 0x07, position = 0x08, scroll = 0x09, gamepad = 0x0a, gamepad_remove = 0x0b, ping = 0x0c,
-                  display_grid = 0x0d, vrr_policy = 0x0e, touch = 0x0f, auth = 0x10, parallelism = 0x11;
+                  display_grid = 0x0d, vrr_policy = 0x0e, touch = 0x0f, auth = 0x10, parallelism = 0x11,
+                  rotation = 0x12;
 // Host -> client.
 constexpr uint8_t hello_ack = 0x81, cursor = 0x82, relative = 0x83, rumble = 0x84, pong = 0x85, error = 0x86,
                   cursor_clip = 0x87, encode_format = 0x88;

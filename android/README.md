@@ -34,7 +34,8 @@ For scripts, the launch intent takes the settings and saves them:
 --es size WxH --ei stripes N --ei parallelism N --ez pieces true|false
 --ez scanout true|false`. Debug switches: `adb shell setprop
 debug.gmstream.phase 1` (the phase lock's decisions to logcat),
-`debug.gmstream.trace 1` (Riptide's first steps), `debug.gmstream.planes 1`
+`debug.gmstream.trace 1` (Riptide's first steps), `debug.gmstream.stream 1`
+(each streamed frame's claim and slack), `debug.gmstream.planes 1`
 or `debug.gmstream.red 1` (Riptide's output pass shows the raw planes, or a
 clear).
 `--ez overLock true` (testing from adb) shows this window over the lock screen.
@@ -73,19 +74,21 @@ clear).
   period more): the lock sees each frame as presented at its latch point plus a
   period (`Session::to_latch_grid`), so it steers frames to arrive just before
   a latch. Frames waiting for the latch: 4.6 -> 2.5 ms p50.
-- **Scanout mode** (Riptide, experimental, "write frames into the buffer on
-  screen"): one front buffer (`AHARDWAREBUFFER_USAGE_FRONT_BUFFER`) stays on
-  a display plane, a commit goes in every refresh so the command-mode panel is
-  sent the buffer at each refresh, and each frame is written into it in place;
-  it goes out with the first transfer that starts after it is written, without
-  SurfaceFlinger's 10.3 ms. The phase lock aims at the transfer's start.
-- **On a display plane, never composited**: Riptide draws its RGB already
-  turned to the panel's portrait orientation and tags the buffer with the
-  inverse turn, so the display engine scans it out unrotated (it rotates only
-  compressed buffers: an RGB buffer it has to rotate is composited by the GPU,
-  every frame, which also breaks scanout mode). RGB buffers are tagged sRGB,
-  the decoder's YUV BT.709. `dumpsys SurfaceFlinger --hwclayers` shows the
-  layer as DEVICE with no transform.
+- **Scanout mode** (the default; `jni/compositor.h`): frames go into the
+  buffer the panel reads next, on the panel's own schedule (`jni/panel.h`),
+  not through SurfaceFlinger's latch. Three RGBA buffers in the panel's
+  portrait orientation are committed one per refresh (each a latch ahead,
+  with no fence) and written just before they are read; SurfaceFlinger keeps
+  them on a display plane (`dumpsys SurfaceFlinger --hwclayers`: DEVICE, no
+  transform). Whole frames (the MediaCodec codecs: the decoder's buffer
+  sampled through its YCbCr conversion) are composed by a compute pass at a
+  sample point just before each refresh's prefetch. Riptide frames are
+  **streamed**: the host encodes the picture turned to the panel (the
+  `Rotation` message), so each stripe is a band of the panel's scan lines,
+  and each stripe is written into the buffer as soon as it is decoded, ahead
+  of the scan reaching its rows; the decode of all but the first stripe runs
+  inside the scan. Tears (a stripe or compose that ended after the scan
+  fetched its rows) are counted with their row and steer the phase lock.
 - **When the panel reads a buffer** (Qualcomm's display driver for this chip,
   `sde_encoder_phys_cmd.c`, command mode): the present fence is signalled by
   the write-pointer interrupt, the start of the transfer to the panel; the
@@ -111,15 +114,30 @@ clear).
   gaps and audio.
 
 Not here: PyroWave (codec 3; no Android decoder built), HDR, cursor
-confinement to the game's clip, a client-drawn cursor, scanout mode for the
-MediaCodec codecs (it needs the decoder's YUV buffers sampled into the front
-buffer by the GPU).
+confinement to the game's clip, a client-drawn cursor, streaming for the
+MediaCodec codecs (MediaCodec hands out whole frames: ROOT.md item 4).
 
 What root would add, and the independent root service to hold it: ROOT.md.
 
-## Measured (2026-11-06, Odin 3 over the router to the host's wired port, vkcube 1920x1080)
+## Measured (2026-11-07, scanout mode; same setup as below, vkcube at 120 fps)
 
-| p50 / p99, ms | AV1 40 Mb/s, phase lock | AV1, low latency | Riptide 100 Mb/s, phase lock | Riptide, scanout mode |
+| p50 / p99, ms | AV1, whole frames | Riptide 100 Mb/s, streamed |
+|---|---|---|
+| host present -> transfer starts | 8.2 / 8.7 | **5.9 / 6.5** |
+| of it: ready -> its sample point / prefetch | 2.9 | slack 1.6 p50 |
+| compose (sample point -> done) | 0.7 | stripe 0: 1.05 from handed in |
+
+Streamed, the last stripe is typically done as the transfer starts, and a row r
+leaves for the panel at the transfer's start + r x 4.0 us. What is not hidden
+is stripe 0's own path: its encode, network and decode (128 rows, Riptide's
+smallest stripe) and the margin the phase lock keeps. In a game on the live
+session, AV1's frames waited a whole refresh for their sample point (a phase
+lock issue on the whole-frame path, open); streamed frames are steered on
+their own slack and do not.
+
+## Measured (2026-11-06, through SurfaceFlinger; Odin 3 over the router to the host's wired port, vkcube 1920x1080)
+
+| p50 / p99, ms | AV1 40 Mb/s, phase lock | AV1, low latency | Riptide 100 Mb/s, phase lock | Riptide, one front buffer (superseded: it tore) |
 |---|---|---|---|---|
 | network | 2.5 / 3.5 | 2.7 / 3.5 | 3.4 / 4.2 | 2.2 / 3.2 |
 | decode | 0.5 / 0.8 | 0.5 / 0.8 | 4.2 / 5.2 (first stripe -> GPU done) | 4.2 / 5.1 |

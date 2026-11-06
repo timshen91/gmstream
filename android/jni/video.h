@@ -18,6 +18,7 @@
 #include <media/NdkMediaCodec.h>
 
 #include "conn.h"
+#include "compositor.h"
 #include "presenter.h"
 #include "timing.h"
 
@@ -27,7 +28,7 @@ class VideoDecoder {
 public:
 	std::function<void(int, int)> on_size; // the stream picture's size
 
-	explicit VideoDecoder(Presenter &p) : presenter_(p) {}
+	VideoDecoder(Presenter &p, Compositor &c) : presenter_(p), compositor_(c) {}
 	~VideoDecoder();
 	// Whether there is a surface to show frames on (frames are skipped until there is).
 	void set_enabled(bool on);
@@ -45,6 +46,7 @@ private:
 	void drain();
 
 	Presenter &presenter_;
+	Compositor &compositor_; // scanout mode, while it runs
 	std::mutex lock_;
 	bool enabled_ = false;
 	AMediaCodec *codec_ = nullptr;

@@ -1,0 +1,18 @@
+#version 450
+// Scanout compositor: the video decoder's picture (sampled through its own
+// YCbCr conversion, so it comes out RGB), cropped to the stream's picture,
+// written into the buffer the panel reads next in the panel's orientation.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D picture;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 size; ivec2 origin; vec2 scale; int rotation; } p;
+
+void main()
+{
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy) + p.origin;
+	if (px.x >= p.size.x || px.y >= p.size.y)
+		return;
+	vec2 q = (vec2(px) + 0.5) / vec2(p.size);
+	vec2 uv = p.rotation == 1 ? vec2(q.y, 1.0 - q.x) : p.rotation == 3 ? vec2(1.0 - q.y, q.x) : q;
+	imageStore(dst, px, vec4(textureLod(picture, uv * p.scale, 0.0).rgb, 1.0));
+}
