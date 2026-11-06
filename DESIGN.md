@@ -577,6 +577,30 @@ Touch on Steam's UI tried by hand (2026-10-29): works. PyroWave at
 300 Mb/s ran at 120 fps. Not yet tried: a mouse or trackpad (pointer lock
 and GCMouse's motion sign), the keyboard.
 
+### 3.9 Native Android client (`android/`)
+
+Built for the AYN Odin 3 (Adreno 830, a 1080x1920 120 Hz panel, Android 15),
+any arm64 Android 13+ device; no root, no Gradle (`android/build.sh`).
+`android/README.md` is the full account; the shape:
+
+- A portable C++ core (`android/jni/conn.cpp`, `crypto.cpp`): the plain-UDP
+  protocol as `apple/Connection.swift` speaks it, tested on the build machine
+  (`android/tests/run.sh`, and `probe`, a headless client from the same core).
+- H.264, HEVC and AV1 through MediaCodec (Qualcomm's `.low_latency`
+  decoders), into an AImageReader; Riptide through the host's own Vulkan
+  decoder (`riptide/`, cross-compiled with Granite), stripe by stripe, into
+  AHardwareBuffers. Both go to the screen through a SurfaceControl of our own,
+  one transaction per frame, so each frame's present fence says when it was
+  on screen; the phase lock (a port of `apple/Phase.swift`) runs on those.
+- Java only for the window, the settings and the input devices.
+
+Measured on the Odin 3 (vkcube, 1920x1080, router to the host's wired port):
+AV1 decode 0.5 ms p50 and host present -> on screen 16.9 ms p50, of which
+13 ms is SurfaceFlinger's (it latches 10.33 ms before the refresh it shows a
+buffer at); Riptide 20.5 ms, its decode 4.5 ms on Adreno's compute path
+(inter frames cannot use PyroWave's fragment path), 7.6 before the GPU was
+kept awake.
+
 ## 4. gamescope facts this design depends on
 
 Verified by reading gamescope's source (`src/Backends/WaylandBackend.cpp`,

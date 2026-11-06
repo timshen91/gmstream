@@ -1,0 +1,15 @@
+#version 450
+// Keeps the GPU's clock up: a little arithmetic, back to back, at low priority
+// (apple/GPUWarm.swift, core/gpuwarm.c). The store never happens; it keeps the
+// loop from being optimised away.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Sink { float v[]; } sink;
+layout(push_constant) uniform P { float seed; } p;
+void main()
+{
+	float x = p.seed + float(gl_GlobalInvocationID.x);
+	for (int i = 0; i < 100; i++)
+		x = x * 1.0001 + 0.5;
+	if (x == 12345.678)
+		sink.v[gl_GlobalInvocationID.x] = x;
+}
