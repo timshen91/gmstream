@@ -9,6 +9,9 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <sys/system_properties.h>
+#include <algorithm>
+#include <thread>
 
 #include <android/choreographer.h>
 #include <android/looper.h>
@@ -17,6 +20,12 @@
 #include "log.h"
 
 namespace gm {
+
+static bool debug_fences()
+{
+	char v[PROP_VALUE_MAX] = {};
+	return __system_property_get("debug.gmstream.fences", v) > 0 && v[0] == '1';
+}
 
 // When a fence signalled (CLOCK_MONOTONIC ns), waiting up to 50 ms for it; 0
 // if it never did.
@@ -49,7 +58,7 @@ Presenter::~Presenter()
 
 // ---- Scanout mode -------------------------------------------------------------
 
-void Presenter::set_front(AHardwareBuffer *buf, int crop_w, int crop_h)
+void Presenter::set_front(AHardwareBuffer *buf, int crop_w, int crop_h, int32_t transform)
 {
 	if (buf == front_buf_)
 		return;
@@ -64,6 +73,7 @@ void Presenter::set_front(AHardwareBuffer *buf, int crop_w, int crop_h)
 		front_buf_ = buf;
 		front_w_ = crop_w;
 		front_h_ = crop_h;
+		front_transform_ = transform;
 		for (auto &w : written_)
 			if (w.fence >= 0)
 				close(w.fence);
@@ -112,7 +122,10 @@ void Presenter::front_tick()
 		return;
 	ASurfaceTransaction *txn = ASurfaceTransaction_create();
 	int vw = ANativeWindow_getWidth(parent_), vh = ANativeWindow_getHeight(parent_);
-	if (front_w_ != last_w_ || front_h_ != last_h_ || vw != view_w_ || vh != view_h_) {
+	if (front_w_ != last_w_ || front_h_ != last_h_ || vw != view_w_ || vh != view_h_ ||
+	    front_transform_ != last_transform_) {
+		ASurfaceTransaction_setBufferTransform(txn, sc_, front_transform_);
+		last_transform_ = front_transform_;
 		ARect crop{0, 0, front_w_, front_h_};
 		ASurfaceTransaction_setCrop(txn, sc_, crop);
 		ASurfaceTransaction_setPosition(txn, sc_, 0, 0);
@@ -245,7 +258,7 @@ static void on_complete(void *ctx, ASurfaceTransactionStats *stats)
 }
 
 void Presenter::present(AHardwareBuffer *buf, int fence, int crop_w, int crop_h, FrameTiming t,
-                        std::function<void(int)> release)
+                        std::function<void(int)> release, int32_t dataspace, int32_t transform)
 {
 	std::unique_lock<std::mutex> g(lock_);
 	if (!sc_ || skip_) {
@@ -260,7 +273,14 @@ void Presenter::present(AHardwareBuffer *buf, int fence, int crop_w, int crop_h,
 	}
 	ASurfaceTransaction *txn = ASurfaceTransaction_create();
 	int vw = ANativeWindow_getWidth(parent_), vh = ANativeWindow_getHeight(parent_);
-	if (crop_w != last_w_ || crop_h != last_h_ || vw != view_w_ || vh != view_h_) {
+	if (crop_w != last_w_ || crop_h != last_h_ || vw != view_w_ || vh != view_h_ || dataspace != last_dataspace_ ||
+	    transform != last_transform_) {
+		// A buffer drawn in the panel's own orientation says so, and the
+		// display then scans it out without rotating it (Qualcomm's display
+		// engine rotates only compressed buffers; anything else costs a GPU
+		// composite every frame).
+		ASurfaceTransaction_setBufferTransform(txn, sc_, transform);
+		last_transform_ = transform;
 		// The picture's own rows only (the decoder's buffer may carry padding),
 		// scaled to fill the view (Java letterboxes the view to the stream).
 		ARect crop{0, 0, crop_w, crop_h};
@@ -269,7 +289,11 @@ void Presenter::present(AHardwareBuffer *buf, int fence, int crop_w, int crop_h,
 		ASurfaceTransaction_setScale(txn, sc_, float(vw) / float(crop_w), float(vh) / float(crop_h));
 		ASurfaceTransaction_setVisibility(txn, sc_, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
 		ASurfaceTransaction_setBufferTransparency(txn, sc_, ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
-		ASurfaceTransaction_setBufferDataSpace(txn, sc_, ADATASPACE_BT709);
+		// What the buffer holds: YUV from the video decoder (BT.709), or RGB
+		// (sRGB). An RGB buffer tagged as video can't go on a display plane
+		// and costs a GPU composite every frame.
+		ASurfaceTransaction_setBufferDataSpace(txn, sc_, ADataSpace(dataspace));
+		last_dataspace_ = dataspace;
 		last_w_ = crop_w;
 		last_h_ = crop_h;
 		view_w_ = vw;
@@ -325,6 +349,27 @@ void Presenter::complete(uint64_t seq, ASurfaceTransactionStats *stats)
 				f.release = nullptr;
 			}
 		}
+	}
+	if (debug_fences() && release_fd >= 0 && present) {
+		// Measuring: when the display stopped reading the buffer this one
+		// replaced, against this one's present fence (the question being
+		// whether the present fence is the start or the end of the push).
+		int dupfd = dup(release_fd);
+		std::thread([dupfd, present] {
+			uint64_t rel = signal_time(dupfd, 40);
+			close(dupfd);
+			static std::mutex m;
+			static std::vector<double> v;
+			std::lock_guard<std::mutex> g(m);
+			if (rel)
+				v.push_back((double(int64_t(rel) - int64_t(present))) / 1e6);
+			if (v.size() >= 120) {
+				std::sort(v.begin(), v.end());
+				LOGI("fences: previous buffer released at present %+.3f ms p1, %+.3f p50, %+.3f p99 (n %zu)",
+				     v[v.size() / 100], v[v.size() / 2], v[v.size() * 99 / 100], v.size());
+				v.clear();
+			}
+		}).detach();
 	}
 	if (release)
 		release(release_fd);

@@ -594,17 +594,22 @@ any arm64 Android 13+ device; no root, no Gradle (`android/build.sh`).
   on screen; the phase lock (a port of `apple/Phase.swift`) runs on those.
 - Java only for the window, the settings and the input devices.
 
-Measured on the Odin 3 (vkcube, 1920x1080, router to the host's wired port):
-AV1 decode 0.5 ms p50 and host present -> on screen 16.3 ms p50, of which
-10.2 ms is SurfaceFlinger's (it latches 10.33 ms before the refresh it shows a
-buffer at) and 2.5 ms the margin before its latch, which the phase lock aims
-at (`Session::to_latch_grid`; aimed at the refresh, as on macOS, frames
-waited 4.6 ms). Riptide 19.9 ms, its decode 4.4 ms on Adreno's compute path
-(inter frames cannot use PyroWave's fragment path), 7.6 before the GPU was
-kept awake. Riptide's experimental scanout mode writes each frame into a front
-buffer kept on the display plane, committed every refresh, and skips the latch:
-9.5 ms p50 total (not yet checked by eye for tearing). What root would add, and
-the root service to hold it: `android/ROOT.md`.
+Measured on the Odin 3 (vkcube, 1920x1080, router to the host's wired port),
+host present -> the panel transfer starts, p50: AV1 16.3 ms (decode 0.5), of
+which 10.2 ms is SurfaceFlinger's (it latches 10.33 ms before the refresh it
+shows a buffer at) and 2.5 ms the margin before its latch, which the phase lock
+aims at (`Session::to_latch_grid`; aimed at the refresh, as on macOS, frames
+waited 4.6). Riptide 17.7 ms, its decode 4.2 ms on Adreno's compute path
+(inter frames cannot use PyroWave's fragment path; 7.6 before the GPU was kept
+awake). Riptide's scanout mode writes each frame into a front buffer kept on a
+display plane and committed every refresh, skipping the latch: **6.9 ms p50,
+7.1 p99**. It needs the buffer drawn in the panel's portrait orientation (the
+display engine rotates only compressed buffers; otherwise SurfaceFlinger
+composites on the GPU and the mode does nothing). On this chip's command-mode
+panel the present fence is the start of the transfer to the panel and the
+transfer takes ~7.7 ms of the period (Qualcomm's driver source, and release
+fences measured 0.62 ms before the next present). What root would add, and the
+root service to hold it: `android/ROOT.md`.
 
 ## 4. gamescope facts this design depends on
 

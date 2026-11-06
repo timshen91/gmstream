@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include <android/hardware_buffer.h>
+#include <android/data_space.h>
 #include <media/NdkMediaFormat.h>
 #include <unistd.h>
 
@@ -286,7 +287,7 @@ void VideoDecoder::image_available(AImageReader *r)
 			AImage_deleteAsync(img, release);
 		else if (release >= 0)
 			close(release);
-	});
+	}, ADATASPACE_BT709);
 }
 
 std::string VideoDecoder::summary()

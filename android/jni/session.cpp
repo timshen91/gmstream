@@ -41,6 +41,7 @@ struct Options {
 	int parallelism = 0, stripes = 0;
 	bool keep_awake = true, keep_gpu_awake = true;
 	int pacing = 0; // 0 auto (phase lock), 1 low latency
+	int rotation = 0; // the display's (Surface.ROTATION_*)
 	bool scanout = false; // Riptide: frames written into the buffer on screen (experimental)
 };
 
@@ -261,6 +262,10 @@ private:
 	// minus the median latch -> present time.
 	FrameTiming to_latch_grid(FrameTiming t)
 	{
+		// A frame is ready when its pixels are, not when the CPU handed it
+		// over: Riptide's last stripe and RGB pass are still on the GPU then.
+		if (t.decoded > t.submitted)
+			t.submitted = t.decoded;
 		std::lock_guard<std::mutex> g(pipe_lock_);
 		if (presenter_.front())
 			return t;
@@ -371,6 +376,7 @@ void Session::connect()
 	}
 	riptide_.set_keep_gpu_awake(opt_.keep_gpu_awake);
 	riptide_.set_scanout(opt_.scanout);
+	riptide_.set_rotation(opt_.rotation);
 	if (!opt_.scanout)
 		presenter_.set_front(nullptr, 0, 0);
 	riptide_.reset();
@@ -567,7 +573,7 @@ FN(void, forgetHosts)(JNIEnv *, jclass, jlong h) { S(h)->identity().forget_hosts
 
 FN(void, start)(JNIEnv *env, jclass, jlong h, jstring host, jint port, jint codec, jint mbps, jint w, jint hgt,
                 jdouble hz, jboolean pieces, jint parallelism, jint stripes, jboolean awake, jboolean gpu_awake,
-                jint pacing, jboolean scanout)
+                jint pacing, jboolean scanout, jint rotation)
 {
 	gm::Options o;
 	o.host = str(env, host);
@@ -584,6 +590,7 @@ FN(void, start)(JNIEnv *env, jclass, jlong h, jstring host, jint port, jint code
 	o.keep_gpu_awake = gpu_awake;
 	o.pacing = pacing;
 	o.scanout = scanout;
+	o.rotation = rotation;
 	S(h)->start(o);
 }
 

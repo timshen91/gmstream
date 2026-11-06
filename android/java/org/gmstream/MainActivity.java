@@ -61,6 +61,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
     private int streamW = 16, streamH = 9;
     private boolean streaming;
     private String startedWith = "";
+    private int startedRotation;
     private boolean relative;
     private final int[] touchIds = new int[32]; // pointer id -> protocol touch id + 1 (0: none)
 
@@ -211,7 +212,8 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         double hz = prefs.refresh > 0 ? prefs.refresh : getDisplay().getRefreshRate();
         Native.start(h, prefs.host.trim(), prefs.port, prefs.codec, prefs.mbps, size[0], size[1], hz,
             prefs.streamFrames, prefs.parallelism, prefs.stripes, prefs.keepWiFiAwake, prefs.keepGPUAwake, prefs.pacing,
-            prefs.scanout);
+            prefs.scanout, getDisplay().getRotation());
+        startedRotation = getDisplay().getRotation();
         if (prefs.keepWiFiAwake) wifiLock.acquire();
         streaming = true;
         startedWith = prefs.connectionKey();
@@ -503,6 +505,11 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
     public void onConfigurationChanged(android.content.res.Configuration c) {
         super.onConfigurationChanged(c);
         root.post(this::layoutVideo);
+        // Turned the other way up: the output is drawn for the panel's orientation.
+        if (streaming && getDisplay().getRotation() != startedRotation) {
+            stopStream();
+            startStream();
+        }
     }
 
     // ---- Settings -------------------------------------------------------------------------

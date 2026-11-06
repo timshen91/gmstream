@@ -39,6 +39,8 @@ public:
 	void set_keep_gpu_awake(bool on);
 	// Scanout mode (Presenter::set_front): frames written into the buffer on screen.
 	void set_scanout(bool on);
+	// The display's rotation (Surface.ROTATION_*): output is drawn in the panel's own orientation.
+	void set_rotation(int r);
 	std::string summary();
 
 	struct Impl;

@@ -75,12 +75,25 @@ clear).
   a latch. Frames waiting for the latch: 4.6 -> 2.5 ms p50.
 - **Scanout mode** (Riptide, experimental, "write frames into the buffer on
   screen"): one front buffer (`AHARDWAREBUFFER_USAGE_FRONT_BUFFER`) stays on
-  the display plane, a commit goes in every refresh so the command-mode panel
-  is sent the buffer at each refresh, and each frame is written into it in
-  place; it is shown at the first refresh after it is written, without
-  SurfaceFlinger's 10.3 ms. The phase lock then aims at the refresh itself.
-  It may tear if a write overlaps the transfer to the panel; whether frames
-  reach the panel as measured has not been checked by eye or camera.
+  a display plane, a commit goes in every refresh so the command-mode panel is
+  sent the buffer at each refresh, and each frame is written into it in place;
+  it goes out with the first transfer that starts after it is written, without
+  SurfaceFlinger's 10.3 ms. The phase lock aims at the transfer's start.
+- **On a display plane, never composited**: Riptide draws its RGB already
+  turned to the panel's portrait orientation and tags the buffer with the
+  inverse turn, so the display engine scans it out unrotated (it rotates only
+  compressed buffers: an RGB buffer it has to rotate is composited by the GPU,
+  every frame, which also breaks scanout mode). RGB buffers are tagged sRGB,
+  the decoder's YUV BT.709. `dumpsys SurfaceFlinger --hwclayers` shows the
+  layer as DEVICE with no transform.
+- **When the panel reads a buffer** (Qualcomm's display driver for this chip,
+  `sde_encoder_phys_cmd.c`, command mode): the present fence is signalled by
+  the write-pointer interrupt, the start of the transfer to the panel; the
+  release fence at the transfer's end (`pp_done`). Measured: the previous
+  buffer is released 0.62-0.63 ms before the next present, every frame, so a
+  transfer takes ~7.7 ms of the 8.33 ms period and reads the buffer row by row
+  (in the panel's order: across the landscape picture) from the present fence
+  on. "On screen" in the stats is that start.
 - **Audio**: Opus through the platform's decoder (MediaCodec) into AAudio
   (low latency, exclusive), with the Apple clients' jitter buffer.
 - **Wi-Fi**: "Keep Wi-Fi awake" holds Android's low-latency Wi-Fi lock
@@ -108,16 +121,19 @@ What root would add, and the independent root service to hold it: ROOT.md.
 
 | p50 / p99, ms | AV1 40 Mb/s, phase lock | AV1, low latency | Riptide 100 Mb/s, phase lock | Riptide, scanout mode |
 |---|---|---|---|---|
-| network | 2.5 / 3.5 | 2.7 / 3.5 | 2.3 / 3.1 | 2.4 / 3.7 |
-| decode | 0.5 / 0.8 | 0.5 / 0.8 | 4.4 / 5.3 (first stripe -> GPU done) | 4.2 / 5.2 |
-| to latch | 2.5 / 3.0 | | (from the CPU's submit) | - |
-| latch -> on screen | 10.2 / 10.3 | | 10.2 / 10.3 | - |
-| display (handed over -> on screen) | 12.7 / 13.2 | 13.7 / 19.3 | 16.8 / 18.0 | 6.3 / 8.0 |
-| total (host present -> on screen) | 16.3 / 26 | 17.1 / 22.7 | 19.9 / 21.0 | 9.5 / 11.2 |
+| network | 2.5 / 3.5 | 2.7 / 3.5 | 3.4 / 4.2 | 2.2 / 3.2 |
+| decode | 0.5 / 0.8 | 0.5 / 0.8 | 4.2 / 5.2 (first stripe -> GPU done) | 4.2 / 5.1 |
+| to latch | 2.5 / 3.0 | | 3.3 / 3.7 (from the CPU's submit) | - |
+| latch -> transfer starts | 10.2 / 10.3 | | 10.2 / 10.3 | - |
+| display (handed over -> transfer starts) | 12.7 / 13.2 | 13.7 / 19.3 | 13.5 / 13.9 | 3.9 / 4.1 |
+| total (host present -> transfer starts) | 16.3 / 26 | 17.1 / 22.7 | 17.7 / 17.8 | **6.9 / 7.1** |
 
 (The test host ran vkcube at 60 fps in a nested gamescope; the AV1 p99 total
-includes its encode spikes. The first AV1 runs, before the lock aimed at the
-latch, waited 4.6 ms for it: display 14.9, total 18.4.)
+includes its encode spikes. Before the lock aimed at the latch, AV1 frames
+waited 4.6 ms for it: display 14.9, total 18.4. Riptide was at 19.9-23.9 total
+while its buffers were GPU-composited and the lock timed them from the CPU.
+A row of the picture leaves for the panel up to ~7.7 ms after the transfer
+starts.)
 
 - The display stage is SurfaceFlinger's: on this device it latches a buffer
   10.33 ms before the refresh it is shown at (`dumpsys SurfaceFlinger`: SF

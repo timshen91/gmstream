@@ -36,7 +36,7 @@ public:
 	// signals; `release` gets the buffer back with a fence (-1: now) when the
 	// screen is done with it. Takes ownership of `fence`.
 	void present(AHardwareBuffer *buf, int fence, int crop_w, int crop_h, FrameTiming t,
-	             std::function<void(int)> release);
+	             std::function<void(int)> release, int32_t dataspace, int32_t transform = 0);
 	void skip_one() { skip_ = true; }
 
 	// Scanout mode (experimental): one buffer stays on the display plane and
@@ -44,7 +44,7 @@ public:
 	// the (command-mode) panel is sent the buffer as it is at each refresh,
 	// and a frame finished before that refresh's push is shown at it,
 	// without waiting for SurfaceFlinger's latch. set_front(nullptr) ends it.
-	void set_front(AHardwareBuffer *buf, int crop_w, int crop_h);
+	void set_front(AHardwareBuffer *buf, int crop_w, int crop_h, int32_t transform = 0);
 	bool front() const { return front_buf_ != nullptr; }
 	// A frame written into the front buffer; `fence` (owned) signals when it is.
 	void front_written(FrameTiming t, int fence);
@@ -82,6 +82,8 @@ private:
 	std::deque<InFlight> flight_;
 	bool skip_ = false;
 	int last_w_ = 0, last_h_ = 0, view_w_ = 0, view_h_ = 0;
+	int32_t last_dataspace_ = -1, last_transform_ = -1, front_transform_ = 0;
+	uint64_t last_present_ = 0; // the previous transaction's present (debug: release timing)
 };
 
 } // namespace gm

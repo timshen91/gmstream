@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 
+#include <android/data_space.h>
 #include <android/hardware_buffer.h>
 #include <poll.h>
 #include <sys/system_properties.h>
@@ -46,6 +47,12 @@ static const uint32_t yuv_vert[] = {
 static const uint32_t yuv_frag[] = {
 #include "shaders/yuv_frag.inc"
 };
+static const uint32_t yuv_r90_vert[] = {
+#include "shaders/yuv_r90_vert.inc"
+};
+static const uint32_t yuv_r270_vert[] = {
+#include "shaders/yuv_r270_vert.inc"
+};
 static const uint32_t debug_frag[] = {
 #include "shaders/debug_frag.inc"
 };
@@ -61,7 +68,8 @@ struct RiptideClient::Impl {
 	Context context;
 	std::unique_ptr<Device> dev;
 	PFN_vkGetAndroidHardwareBufferPropertiesANDROID get_ahb_props = nullptr;
-	Program *program = nullptr;
+	Program *program = nullptr, *program_r90 = nullptr, *program_r270 = nullptr;
+	int rotation = 0, out_rotation = 0; // Surface.ROTATION_*: asked for; what the buffers were made for
 
 	int width = 0, height = 0, first_rows = 0, stripe_rows = 0;
 	struct Stripe {
@@ -120,6 +128,12 @@ struct RiptideClient::Impl {
 	GpuWarm warm;
 
 	explicit Impl(RiptideClient &o) : owner(o) {}
+	// The buffer is the picture turned to the panel; this undoes the turn.
+	int32_t buffer_transform() const
+	{
+		return out_rotation == 1 ? ANATIVEWINDOW_TRANSFORM_ROTATE_270
+		       : out_rotation == 3 ? ANATIVEWINDOW_TRANSFORM_ROTATE_90 : 0;
+	}
 	~Impl() { teardown(); }
 
 	bool init();
@@ -181,7 +195,9 @@ bool RiptideClient::Impl::init()
 		program = dev->request_program(yuv_vert, sizeof(yuv_vert), debug_frag, sizeof(debug_frag), &vl, &fl);
 	else
 		program = dev->request_program(yuv_vert, sizeof(yuv_vert), yuv_frag, sizeof(yuv_frag), &vl, &fl);
-	ok = get_ahb_props && program;
+	program_r90 = dev->request_program(yuv_r90_vert, sizeof(yuv_r90_vert), yuv_frag, sizeof(yuv_frag), &vl, &fl);
+	program_r270 = dev->request_program(yuv_r270_vert, sizeof(yuv_r270_vert), yuv_frag, sizeof(yuv_frag), &vl, &fl);
+	ok = get_ahb_props && program && program_r90 && program_r270;
 	auto &props = dev->get_gpu_properties();
 	LOGI("riptide: %s, Vulkan %u.%u%s", props.deviceName, VK_VERSION_MAJOR(props.apiVersion),
 	     VK_VERSION_MINOR(props.apiVersion), ok ? "" : " (no AHardwareBuffer interop)");
@@ -227,16 +243,19 @@ void RiptideClient::Impl::teardown()
 // An RGBA buffer SurfaceFlinger can scan out, as a Vulkan image we render into.
 bool RiptideClient::Impl::ensure_out(int w, int h)
 {
-	if (w == out_w && h == out_h && scanout == out_scanout)
+	if (w == out_w && h == out_h && scanout == out_scanout && rotation == out_rotation)
 		return true;
 	if (presenter)
 		presenter->set_front(nullptr, 0, 0);
 	free_out();
 	VkDevice vk = dev->get_device();
+	// Drawn in the panel's orientation: a quarter turn swaps the sides.
+	bool quarter = rotation == 1 || rotation == 3;
+	int bw = quarter ? h : w, bh = quarter ? w : h;
 	for (auto &o : outs) {
 		AHardwareBuffer_Desc d = {};
-		d.width = uint32_t(w);
-		d.height = uint32_t(h);
+		d.width = uint32_t(bw);
+		d.height = uint32_t(bh);
 		d.layers = 1;
 		d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
 		d.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
@@ -252,7 +271,7 @@ bool RiptideClient::Impl::ensure_out(int w, int h)
 		VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext};
 		ici.imageType = VK_IMAGE_TYPE_2D;
 		ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-		ici.extent = {uint32_t(w), uint32_t(h), 1};
+		ici.extent = {uint32_t(bw), uint32_t(bh), 1};
 		ici.mipLevels = 1;
 		ici.arrayLayers = 1;
 		ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -273,7 +292,7 @@ bool RiptideClient::Impl::ensure_out(int w, int h)
 		if (vkAllocateMemory(vk, &mai, nullptr, &o.memory) != VK_SUCCESS ||
 		    vkBindImageMemory(vk, o.image, o.memory, 0) != VK_SUCCESS)
 			return false;
-		auto info = ImageCreateInfo::render_target(uint32_t(w), uint32_t(h), VK_FORMAT_R8G8B8A8_UNORM);
+		auto info = ImageCreateInfo::render_target(uint32_t(bw), uint32_t(bh), VK_FORMAT_R8G8B8A8_UNORM);
 		info.usage = ici.usage;
 		info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 		o.wrapped = dev->wrap_image(info, o.image);
@@ -288,6 +307,7 @@ bool RiptideClient::Impl::ensure_out(int w, int h)
 	out_w = w;
 	out_h = h;
 	out_scanout = scanout;
+	out_rotation = rotation;
 	return true;
 }
 
@@ -480,7 +500,7 @@ void RiptideClient::Impl::end_frame(InterFrame *f, CommandBufferHandle &cmd)
 	if (scanout && out_scanout) {
 		slot = 0;
 		if (!presenter->front())
-			presenter->set_front(outs[0].ahb, width, height);
+			presenter->set_front(outs[0].ahb, width, height, buffer_transform());
 	} else {
 		std::lock_guard<std::mutex> g(out_lock);
 		for (int i = 0; i < out_count; i++)
@@ -516,7 +536,7 @@ void RiptideClient::Impl::end_frame(InterFrame *f, CommandBufferHandle &cmd)
 		rp.clear_color[0].float32[3] = 1.0f;
 	}
 	cmd->begin_render_pass(rp);
-	cmd->set_program(program);
+	cmd->set_program(out_rotation == 1 ? program_r270 : out_rotation == 3 ? program_r90 : program);
 	cmd->set_opaque_state();
 	cmd->set_depth_test(false, false);
 	cmd->set_cull_mode(VK_CULL_MODE_NONE);
@@ -572,7 +592,7 @@ void RiptideClient::Impl::end_frame(InterFrame *f, CommandBufferHandle &cmd)
 			close(x.release_fence);
 		x.release_fence = release;
 		x.busy = false;
-	});
+	}, ADATASPACE_SRGB, buffer_transform());
 }
 
 // A newer frame has started: the rest of this one as it is.
@@ -733,6 +753,7 @@ void RiptideClient::reset()
 void RiptideClient::skip_one() { impl_->skip = true; }
 void RiptideClient::set_keep_gpu_awake(bool on) { impl_->keep_awake = on; }
 void RiptideClient::set_scanout(bool on) { impl_->scanout = on; }
+void RiptideClient::set_rotation(int r) { impl_->rotation = r & 3; }
 std::string RiptideClient::summary()
 {
 	if (!impl_->ok)

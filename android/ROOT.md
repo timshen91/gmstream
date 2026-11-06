@@ -40,8 +40,9 @@ margin, for 99.9% of frames to make it); the 10.3 ms is the floor.
   overlay, and checking the rest of the UI does not stutter.
 - Only during a stream, restored the moment it ends (the service below does
   both, and restores on its own start in case it crashed).
-- The scanout mode (Riptide, experimental: frames written into the buffer
-  on screen) does not go through the latch at all, so it does not need this.
+- The scanout mode (Riptide: frames written into the buffer on screen,
+  6.9 ms p50 host present -> transfer) does not go through the latch at all, so
+  it does not need this; it is the MediaCodec path that does.
 
 ### 2. The GPU's clock
 
