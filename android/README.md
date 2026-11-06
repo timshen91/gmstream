@@ -31,7 +31,12 @@ line" puts it on the clipboard); the host refuses the device until then.
 For scripts, the launch intent takes the settings and saves them:
 `adb shell am start -n org.gmstream/.MainActivity --es host H --ei port P
 --ei codec 0|1|2|4 --ei mbps M --ei pacing 0|1 --ez stats true|false
---es size WxH --ei stripes N --ei parallelism N --ez pieces true|false`.
+--es size WxH --ei stripes N --ei parallelism N --ez pieces true|false
+--ez scanout true|false`. Debug switches: `adb shell setprop
+debug.gmstream.phase 1` (the phase lock's decisions to logcat),
+`debug.gmstream.trace 1` (Riptide's first steps), `debug.gmstream.planes 1`
+or `debug.gmstream.red 1` (Riptide's output pass shows the raw planes, or a
+clear).
 `--ez overLock true` (testing from adb) shows this window over the lock screen.
 
 ## What it does
@@ -62,7 +67,20 @@ For scripts, the launch intent takes the settings and saves them:
 - **Pacing**: Auto is the phase lock (`jni/phase.cpp`, a port of
   `apple/Phase.swift`) on the panel's measured refresh, from those present
   times, with Steam's VRR off; Low latency shows frames as they come and lets
-  the game run free.
+  the game run free. On Android the cut-off a frame must make is
+  SurfaceFlinger's latch, not the refresh (it latches 10.3 ms before the
+  refresh it shows a buffer at, so a frame just past a latch waits a whole
+  period more): the lock sees each frame as presented at its latch point plus a
+  period (`Session::to_latch_grid`), so it steers frames to arrive just before
+  a latch. Frames waiting for the latch: 4.6 -> 2.5 ms p50.
+- **Scanout mode** (Riptide, experimental, "write frames into the buffer on
+  screen"): one front buffer (`AHARDWAREBUFFER_USAGE_FRONT_BUFFER`) stays on
+  the display plane, a commit goes in every refresh so the command-mode panel
+  is sent the buffer at each refresh, and each frame is written into it in
+  place; it is shown at the first refresh after it is written, without
+  SurfaceFlinger's 10.3 ms. The phase lock then aims at the refresh itself.
+  It may tear if a write overlaps the transfer to the panel; whether frames
+  reach the panel as measured has not been checked by eye or camera.
 - **Audio**: Opus through the platform's decoder (MediaCodec) into AAudio
   (low latency, exclusive), with the Apple clients' jitter buffer.
 - **Wi-Fi**: "Keep Wi-Fi awake" holds Android's low-latency Wi-Fi lock
@@ -80,21 +98,34 @@ For scripts, the launch intent takes the settings and saves them:
   gaps and audio.
 
 Not here: PyroWave (codec 3; no Android decoder built), HDR, cursor
-confinement to the game's clip, a client-drawn cursor.
+confinement to the game's clip, a client-drawn cursor, scanout mode for the
+MediaCodec codecs (it needs the decoder's YUV buffers sampled into the front
+buffer by the GPU).
+
+What root would add, and the independent root service to hold it: ROOT.md.
 
 ## Measured (2026-11-06, Odin 3 over the router to the host's wired port, vkcube 1920x1080)
 
-| p50 / p99, ms | AV1 40 Mb/s, phase lock | AV1, low latency | Riptide 100 Mb/s, phase lock |
-|---|---|---|---|
-| network | 2.7 / 3.7 | 2.7 / 3.5 | 2.3-2.8 / 3.2-3.8 |
-| decode | 0.5 / 0.8 | 0.5 / 0.8 | 4.5-5.0 / 5.6-5.8 (first stripe -> GPU done) |
-| display (handed to SurfaceFlinger -> on screen) | 13.1 / 14.1 | 13.7 / 19.3 | 17.0-18.5 / 17.5-18.8 |
-| total (host present -> on screen) | 16.9 | 17.1 / 22.7 | 20.5-21.5 / 20.6 |
+| p50 / p99, ms | AV1 40 Mb/s, phase lock | AV1, low latency | Riptide 100 Mb/s, phase lock | Riptide, scanout mode |
+|---|---|---|---|---|
+| network | 2.5 / 3.5 | 2.7 / 3.5 | 2.3 / 3.1 | 2.4 / 3.7 |
+| decode | 0.5 / 0.8 | 0.5 / 0.8 | 4.4 / 5.3 (first stripe -> GPU done) | 4.2 / 5.2 |
+| to latch | 2.5 / 3.0 | | (from the CPU's submit) | - |
+| latch -> on screen | 10.2 / 10.3 | | 10.2 / 10.3 | - |
+| display (handed over -> on screen) | 12.7 / 13.2 | 13.7 / 19.3 | 16.8 / 18.0 | 6.3 / 8.0 |
+| total (host present -> on screen) | 16.3 / 26 | 17.1 / 22.7 | 19.9 / 21.0 | 9.5 / 11.2 |
+
+(The test host ran vkcube at 60 fps in a nested gamescope; the AV1 p99 total
+includes its encode spikes. The first AV1 runs, before the lock aimed at the
+latch, waited 4.6 ms for it: display 14.9, total 18.4.)
 
 - The display stage is SurfaceFlinger's: on this device it latches a buffer
   10.33 ms before the refresh it is shown at (`dumpsys SurfaceFlinger`: SF
-  duration 10333333 ns at 120 Hz), so ~10.3 ms plus the wait for its next latch
-  is the floor without root.
+  duration 10333333 ns at 120 Hz), so ~10.3 ms plus the margin before its
+  latch is the floor on the latched path without root (ROOT.md, item 1).
+  Android drives the panel in command mode (`/sys/class/drm/card0-DSI-1/modes`:
+  `1080x1920x120cmd`), and the video layer is on a display plane (`dumpsys
+  SurfaceFlinger --hwclayers`: DEVICE, rotated 90° inline).
 - Riptide's decode on Adreno 830 is ~10x the M4's: inter frames need the
   compute path (PyroWave's Qualcomm fragment path does intra only). Keeping the
   GPU awake took it from 7.6 to 4.5 ms p50.

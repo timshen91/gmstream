@@ -136,6 +136,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         prefs.parallelism = x.getInt("parallelism", prefs.parallelism);
         prefs.stripes = x.getInt("stripes", prefs.stripes);
         prefs.showStats = x.getBoolean("stats", prefs.showStats);
+        prefs.scanout = x.getBoolean("scanout", prefs.scanout);
         prefs.streamFrames = x.getBoolean("pieces", prefs.streamFrames);
         if (x.containsKey("size")) prefs.size = x.getString("size", prefs.size);
         prefs.save(this);
@@ -209,7 +210,8 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         }
         double hz = prefs.refresh > 0 ? prefs.refresh : getDisplay().getRefreshRate();
         Native.start(h, prefs.host.trim(), prefs.port, prefs.codec, prefs.mbps, size[0], size[1], hz,
-            prefs.streamFrames, prefs.parallelism, prefs.stripes, prefs.keepWiFiAwake, prefs.keepGPUAwake, prefs.pacing);
+            prefs.streamFrames, prefs.parallelism, prefs.stripes, prefs.keepWiFiAwake, prefs.keepGPUAwake, prefs.pacing,
+            prefs.scanout);
         if (prefs.keepWiFiAwake) wifiLock.acquire();
         streaming = true;
         startedWith = prefs.connectionKey();
@@ -600,6 +602,8 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         l.addView(awake);
         CheckBox gpu = check("Keep the GPU awake for Riptide", prefs.keepGPUAwake);
         l.addView(gpu);
+        CheckBox scan = check("Riptide: write frames into the buffer on screen (experimental; may tear)", prefs.scanout);
+        l.addView(scan);
         CheckBox touch = check("Fingers are a touchscreen (off: a mouse)", prefs.touchscreen);
         l.addView(touch);
         CheckBox showStats = check("Show stats", prefs.showStats);
@@ -641,6 +645,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
             prefs.stripes = Math.max(0, intOf(stripes, 0));
             prefs.keepWiFiAwake = awake.isChecked();
             prefs.keepGPUAwake = gpu.isChecked();
+            prefs.scanout = scan.isChecked();
             prefs.touchscreen = touch.isChecked();
             prefs.showStats = showStats.isChecked();
             prefs.save(this);

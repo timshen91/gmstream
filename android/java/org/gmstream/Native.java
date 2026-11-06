@@ -23,7 +23,7 @@ final class Native {
     static native void forgetHosts(long h);
     static native void start(long h, String host, int port, int codec, int mbps, int width, int height,
                              double refreshHz, boolean pieces, int parallelism, int stripes,
-                             boolean keepWiFiAwake, boolean keepGPUAwake, int pacing);
+                             boolean keepWiFiAwake, boolean keepGPUAwake, int pacing, boolean scanout);
     static native void stop(long h);
     static native void setSurface(long h, android.view.Surface surface);
     static native String stats(long h);

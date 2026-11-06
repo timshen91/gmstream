@@ -19,6 +19,7 @@ struct FrameTiming {
 	uint64_t decode_start = 0;   // handed to the decoder
 	uint64_t decoded = 0;        // the decoder gave it back
 	uint64_t submitted = 0;      // handed to the display (released to the surface)
+	uint64_t latched = 0;        // SurfaceFlinger took it
 	uint64_t presented = 0;      // on screen
 };
 

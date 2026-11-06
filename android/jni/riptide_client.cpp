@@ -116,6 +116,7 @@ struct RiptideClient::Impl {
 	int out_w = 0, out_h = 0;
 	bool skip = false;
 	bool keep_awake = true;
+	bool scanout = false, out_scanout = false; // asked for; what the buffers were made for
 	GpuWarm warm;
 
 	explicit Impl(RiptideClient &o) : owner(o) {}
@@ -226,8 +227,10 @@ void RiptideClient::Impl::teardown()
 // An RGBA buffer SurfaceFlinger can scan out, as a Vulkan image we render into.
 bool RiptideClient::Impl::ensure_out(int w, int h)
 {
-	if (w == out_w && h == out_h)
+	if (w == out_w && h == out_h && scanout == out_scanout)
 		return true;
+	if (presenter)
+		presenter->set_front(nullptr, 0, 0);
 	free_out();
 	VkDevice vk = dev->get_device();
 	for (auto &o : outs) {
@@ -237,7 +240,7 @@ bool RiptideClient::Impl::ensure_out(int w, int h)
 		d.layers = 1;
 		d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
 		d.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-		          AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+		          AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY | (scanout ? AHARDWAREBUFFER_USAGE_FRONT_BUFFER : 0);
 		if (AHardwareBuffer_allocate(&d, &o.ahb) != 0)
 			return false;
 		VkAndroidHardwareBufferFormatPropertiesANDROID fmt = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
@@ -284,6 +287,7 @@ bool RiptideClient::Impl::ensure_out(int w, int h)
 	}
 	out_w = w;
 	out_h = h;
+	out_scanout = scanout;
 	return true;
 }
 
@@ -471,9 +475,13 @@ void RiptideClient::Impl::end_frame(InterFrame *f, CommandBufferHandle &cmd)
 		dev->next_frame_context();
 		return;
 	}
-	// A buffer the screen is done with.
+	// A buffer the screen is done with (scanout mode: always the one on screen).
 	int slot = -1, wait_fd = -1;
-	{
+	if (scanout && out_scanout) {
+		slot = 0;
+		if (!presenter->front())
+			presenter->set_front(outs[0].ahb, width, height);
+	} else {
 		std::lock_guard<std::mutex> g(out_lock);
 		for (int i = 0; i < out_count; i++)
 			if (!outs[i].busy) {
@@ -552,6 +560,10 @@ void RiptideClient::Impl::end_frame(InterFrame *f, CommandBufferHandle &cmd)
 	TRACE("riptide: next frame context");
 	FrameTiming t = f->timing;
 	t.decode_start = f->decode_start;
+	if (scanout && out_scanout) {
+		presenter->front_written(t, fence);
+		return;
+	}
 	Impl *self = this;
 	presenter->present(o.ahb, fence, width, height, t, [self, slot](int release) {
 		std::lock_guard<std::mutex> g(self->out_lock);
@@ -713,12 +725,14 @@ void RiptideClient::reset()
 {
 	impl_->in_frame = false;
 	impl_->has_last = false;
+	impl_->width = impl_->height = 0; // set up again with the next packet (settings may have changed)
 	impl_->reference = -1;
 	impl_->waiting_intra = false;
 	impl_->pending.clear();
 }
 void RiptideClient::skip_one() { impl_->skip = true; }
 void RiptideClient::set_keep_gpu_awake(bool on) { impl_->keep_awake = on; }
+void RiptideClient::set_scanout(bool on) { impl_->scanout = on; }
 std::string RiptideClient::summary()
 {
 	if (!impl_->ok)

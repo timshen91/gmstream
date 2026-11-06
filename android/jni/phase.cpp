@@ -7,6 +7,13 @@
 
 #include "conn.h" // now_ns
 #include "log.h"
+#include <sys/system_properties.h>
+
+static bool debug_phase()
+{
+	char v[PROP_VALUE_MAX] = {};
+	return __system_property_get("debug.gmstream.phase", v) > 0 && v[0] == '1';
+}
 
 namespace gm {
 
@@ -236,6 +243,13 @@ bool PhaseLock::step(uint64_t &anchor, uint64_t &interval_out)
 			double move = best - h;
 			move -= std::round(move / t) * t;
 			shift_ += move / 2;
+			if (debug_phase()) {
+				std::vector<double> r = recent_;
+				std::sort(r.begin(), r.end());
+				LOGI("phase: shift %+.2f host lead %.2f target %.2f (%.2f%% expected) med %.2f late p10 %.2f p90 %.2f p99 %.2f n %zu",
+				     shift_ / 1e6, h / 1e6, best / 1e6, expected_ * 100, med / 1e6, r[r.size() / 10] / 1e6,
+				     r[r.size() * 9 / 10] / 1e6, r[r.size() * 99 / 100] / 1e6, r.size());
+			}
 		}
 	}
 	since_ = now_ns() + 100000000ull;

@@ -37,6 +37,8 @@ public:
 	void reset();
 	void skip_one();
 	void set_keep_gpu_awake(bool on);
+	// Scanout mode (Presenter::set_front): frames written into the buffer on screen.
+	void set_scanout(bool on);
 	std::string summary();
 
 	struct Impl;

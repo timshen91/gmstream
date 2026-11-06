@@ -13,5 +13,6 @@ void RiptideClient::packet(const RiptidePacket &, bool, int64_t) {}
 void RiptideClient::reset() {}
 void RiptideClient::skip_one() {}
 void RiptideClient::set_keep_gpu_awake(bool) {}
+void RiptideClient::set_scanout(bool) {}
 std::string RiptideClient::summary() { return "Riptide not built in"; }
 } // namespace gm

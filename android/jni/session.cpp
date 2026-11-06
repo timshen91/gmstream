@@ -5,6 +5,7 @@
 
 #include <jni.h>
 
+#include <android/hardware_buffer.h>
 #include <android/native_window_jni.h>
 
 #include <algorithm>
@@ -40,6 +41,7 @@ struct Options {
 	int parallelism = 0, stripes = 0;
 	bool keep_awake = true, keep_gpu_awake = true;
 	int pacing = 0; // 0 auto (phase lock), 1 low latency
+	bool scanout = false; // Riptide: frames written into the buffer on screen (experimental)
 };
 
 class Session : public ConnectionListener {
@@ -56,11 +58,11 @@ public:
 		m_status_ = env->GetMethodID(c, "onStatus", "(Ljava/lang/String;)V");
 		presenter_.on_presented = [this](const FrameTiming &t) {
 			stages_.add(t);
-			phase_.presented(t);
+			phase_.presented(to_latch_grid(t));
 		};
 		presenter_.on_dropped = [this](const FrameTiming &t) {
 			stages_.drop();
-			phase_.dropped(t);
+			phase_.dropped(to_latch_grid(t));
 		};
 		video_.on_size = [this](int w, int h) { stream_size(w, h); };
 		riptide_.on_dropped = [this](const FrameTiming &t) { stages_.drop(); phase_.dropped(t); };
@@ -74,6 +76,14 @@ public:
 		riptide_.on_need_intra = [this] { send(msg::keyframe); };
 		riptide_.on_gap = [this] { through_.gap(); };
 		LOGI("this device's key: %s", id_.authorized_line("android").c_str());
+		AHardwareBuffer_Desc d = {};
+		d.width = 1920;
+		d.height = 1080;
+		d.layers = 1;
+		d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+		d.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+		          AHARDWAREBUFFER_USAGE_FRONT_BUFFER;
+		LOGI("front buffer (RGBA8, overlay): %s", AHardwareBuffer_isSupported(&d) ? "supported" : "not supported");
 	}
 
 	~Session() override
@@ -240,6 +250,36 @@ private:
 		stream_h_ = h;
 		env_()->CallVoidMethod(listener_, m_size_, w, h);
 	}
+	// The phase lock steers frames to the cut-off that decides when they are
+	// shown. On macOS that is the refresh; on Android it is SurfaceFlinger's
+	// latch, a fixed time (its "sf duration", 10.3 ms on the Odin 3) before
+	// the refresh the frame then shows at, and a frame that misses it by a
+	// little waits a whole period. So the lock sees each frame as presented at
+	// its latch point plus one period: its lead is then the time to the next
+	// latch, and "a refresh after its flip point" means it made that latch.
+	// The latch point comes from the present time (exact, on the refresh grid)
+	// minus the median latch -> present time.
+	FrameTiming to_latch_grid(FrameTiming t)
+	{
+		std::lock_guard<std::mutex> g(pipe_lock_);
+		if (presenter_.front())
+			return t;
+		if (t.latched && t.presented > t.latched) {
+			pipe_.push_back(double(t.presented - t.latched));
+			if (pipe_.size() > 120)
+				pipe_.erase(pipe_.begin());
+		}
+		if (pipe_.size() < 10 || !t.presented || presenter_.front())
+			return t; // scanout mode: the cut-off is the refresh itself
+		std::vector<double> s = pipe_;
+		std::nth_element(s.begin(), s.begin() + long(s.size() / 2), s.end());
+		double period = 1e9 / opt_.refresh_hz;
+		t.presented = uint64_t(double(t.presented) - s[s.size() / 2] + period);
+		return t;
+	}
+	std::mutex pipe_lock_;
+	std::vector<double> pipe_; // recent latch -> present, ns
+
 	void connect();
 	void disconnect();
 	void send_grid();
@@ -330,6 +370,9 @@ void Session::connect()
 		conn_->keep_awake(opt_.keep_awake);
 	}
 	riptide_.set_keep_gpu_awake(opt_.keep_gpu_awake);
+	riptide_.set_scanout(opt_.scanout);
+	if (!opt_.scanout)
+		presenter_.set_front(nullptr, 0, 0);
 	riptide_.reset();
 	video_.reset();
 	if (!audio_)
@@ -524,7 +567,7 @@ FN(void, forgetHosts)(JNIEnv *, jclass, jlong h) { S(h)->identity().forget_hosts
 
 FN(void, start)(JNIEnv *env, jclass, jlong h, jstring host, jint port, jint codec, jint mbps, jint w, jint hgt,
                 jdouble hz, jboolean pieces, jint parallelism, jint stripes, jboolean awake, jboolean gpu_awake,
-                jint pacing)
+                jint pacing, jboolean scanout)
 {
 	gm::Options o;
 	o.host = str(env, host);
@@ -540,6 +583,7 @@ FN(void, start)(JNIEnv *env, jclass, jlong h, jstring host, jint port, jint code
 	o.keep_awake = awake;
 	o.keep_gpu_awake = gpu_awake;
 	o.pacing = pacing;
+	o.scanout = scanout;
 	S(h)->start(o);
 }
 

@@ -12,7 +12,9 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <atomic>
 #include <mutex>
+#include <thread>
 
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
@@ -36,6 +38,18 @@ public:
 	void present(AHardwareBuffer *buf, int fence, int crop_w, int crop_h, FrameTiming t,
 	             std::function<void(int)> release);
 	void skip_one() { skip_ = true; }
+
+	// Scanout mode (experimental): one buffer stays on the display plane and
+	// frames are written into it in place; a commit goes in every refresh so
+	// the (command-mode) panel is sent the buffer as it is at each refresh,
+	// and a frame finished before that refresh's push is shown at it,
+	// without waiting for SurfaceFlinger's latch. set_front(nullptr) ends it.
+	void set_front(AHardwareBuffer *buf, int crop_w, int crop_h);
+	bool front() const { return front_buf_ != nullptr; }
+	// A frame written into the front buffer; `fence` (owned) signals when it is.
+	void front_written(FrameTiming t, int fence);
+	void front_complete(ASurfaceTransactionStats *stats); // SurfaceFlinger's thread
+	void front_tick_public() { front_tick(); }
 	// SurfaceFlinger's thread.
 	void complete(uint64_t seq, ASurfaceTransactionStats *stats);
 
@@ -49,6 +63,17 @@ private:
 		int acquire = -1; // a copy of the acquire fence, for the decode's end time
 	};
 	void settle();
+
+	void front_tick();
+	void front_loop();
+	AHardwareBuffer *front_buf_ = nullptr;
+	int front_w_ = 0, front_h_ = 0;
+	std::thread front_thread_;
+	std::atomic<bool> front_run_{false};
+	void *front_looper_ = nullptr;
+	struct Written { FrameTiming t; int fence; uint64_t done; };
+	std::deque<Written> written_;
+	std::deque<uint64_t> presents_; // recent refreshes the buffer was sent at
 
 	std::mutex lock_;
 	ANativeWindow *parent_ = nullptr;

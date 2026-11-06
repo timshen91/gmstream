@@ -595,11 +595,16 @@ any arm64 Android 13+ device; no root, no Gradle (`android/build.sh`).
 - Java only for the window, the settings and the input devices.
 
 Measured on the Odin 3 (vkcube, 1920x1080, router to the host's wired port):
-AV1 decode 0.5 ms p50 and host present -> on screen 16.9 ms p50, of which
-13 ms is SurfaceFlinger's (it latches 10.33 ms before the refresh it shows a
-buffer at); Riptide 20.5 ms, its decode 4.5 ms on Adreno's compute path
+AV1 decode 0.5 ms p50 and host present -> on screen 16.3 ms p50, of which
+10.2 ms is SurfaceFlinger's (it latches 10.33 ms before the refresh it shows a
+buffer at) and 2.5 ms the margin before its latch, which the phase lock aims
+at (`Session::to_latch_grid`; aimed at the refresh, as on macOS, frames
+waited 4.6 ms). Riptide 19.9 ms, its decode 4.4 ms on Adreno's compute path
 (inter frames cannot use PyroWave's fragment path), 7.6 before the GPU was
-kept awake.
+kept awake. Riptide's experimental scanout mode writes each frame into a front
+buffer kept on the display plane, committed every refresh, and skips the latch:
+9.5 ms p50 total (not yet checked by eye for tearing). What root would add, and
+the root service to hold it: `android/ROOT.md`.
 
 ## 4. gamescope facts this design depends on
 

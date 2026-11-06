@@ -18,6 +18,7 @@ final class Prefs {
     int parallelism = 0;    // AV1 tiles / HEVC slice segments, 0 = the host's default
     int stripes = 0;        // Riptide stripes, 0 = the host's default
     int pacing = 0;         // 0 Auto (phase lock), 1 Low latency
+    boolean scanout = false; // Riptide: frames written into the buffer on screen (experimental)
     boolean touchscreen = true; // fingers are a touchscreen on the host; off: a mouse
 
     static final String[] CODECS = {"H.264", "HEVC", "AV1", "Riptide"};
@@ -40,6 +41,7 @@ final class Prefs {
         o.stripes = p.getInt("stripes", o.stripes);
         o.pacing = p.getInt("pacing", o.pacing);
         o.touchscreen = p.getBoolean("touchscreen", o.touchscreen);
+        o.scanout = p.getBoolean("scanout", o.scanout);
         return o;
     }
 
@@ -50,13 +52,13 @@ final class Prefs {
             .putBoolean("showStats", showStats).putBoolean("keepWiFiAwake", keepWiFiAwake)
             .putBoolean("keepGPUAwake", keepGPUAwake).putBoolean("streamFrames", streamFrames)
             .putInt("parallelism", parallelism).putInt("stripes", stripes).putInt("pacing", pacing)
-            .putBoolean("touchscreen", touchscreen).apply();
+            .putBoolean("touchscreen", touchscreen).putBoolean("scanout", scanout).apply();
     }
 
     /** What a reconnect is needed for (everything but the bitrate and the overlay). */
     String connectionKey() {
         return host + "|" + port + "|" + codec + "|" + size + "|" + refresh + "|" + keepWiFiAwake + "|" + keepGPUAwake
-            + "|" + streamFrames + "|" + parallelism + "|" + stripes + "|" + pacing;
+            + "|" + streamFrames + "|" + parallelism + "|" + stripes + "|" + pacing + "|" + scanout;
     }
 
     /** "WxH" or null. */

@@ -16,7 +16,7 @@ const std::vector<std::string> &StageStats::names()
 	// gamescope's present -> the frame handed to SurfaceFlinger, "display" from
 	// there to on screen.
 	static const std::vector<std::string> n = {"encode", "network", "overlap", "read", "decode",
-	                                           "to Android", "display", "total", "spacing"};
+	                                           "to Android", "to latch", "latch->on", "display", "total", "spacing"};
 	return n;
 }
 
@@ -39,13 +39,17 @@ void StageStats::add(const FrameTiming &t)
 		set(4, ms(t.decode_start ? t.decode_start : t.received, t.decoded));
 	if (t.local)
 		set(5, ms(t.present_local, t.submitted));
-	set(6, ms(t.submitted, t.presented));
+	if (t.latched) {
+		set(6, ms(t.submitted, t.latched));
+		set(7, ms(t.latched, t.presented));
+	}
+	set(8, ms(t.submitted, t.presented));
 	if (t.local)
-		set(7, ms(t.present_local, t.presented));
+		set(9, ms(t.present_local, t.presented));
 	std::lock_guard<std::mutex> g(lock_);
 	if (last_presented_ && last_present_ && t.local && t.present_local > last_present_ &&
 	    t.present_local - last_present_ < 100000000ull)
-		set(8, std::fabs(double(int64_t(t.presented) - int64_t(last_presented_)) -
+		set(10, std::fabs(double(int64_t(t.presented) - int64_t(last_presented_)) -
 		                 double(t.present_local - last_present_)) / 1e6);
 	last_presented_ = t.presented;
 	last_present_ = t.local ? t.present_local : 0;
