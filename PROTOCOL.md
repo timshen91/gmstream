@@ -324,8 +324,8 @@ lowest-RTT exchange and uses it to show capture→display latency.
 
 ## Plain UDP
 
-For native clients, on UDP port 8444 (the WebTransport port + 1). No
-retransmission: it assumes a clean LAN. The control stream is encrypted and the
+For native clients, on UDP port 8444 (the WebTransport port + 1). Only the
+control stream is resent (below); video and audio are not. The control stream is encrypted and the
 client must be authorized; video and audio are plain. Every datagram starts with a
 type byte:
 
@@ -337,7 +337,7 @@ type byte:
 | 5 | keep-awake (client → host): no payload; the host drops it |
 | 6 | handshake (below) |
 | 7 | mouse (client → host): `u32 sequence` then a sealed payload (below) |
-| 8 | acknowledgement (host → client): `u32 sequence` then a sealed `u32` |
+| 8 | acknowledgement (either way): `u32 sequence` then a sealed `u32` |
 | 9 | a piece of a frame, as in "Video chunks" above |
 | 10 | a Riptide packet, as in "Riptide" above |
 | 11 | a Riptide loss report (client → host), as in "Riptide" above |
@@ -373,6 +373,15 @@ second time, as nothing may follow it. They count from when the host has accepte
 The host answers every control datagram with type 8, whose sealed value is the next
 control sequence it wants. A client sends again whatever isn't acknowledged within
 30 ms.
+
+The other way round is the same: a client acknowledges the host's control stream
+with type 8 (sealed with its own key, numbered with its own sequence, kind 2), the
+next sequence it wants, on every control datagram it receives and at least every
+250 ms. On each acknowledgement the host sends again what is still missing and
+went more than 30 ms ago (up to 64), and it keeps up to 1024 unacknowledged; only
+an acknowledgement numbered later than the last one counts. A client that never
+acknowledges gets each control datagram once, and a lost one holds up the rest of
+the stream.
 
 The first control message is `Auth` (0x10): the client's Ed25519 public key (32)
 and its signature (64) over "gmstream client" + T. That key must be in the host

@@ -162,6 +162,10 @@ final class Connection {
     private static let resendAfterNs: UInt64 = 30_000_000
     private var mouseSeq: UInt32 = 0, mouseTotal = (x: 0.0, y: 0.0)
     private var lossSeq: UInt32 = 0
+    // The host's control stream received up to here (under sendLock):
+    // acknowledged on each control datagram and every 250 ms, so the host
+    // sends a lost one again instead of every later one waiting behind it.
+    private var ackSeq: UInt32 = 0, ackNext: UInt32 = 0, lastAckNs: UInt64 = 0
     private static let dropEvery = Int(getenv("GM_DEBUG_DROP").map { String(cString: $0) } ?? "") ?? 0
     private var droppedCount = 0
     private var lastMouse: Data?, mouseRepeated = true
@@ -457,6 +461,28 @@ final class Connection {
             sendMouse(lastMouse)
             mouseRepeated = true
         }
+        // Also when nothing arrives: the host's last datagram may be the lost one.
+        if now - lastAckNs > 250_000_000 {
+            sendAck()
+        }
+    }
+
+    /// To the host: `u32 next`, the first of its control datagrams not yet
+    /// received (PROTOCOL.md, "Plain UDP"). Under sendLock.
+    private func sendAck() {
+        guard running, let key = sendKey else { return }
+        var d = Writer()
+        d.u8(datagramAck)
+        d.u32(ackSeq)
+        var plain = Writer()
+        plain.u32(ackNext)
+        guard let box = try? AES.GCM.seal(plain.data, using: key, nonce: Self.nonce(.ack, ackSeq),
+                                          authenticating: d.data) else { return }
+        ackSeq += 1
+        lastAckNs = nowNs()
+        d.data.append(box.ciphertext)
+        d.data.append(box.tag)
+        _ = d.data.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
     }
 
     private enum SeqKind: UInt8 { case control = 0, mouse = 1, ack = 2, loss = 3 }
@@ -802,6 +828,12 @@ final class Connection {
         } else if seq > controlNext {
             controlPending[seq] = payload
         }
+        // Each one says how far we have it (the host resends a gap; a
+        // duplicate is acknowledged too, in case our last acknowledgement was lost).
+        sendLock.lock()
+        ackNext = controlNext
+        sendAck()
+        sendLock.unlock()
     }
 
     private func parseControl() {

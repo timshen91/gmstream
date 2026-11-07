@@ -1,4 +1,4 @@
-//! Plain UDP for native clients (PROTOCOL.md, "Plain UDP"): no retransmission.
+//! Plain UDP for native clients (PROTOCOL.md, "Plain UDP"): only the control stream is resent.
 //! The control stream's bytes travel encrypted in numbered datagrams that the
 //! receiver puts back in order (auth.rs); video and audio use the same plain
 //! datagrams as WebTransport's datagram mode. A client is its address: after a
@@ -11,7 +11,9 @@
 //! it up, and nothing waits for them: a motion datagram says how far the mouse has
 //! gone since the start of the session, so one that is lost is in the next, and a
 //! position is simply the latest. The client resends control datagrams until they
-//! are acknowledged.
+//! are acknowledged, and the host its own to a client that acknowledges them
+//! (Sent): a single lost one held up every later one, and after 256 the client
+//! gave up on the session.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -45,6 +47,60 @@ const IDLE: Duration = Duration::from_secs(10);
 const MAX_OUT_OF_ORDER: usize = 256;
 /// Handshakes that haven't gone on to a session.
 const MAX_HANDSHAKES: usize = 64;
+/// Host -> client control datagrams kept until the client acknowledges them;
+/// past this the oldest go (a client that never acknowledges: it gets each
+/// datagram once, as before).
+const MAX_UNACKED: usize = 1024;
+/// A control datagram still unacknowledged this long after it went is sent
+/// again, when an acknowledgement shows the client is waiting for it.
+const RESEND_AFTER: Duration = Duration::from_millis(30);
+/// Resent per acknowledgement at most.
+const MAX_RESEND: usize = 64;
+
+/// GM_DEBUG_DROP_CONTROL=N: every Nth control datagram to a client is not
+/// sent (it is kept, so an acknowledging client gets it resent).
+fn debug_drop_control(seq: u32) -> bool {
+    static EVERY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let n = *EVERY.get_or_init(|| std::env::var("GM_DEBUG_DROP_CONTROL").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    n > 0 && seq % n == n - 1
+}
+
+/// The host's control datagrams to one client not yet acknowledged.
+#[derive(Default)]
+struct Sent {
+    unacked: BTreeMap<u32, (Vec<u8>, std::time::Instant)>,
+    /// Resent since the last log line, and when that was.
+    resent: u32,
+    said: Option<std::time::Instant>,
+}
+
+impl Sent {
+    fn keep(&mut self, seq: u32, d: Vec<u8>) {
+        self.unacked.insert(seq, (d, std::time::Instant::now()));
+        while self.unacked.len() > MAX_UNACKED {
+            self.unacked.pop_first();
+        }
+    }
+
+    /// The client has everything before `next`: let it go, and send again
+    /// what it is still missing and has had time to get.
+    fn acked(&mut self, next: u32, socket: &UdpSocket, addr: SocketAddr) {
+        self.unacked.retain(|&seq, _| seq.wrapping_sub(next) as i32 >= 0);
+        let now = std::time::Instant::now();
+        for (_, (d, sent)) in self.unacked.iter_mut().take(MAX_RESEND) {
+            if now.duration_since(*sent) >= RESEND_AFTER {
+                *sent = now;
+                let _ = socket.try_send_to(d, addr);
+                self.resent += 1;
+            }
+        }
+        if self.resent > 0 && self.said.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+            eprintln!("gmstream: {addr}: resent {} control datagrams it was missing (next {next})", self.resent);
+            self.resent = 0;
+            self.said = Some(now);
+        }
+    }
+}
 
 struct Route {
     tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -52,6 +108,9 @@ struct Route {
     pending: BTreeMap<u32, Vec<u8>>,
     keys: Arc<Keys>,
     ack_seq: u32,
+    /// The client's acknowledgements of our control datagrams.
+    sent: Arc<Mutex<Sent>>,
+    ack_in: u32,
     /// The mouse counts once the session has authorized the client.
     mouse_on: Arc<AtomicBool>,
     mouse_next: u32,
@@ -145,6 +204,7 @@ pub struct Peer {
     routes: Routes,
     keys: Arc<Keys>,
     mouse_on: Arc<AtomicBool>,
+    sent: Arc<Mutex<Sent>>,
 }
 
 impl Peer {
@@ -218,6 +278,10 @@ impl Peer {
             d.extend_from_slice(&seq.to_le_bytes());
             let sealed = self.keys.seal(Kind::Control, &d, seq, chunk);
             d.extend_from_slice(&sealed);
+            self.sent.lock().unwrap().keep(seq, d.clone());
+            if debug_drop_control(seq) {
+                continue; // GM_DEBUG_DROP_CONTROL=N: as if every Nth were lost
+            }
             self.send(&d).await?;
         }
         Ok(())
@@ -301,7 +365,8 @@ where
             continue;
         }
         if n < CONTROL_HEADER + auth::TAG_SIZE
-            || (buf[0] != DATAGRAM_CONTROL && buf[0] != DATAGRAM_MOUSE && buf[0] != DATAGRAM_RIPTIDE_LOSS)
+            || (buf[0] != DATAGRAM_CONTROL && buf[0] != DATAGRAM_MOUSE && buf[0] != DATAGRAM_RIPTIDE_LOSS
+                && buf[0] != DATAGRAM_ACK)
         {
             continue;
         }
@@ -312,6 +377,21 @@ where
             if let Some(route) = map.get_mut(&addr) {
                 if let Some(m) = route.keys.open(Kind::Loss, header, seq, sealed) {
                     route.riptide_loss(&m);
+                }
+            }
+            continue;
+        }
+        if header[0] == DATAGRAM_ACK {
+            // The client's acknowledgement of our control stream: `u32 next`.
+            // Only newer ones count (they are numbered), so an old one
+            // arriving late does not send everything again.
+            if let Some(route) = map.get_mut(&addr) {
+                if let Some(m) = route.keys.open(Kind::Ack, header, seq, sealed).filter(|m| m.len() == 4) {
+                    if seq.wrapping_sub(route.ack_in) as i32 >= 0 {
+                        route.ack_in = seq.wrapping_add(1);
+                        let next = u32::from_le_bytes(m[..4].try_into().unwrap());
+                        route.sent.lock().unwrap().acked(next, &socket, addr);
+                    }
                 }
             }
             continue;
@@ -342,12 +422,15 @@ where
         let keys = handshakes.remove(&addr).unwrap().keys;
         let (tx, rx) = mpsc::unbounded_channel();
         let mouse_on = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(Mutex::new(Sent::default()));
         let mut route = Route {
             tx,
             next: 0,
             pending: BTreeMap::new(),
             keys: keys.clone(),
             ack_seq: 0,
+            sent: sent.clone(),
+            ack_in: 0,
             mouse_on: mouse_on.clone(),
             mouse_next: 0,
             mouse_total: (0.0, 0.0),
@@ -355,7 +438,7 @@ where
         route.deliver(seq, payload);
         route.ack(&socket, addr);
         map.insert(addr, route);
-        let peer = Arc::new(Peer { socket: socket.clone(), addr, seq: AtomicU32::new(0), routes: routes.clone(), keys, mouse_on });
+        let peer = Arc::new(Peer { socket: socket.clone(), addr, seq: AtomicU32::new(0), routes: routes.clone(), keys, mouse_on, sent });
         let fut = session(peer, Control { rx, buf: Vec::new() });
         let routes = routes.clone();
         tokio::spawn(async move {

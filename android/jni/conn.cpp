@@ -294,6 +294,27 @@ void Connection::transmit(const std::vector<uint8_t> &bytes)
 	}
 }
 
+// To the host: `u32 next`, the first of its control datagrams not yet
+// received (PROTOCOL.md, "Plain UDP").
+void Connection::send_ack()
+{
+	if (!send_key_ || !running_)
+		return;
+	uint32_t next = ack_next_.load();
+	uint8_t plain[4] = {uint8_t(next), uint8_t(next >> 8), uint8_t(next >> 16), uint8_t(next >> 24)};
+	std::vector<uint8_t> d(5 + 4 + tag_size);
+	d[0] = dg_ack;
+	d[1] = uint8_t(ack_seq_);
+	d[2] = uint8_t(ack_seq_ >> 8);
+	d[3] = uint8_t(ack_seq_ >> 16);
+	d[4] = uint8_t(ack_seq_ >> 24);
+	uint8_t iv[12];
+	nonce(k_ack, ack_seq_, iv);
+	send_key_->seal(iv, d.data(), 5, plain, 4, d.data() + 5);
+	ack_seq_++;
+	raw_send(d.data(), d.size());
+}
+
 void Connection::motion(double dx, double dy)
 {
 	std::lock_guard<std::mutex> g(send_lock_);
@@ -472,7 +493,7 @@ bool Connection::to_host(uint64_t local_ns, uint64_t &host) const
 // mouse's last word once more, and the keep-awake datagram at 60 Hz.
 void Connection::timer_loop()
 {
-	uint64_t next_resend = now_ns(), next_awake = now_ns();
+	uint64_t next_resend = now_ns(), next_awake = now_ns(), next_ack = now_ns();
 	std::unique_lock<std::mutex> lk(timer_mx_);
 	while (running_) {
 		uint64_t now = now_ns();
@@ -490,6 +511,12 @@ void Connection::timer_loop()
 			}
 			next_resend = now + 15000000ull;
 		}
+		if (now >= next_ack) {
+			// Also when nothing arrives: the host's last datagram may be the lost one.
+			std::lock_guard<std::mutex> g(send_lock_);
+			send_ack();
+			next_ack = now + 250000000ull;
+		}
 		if (now >= next_awake) {
 			bool on;
 			{
@@ -504,7 +531,7 @@ void Connection::timer_loop()
 			if (next_awake < now)
 				next_awake = now + 1000000000ull / 60;
 		}
-		uint64_t wake = std::min(next_resend, next_awake);
+		uint64_t wake = std::min({next_resend, next_awake, next_ack});
 		now = now_ns();
 		if (wake > now)
 			timer_cv_.wait_for(lk, std::chrono::nanoseconds(wake - now));
@@ -783,9 +810,14 @@ void Connection::control_datagram(uint32_t seq, std::vector<uint8_t> &&payload)
 		parse_control();
 	} else if (int32_t(seq - control_next_) > 0) {
 		control_pending_[seq] = std::move(payload);
-		if (control_pending_.size() > 256)
+		if (control_pending_.size() > 1024)
 			closed("The control stream stalled");
 	}
+	// Each one says how far we have it (the host resends a gap; a duplicate
+	// is acknowledged too, in case our last acknowledgement was the one lost).
+	ack_next_ = control_next_;
+	std::lock_guard<std::mutex> g(send_lock_);
+	send_ack();
 }
 
 void Connection::parse_control()

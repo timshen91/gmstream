@@ -48,7 +48,10 @@ final class FakeHost {
     /// The next control datagram (type 3), opened, skipping keep-awake ones and
     /// answering handshakes.
     func receiveControl(timeout: Double = 2) -> (seq: UInt32, payload: Data)? {
-        while let d = receive(timeout: timeout) {
+        // A deadline for the whole wait, not each datagram: the client also
+        // acknowledges our control stream every 250 ms, so it is never quiet.
+        let deadline = Date().addingTimeInterval(timeout)
+        while case let left = deadline.timeIntervalSinceNow, left > 0.001, let d = receive(timeout: left) {
             if d[0] == datagramHandshake { answerHandshake(d) }
             if d[0] == datagramControl, let recv {
                 let seq = d.u32(1)
