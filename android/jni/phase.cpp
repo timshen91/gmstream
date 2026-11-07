@@ -50,6 +50,7 @@ void PhaseLock::start_sweep()
 {
 	slack_steps_ = 0;
 	slack_.clear();
+	phases_.clear();
 	sweeping_ = true;
 	sweep_.clear();
 	has_target_ = false;
@@ -155,34 +156,77 @@ bool PhaseLock::step(uint64_t &anchor, uint64_t &interval_out)
 		slack_.clear();
 		return result();
 	}
-	if (slack_.size() >= 20) {
+	if (slack_.size() >= 10) {
 		// Scanout frames: each says how much later it could have come and
-		// still gone out whole at its refresh (Compositor::on_slack). Move the
-		// host's frames later until the earliest percent of them have just a
-		// small margin left; back at once on one that tore or went late. (No
-		// sweep: the slack is what the sweep would look for.)
-		std::vector<double> s = slack_;
+		// still made its refresh (Compositor::on_slack), which is also how
+		// long it waited for its sample point: a frame that just missed one
+		// (slack -x) waits for the next, T - x. So the phase of the host's
+		// frames sets each frame's wait, modulo T, and a move of the shift by
+		// d adds d to every slack (a larger shift: frames earlier; measured,
+		// +2 ms of shift gave +2 ms of slack). Choose the move that makes the
+		// longest waits (p99 over the last few seconds) shortest, keeping a
+		// margin before each frame's deadline; ties go to the shorter median.
+		// Folding slack around +-T/2 and aiming the earliest percent at the
+		// margin, as this did first, has no answer once frames spread over
+		// more than half a refresh (a game below the refresh rate, Wi-Fi
+		// jitter): the shift walked on forever, and the frames with it.
+		const double T = t;
+		for (double x : slack_)
+			phases_.push_back(x - shift_);
 		slack_.clear();
-		std::sort(s.begin(), s.end());
-		double low = s[s.size() / 100], least = s.front();
-		static constexpr double keep = 0.5e6;
-		// A larger shift moves the host's frames earlier (measured: +2 ms of
-		// shift gave +2 ms of slack). Gently: a step sees ~60 frames, and
-		// their earliest percent is one or two of them.
-		double move = std::clamp((keep - low) * 0.3, -0.5e6, 0.5e6);
-		shift_ += move;
-		sweeping_ = false;
-		has_target_ = true;
-		target_ = low;
-		expected_ = double(std::count_if(s.begin(), s.end(), [](double x) { return x >= 0; })) / double(s.size());
-		slack_steps_++;
-		if (debug_phase())
-			LOGI("phase: slack p1 %.2f min %.2f p50 %.2f ms, shift %+.2f (moved %+.2f)", low / 1e6,
-			     least / 1e6, s[s.size() / 2] / 1e6, shift_ / 1e6, move / 1e6);
+		while (phases_.size() > 480) // ~4 s at 120 fps
+			phases_.pop_front();
+		if (phases_.size() >= 60) {
+			static constexpr double keep = 0.5e6; // margin before the deadline
+			auto wait_of = [&](double phase, double d) {
+				double w = std::fmod(phase + shift_ + d - keep, T);
+				return (w < 0 ? w + T : w) + keep;
+			};
+			std::vector<double> w(phases_.size());
+			// The cost: the p99 wait first, then the median, then the
+			// smaller move (so a flat cost does not drift).
+			double best = 0, best_cost = 1e18, best_p99 = 0, best_p50 = 0;
+			int n = int(std::ceil(T / 0.1e6));
+			for (int i = 0; i < n; i++) {
+				double d = -T / 2 + i * T / n;
+				for (size_t k = 0; k < w.size(); k++)
+					w[k] = wait_of(phases_[k], d);
+				size_t i99 = w.size() * 99 / 100, i50 = w.size() / 2;
+				std::nth_element(w.begin(), w.begin() + long(i99), w.end());
+				double p99 = w[i99];
+				std::nth_element(w.begin(), w.begin() + long(i50), w.begin() + long(i99));
+				double p50 = w[i50];
+				double cost = p99 + 0.3 * p50 + 0.1 * std::fabs(d);
+				if (cost < best_cost) {
+					best_cost = cost;
+					best = d;
+					best_p99 = p99;
+					best_p50 = p50;
+				}
+			}
+			double move = std::clamp(best * 0.3, -0.5e6, 0.5e6);
+			shift_ += move;
+			sweeping_ = false;
+			has_target_ = true;
+			target_ = best_p50; // what the lock expects, once there
+			expected_ = best_p99;
+			slack_steps_++;
+			if (debug_phase()) {
+				std::vector<double> now(phases_.size());
+				for (size_t k = 0; k < now.size(); k++)
+					now[k] = wait_of(phases_[k], 0);
+				std::sort(now.begin(), now.end());
+				LOGI("phase: wait p50 %.2f p99 %.2f ms now, %.2f / %.2f at %+.2f; shift %+.2f (moved %+.2f)",
+				     now[now.size() / 2] / 1e6, now[now.size() * 99 / 100] / 1e6, best_p50 / 1e6,
+				     best_p99 / 1e6, best / 1e6, shift_ / 1e6, move / 1e6);
+			}
+		}
 		since_ = now_ns() + 100000000ull;
 		return result();
 	}
 	slack_.clear();
+	if (slack_steps_ > 0)
+		return result(); // on slack, and few frames this step (a still screen): hold
 	if (sweeping_) {
 		double display = d[d.size() / 2];
 		sweep_.push_back({shift_, display, drops * 30 < int(d.size())});
@@ -312,8 +356,8 @@ std::string PhaseLock::summary()
 		snprintf(b, sizeof(b), "phase: sweeping %zu/%d, shift %+.1f ms, refresh %.3f ms", sweep_.size(),
 		         int(std::ceil(interval() / sweep_step)), shift_ / 1e6, interval() / 1e6);
 	else if (slack_steps_ > 0)
-		snprintf(b, sizeof(b), "phase: on slack, shift %+.1f ms, refresh %.3f ms, slack p1 %.2f ms, %.1f%% made it",
-		         shift_ / 1e6, interval() / 1e6, target_ / 1e6, expected_ * 100);
+		snprintf(b, sizeof(b), "phase: on slack, shift %+.1f ms, refresh %.3f ms, wait p50 %.2f p99 %.2f ms",
+		         shift_ / 1e6, interval() / 1e6, target_ / 1e6, expected_ / 1e6);
 	else if (has_target_)
 		snprintf(b, sizeof(b), "phase: locked, shift %+.1f ms, refresh %.3f ms, host lead %.2f ms, %.0f%% shown expected",
 		         shift_ / 1e6, interval() / 1e6, target_ / 1e6, expected_ * 100);

@@ -136,8 +136,16 @@ smallest stripe) and the margin the phase lock keeps.
 In scanout mode the phase lock steers on each shown frame's slack (how much
 later it could have come and still made its refresh: streamed frames against
 their rows' deadlines, whole frames against their sample point, modulo a
-refresh so that just missing reads as late), moving the host until the
-earliest percent have ~0.5 ms left. Its usual servo could not do this: a frame
+refresh so that just missing reads as late). That is also how long the frame
+waited for its sample point, modulo a refresh, so over the last ~4 s of frames
+it picks the phase whose p99 wait (with a 0.5 ms margin before each deadline)
+is shortest, then the median, and moves the host there gently. It first aimed
+the earliest percent of slack, folded to +-half a refresh, at 0.5 ms: once
+frames spread over more than half a refresh (Witcher 3 at ~97 fps over Wi-Fi)
+that has no answer, and the shift walked on without end (+234 ms after a few
+minutes), the frames sweeping through the sample point (total 12.0 / 21.1 ms
+p50 / p99); now it holds within a few ms (10.4 / 18.9, the tail being frames
+the network made late). Its usual servo could not do this: a frame
 that just misses a sample point goes out at the next and counts as on time, so
 it never learned that shorter waits were safe, and parked AV1 frames ~4 ms
 early (Ender Lilies, live: total 10.5 -> 7.5 / 8.2 ms p50 / p99). Low latency

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -56,7 +57,10 @@ private:
 	std::vector<double> bin_all_, bin_dropped_;
 	std::vector<double> recent_;
 	double margin_ = 3e6;
-	std::vector<double> slack_; // this step's streamed frames
+	std::vector<double> slack_; // this step's frames' slack (scanout)
+	// The last few seconds of them, as their phase (slack less the shift they
+	// were measured under), so they still count after the shift has moved.
+	std::deque<double> phases_;
 	int slack_steps_ = 0;
 	int drops_ = 0;
 };
