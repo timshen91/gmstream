@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -21,9 +22,15 @@ public:
 	struct Row { std::string name; bool has; double p50, p99, max; };
 	struct Taken { std::vector<Row> rows; int shown = 0, dropped = 0, torn = 0, tear_min = 0, tear_max = 0; };
 	Taken take();
+	// The latency chart (apple/Latency.swift, LatencyChart): the last 10 s of
+	// shown frames as (seconds ago, host present -> to Android ms, host
+	// present -> on screen ms), oldest first.
+	void chart(std::vector<float> &out, uint64_t now);
 
 private:
 	std::mutex lock_;
+	struct Point { uint64_t at; float base, total; };
+	std::deque<Point> chart_;
 	struct Entry { uint64_t at; std::vector<double> v; std::vector<bool> has; };
 	std::vector<Entry> frames_;
 	int shown_ = 0, dropped_ = 0, torn_ = 0, tear_min_ = 1 << 30, tear_max_ = -1;

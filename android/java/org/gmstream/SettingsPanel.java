@@ -99,7 +99,8 @@ final class SettingsPanel {
             i -> i == 0 ? "Touchscreen" : "Mouse"));
         rows.add(toggle("Wi-Fi awake", () -> prefs.keepWiFiAwake, v -> prefs.keepWiFiAwake = v, null));
         rows.add(toggle("GPU awake", () -> prefs.keepGPUAwake, v -> prefs.keepGPUAwake = v, () -> prefs.codec == 4));
-        rows.add(toggle("Stats", () -> prefs.showStats, v -> prefs.showStats = v, null));
+        rows.add(choice("Stats", 3, () -> prefs.statsMode, i -> prefs.statsMode = i,
+            i -> i == 0 ? "Off" : i == 1 ? "Chart only" : "Full"));
 
         // The connection.
         rows.add(header("Connection"));

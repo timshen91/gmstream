@@ -55,6 +55,25 @@ void StageStats::add(const FrameTiming &t)
 	last_present_ = t.local ? t.present_local : 0;
 	shown_++;
 	frames_.push_back(std::move(e));
+	if (t.local && t.presented) {
+		chart_.push_back({t.presented, float(ms(t.present_local, t.submitted)), float(ms(t.present_local, t.presented))});
+		while (!chart_.empty() && t.presented - chart_.front().at > 10000000000ull)
+			chart_.pop_front();
+	}
+}
+
+void StageStats::chart(std::vector<float> &out, uint64_t now)
+{
+	std::lock_guard<std::mutex> g(lock_);
+	while (!chart_.empty() && now > chart_.front().at && now - chart_.front().at > 10000000000ull)
+		chart_.pop_front();
+	out.clear();
+	out.reserve(chart_.size() * 3);
+	for (auto &p : chart_) {
+		out.push_back(float(double(int64_t(now) - int64_t(p.at)) / 1e9));
+		out.push_back(p.base);
+		out.push_back(p.total);
+	}
 }
 
 void StageStats::drop()

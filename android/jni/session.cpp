@@ -239,6 +239,7 @@ public:
 	}
 
 	std::string stats();
+	void chart(std::vector<float> &out) { stages_.chart(out, now_ns()); }
 
 	// ConnectionListener.
 	void on_frame(Frame &&f) override;
@@ -764,6 +765,16 @@ FN(void, setSurface)(JNIEnv *env, jclass, jlong h, jobject surface)
 }
 
 FN(jstring, stats)(JNIEnv *env, jclass, jlong h) { return env->NewStringUTF(S(h)->stats().c_str()); }
+
+FN(jfloatArray, chart)(JNIEnv *env, jclass, jlong h)
+{
+	std::vector<float> v;
+	S(h)->chart(v);
+	jfloatArray a = env->NewFloatArray(jsize(v.size()));
+	if (!v.empty())
+		env->SetFloatArrayRegion(a, 0, jsize(v.size()), v.data());
+	return a;
+}
 
 FN(void, key)(JNIEnv *, jclass, jlong h, jint code, jboolean down)
 {

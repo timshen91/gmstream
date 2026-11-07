@@ -31,6 +31,8 @@ final class Native {
     static native void stop(long h);
     static native void setSurface(long h, android.view.Surface surface);
     static native String stats(long h);
+    /** The latency chart's last 10 s: (seconds ago, to Android ms, total ms) per frame. */
+    static native float[] chart(long h);
     static native void key(long h, int evdev, boolean down);
     static native void button(long h, int evdev, boolean down);
     static native void motion(long h, double dx, double dy);

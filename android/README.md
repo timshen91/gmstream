@@ -41,6 +41,14 @@ through StreamCodec (0x13: the host starts its encoder over in the same
 session and answers HelloAck, and the decoders here start over), pacing,
 scanout, Wi-Fi and GPU awake here. Only another host or port reconnects.
 
+The stats sit at the top right (Settings -> Stats): Full is the text and,
+under it, the latency chart (`ChartView`, as apple/Latency.swift's: the last
+10 s per frame, host present -> handed to Android as a line, the display stage
+up to the total as a band, the scale stepping 20/40/80... ms to fit, a pause
+breaking the line); Chart only is the chart alone, 240 x 56 dp, for playing
+with it on; Off shows only a status line when there is one. The chart is
+redrawn ten times a second, the text once.
+
 For scripts, the launch intent takes the settings and saves them:
 `adb shell am start -n org.gmstream/.MainActivity --es host H --ei port P
 --ei codec 0|1|2|4 --ei mbps M --ei pacing 0|1 --ez stats true|false

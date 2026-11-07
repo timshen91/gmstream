@@ -11,7 +11,7 @@ final class Prefs {
     int mbps = 40;
     String size = "";       // "" = the screen's, else WxH
     double refresh = 0;     // 0 = the screen's
-    boolean showStats = true;
+    int statsMode = 2;      // 0 off, 1 the latency chart alone, 2 the stats and the chart
     boolean keepWiFiAwake = true;
     boolean keepGPUAwake = true;
     boolean streamFrames = true;  // AV1/HEVC in pieces
@@ -33,7 +33,8 @@ final class Prefs {
         o.mbps = p.getInt("mbps", o.mbps);
         o.size = p.getString("size", o.size);
         o.refresh = Double.longBitsToDouble(p.getLong("refresh", Double.doubleToLongBits(o.refresh)));
-        o.showStats = p.getBoolean("showStats", o.showStats);
+        o.statsMode = p.contains("statsMode") ? p.getInt("statsMode", o.statsMode)
+            : p.getBoolean("showStats", true) ? 2 : 0;
         o.keepWiFiAwake = p.getBoolean("keepWiFiAwake", o.keepWiFiAwake);
         o.keepGPUAwake = p.getBoolean("keepGPUAwake", o.keepGPUAwake);
         o.streamFrames = p.getBoolean("streamFrames", o.streamFrames);
@@ -49,7 +50,7 @@ final class Prefs {
         c.getSharedPreferences("gmstream", Context.MODE_PRIVATE).edit()
             .putString("host", host).putInt("port", port).putInt("codec", codec).putInt("mbps", mbps)
             .putString("size", size).putLong("refresh", Double.doubleToLongBits(refresh))
-            .putBoolean("showStats", showStats).putBoolean("keepWiFiAwake", keepWiFiAwake)
+            .putInt("statsMode", statsMode).putBoolean("keepWiFiAwake", keepWiFiAwake)
             .putBoolean("keepGPUAwake", keepGPUAwake).putBoolean("streamFrames", streamFrames)
             .putInt("parallelism", parallelism).putInt("stripes", stripes).putInt("pacing", pacing)
             .putBoolean("touchscreen", touchscreen).putBoolean("scanout", scanout).apply();

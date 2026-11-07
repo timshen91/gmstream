@@ -53,6 +53,8 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
     private FrameLayout root;
     private SurfaceView video;
     private TextView stats;
+    private LinearLayout hud;
+    private ChartView chart;
     private SettingsPanel settings;
     private WifiManager.WifiLock wifiLock;
     private String status = "";
@@ -78,14 +80,35 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         video.getHolder().addCallback(this);
         root.addView(video, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+        // The stats and the latency chart, top right (Settings -> Stats:
+        // Full, Chart only, Off).
+        float dp = getResources().getDisplayMetrics().density;
+        hud = new LinearLayout(this);
+        hud.setOrientation(LinearLayout.VERTICAL);
+        hud.setPadding((int) (8 * dp), (int) (4 * dp), (int) (8 * dp), (int) (6 * dp));
+        android.graphics.drawable.GradientDrawable box = new android.graphics.drawable.GradientDrawable();
+        box.setColor(0x99000000);
+        box.setCornerRadius(4 * dp);
+        hud.setBackground(box);
         stats = new TextView(this);
         stats.setTypeface(Typeface.MONOSPACE);
         stats.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
         stats.setTextColor(Color.WHITE);
-        stats.setBackgroundColor(0x99000000);
-        stats.setPadding(12, 8, 12, 8);
-        root.addView(stats, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START));
+        // Its own width (a vertical LinearLayout would stretch it to the
+        // chart's and wrap the lines).
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.gravity = Gravity.END;
+        hud.addView(stats, slp);
+        chart = new ChartView(this);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams((int) (240 * dp), (int) (56 * dp));
+        clp.topMargin = (int) (4 * dp);
+        clp.gravity = Gravity.END;
+        hud.addView(chart, clp);
+        FrameLayout.LayoutParams hlp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.END);
+        hlp.topMargin = hlp.rightMargin = (int) (6 * dp);
+        root.addView(hud, hlp);
         setContentView(root);
         hideSystemBars();
 
@@ -133,7 +156,8 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         prefs.pacing = x.getInt("pacing", prefs.pacing);
         prefs.parallelism = x.getInt("parallelism", prefs.parallelism);
         prefs.stripes = x.getInt("stripes", prefs.stripes);
-        prefs.showStats = x.getBoolean("stats", prefs.showStats);
+        if (x.containsKey("stats")) prefs.statsMode = x.getBoolean("stats", true) ? 2 : 0;
+        prefs.statsMode = x.getInt("statsMode", prefs.statsMode);
         prefs.scanout = x.getBoolean("scanout", prefs.scanout);
         prefs.streamFrames = x.getBoolean("pieces", prefs.streamFrames);
         if (x.containsKey("size")) prefs.size = x.getString("size", prefs.size);
@@ -241,18 +265,29 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         if (wifiLock.isHeld()) wifiLock.release();
     }
 
+    private long lastTextAt;
+
+    // The chart ten times a second; the text once a second (its counts: fps
+    // shown, drops, tears, composes are since the last poll).
     private final Runnable statsTick = new Runnable() {
         @Override public void run() {
             if (h != 0) {
-                String text = streaming ? Native.stats(h) : "";
-                if (!status.isEmpty()) text = status + (text.isEmpty() ? "" : "\n" + text);
-                if (!streaming && prefs.host.isEmpty()) text = "";
-                stats.setText(text);
-                stats.setVisibility((prefs.showStats || !status.isEmpty()) && !text.isEmpty() ? View.VISIBLE : View.GONE);
+                long now = android.os.SystemClock.uptimeMillis();
+                boolean full = prefs.statsMode == 2, showChart = prefs.statsMode >= 1 && streaming;
+                if (now - lastTextAt >= 1000) {
+                    lastTextAt = now;
+                    String text = streaming && full ? Native.stats(h) : "";
+                    if (!status.isEmpty()) text = status + (text.isEmpty() ? "" : "\n" + text);
+                    if (!streaming && prefs.host.isEmpty()) text = "";
+                    stats.setText(text);
+                    stats.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
+                }
+                chart.setVisibility(showChart ? View.VISIBLE : View.GONE);
+                if (showChart) chart.set(Native.chart(h));
+                boolean any = stats.getVisibility() == View.VISIBLE || showChart;
+                hud.setVisibility(any ? View.VISIBLE : View.GONE);
             }
-            // Once a second: the overlay's counts (fps shown, drops, tears,
-            // composes) are since the last poll.
-            ui.postDelayed(this, 1000);
+            ui.postDelayed(this, 100);
         }
     };
 
