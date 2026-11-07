@@ -1,5 +1,10 @@
 Throttle FIFO games instead of queueing their frames (gmstream; gm_throttle, on by default).
 
+Not for a game under Steam's frame limiter (GAMESCOPE_FPS_LIMIT): the limiter
+paces it already, a finished frame waiting for the limiter's refresh read as a
+backlog here, and the skipped releases took a 60 fps limit on a 120 Hz output
+to 40-45 fps (62 with the throttle off; Witcher 3, 2026-11-07).
+
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
 @@ -294,6 +294,20 @@ timespec nanos_to_timespec( uint64_t ulNanos )
@@ -28,7 +33,7 @@ Throttle FIFO games instead of queueing their frames (gmstream; gm_throttle, on 
  		if (!lastCommit->presentation_feedbacks.empty() || lastCommit->present_id)
  		{
 -			if (!lastCommit->presentation_feedbacks.empty())
-+			if ( cv_gm_throttle && lastCommit->fifo && !lastCommit->is_steam )
++			if ( cv_gm_throttle && lastCommit->fifo && !lastCommit->is_steam && !( g_nSteamCompMgrTargetFPS && steamcompmgr_window_should_limit_fps( w ) ) )
 +			{
 +				if ( !lastCommit->presentation_feedbacks.empty() )
 +				{
