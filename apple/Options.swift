@@ -123,6 +123,11 @@ struct Options {
     // the wire before it is finished (AV1 and HEVC; core/vkencode.c). Off: the
     // host sends whole frames, as before.
     var streamFrames = true
+    // Ask the host to pad each unit it sends (a stripe, a frame) to a multiple
+    // of 32 datagrams, which this Mac's Wi-Fi driver hands up at once instead
+    // of on its ~1.4 ms timer (PROTOCOL.md, "Flush alignment"; DESIGN.md
+    // §14.2). `--no-flush-align` turns it off.
+    var flushAlign = true
     // Each only means something for its own codecs, so each is asked for only
     // with them (and its setting is greyed out otherwise).
     static func takesFramesInPieces(_ codec: UInt8) -> Bool { codec == 1 || codec == 2 }
@@ -216,6 +221,7 @@ struct Options {
             case "--no-keep-awake": keepWiFiAwake = false
             case "--no-gpu-awake": keepGPUAwake = false
             case "--whole-frames": streamFrames = false
+            case "--no-flush-align": flushAlign = false
             case "--no-phase": phaseLock = false
             case "--hold": holdFrames = true; pacingMode = .manual
             case "--no-hold": holdFrames = false; pacingMode = .manual

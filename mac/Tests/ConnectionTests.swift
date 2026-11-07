@@ -130,7 +130,7 @@ final class ConnectionTests: XCTestCase {
         XCTAssertEqual(p.u32(10), 40_000)
         XCTAssertEqual(p[14], 0b1011)
         XCTAssertEqual(p[15], 3)
-        XCTAssertEqual(p[16], 0, "PyroWave preferred: no codec flags (frames in pieces, bit 2, are AV1 and HEVC's)")
+        XCTAssertEqual(p[16] & ~32, 0, "PyroWave preferred: no codec flags (frames in pieces, bit 2, are AV1 and HEVC's); bit 5 is flush alignment, any codec")
         XCTAssertGreaterThanOrEqual(Int(p.u16(17)), maxDatagram, "max_datagram: at least the control size, from the link's MTU")
     }
 
@@ -144,6 +144,25 @@ final class ConnectionTests: XCTestCase {
     func testFramesInPiecesGoOnlyWithAV1AndHEVC() {
         XCTAssertEqual(helloFlags(preferred: 2) & 4, 4, "AV1: frames in pieces")
         XCTAssertEqual(helloFlags(preferred: 4) & 4, 0, "Riptide: not")
+    }
+
+    func testFlushAlignAskedForByDefault() {
+        XCTAssertEqual(helloFlags(preferred: 4) & 32, 32)
+    }
+
+    func testFillerDatagramsAreDropped() {
+        // Type 12 is padding (PROTOCOL.md, "Flush alignment"): nothing of it
+        // reaches the delegate, and what follows still does.
+        start()
+        for _ in 0..<8 { host.send(Data([12])) }
+        var p = Writer()
+        p.u8(datagramRiptide); p.u32(42); p.u16(0); p.u16(1920); p.u16(1080); p.u64(1_000); p.u64(2_000)
+        p.u8(1); p.u32(40); p.u8(0); p.u8(1); p.u16(1080); p.u16(0); p.u16(0); p.u16(1); p.u8(0)
+        host.send(p.data + Data([9]))
+        waitUntil { recorder.snapshot.riptide.count == 1 }
+        XCTAssertEqual(recorder.snapshot.riptide.count, 1)
+        let snap = recorder.snapshot
+        XCTAssertTrue(snap.frames.isEmpty && snap.packets.isEmpty && snap.audio.isEmpty)
     }
 
     func testNoCodecFlagsWithH264() {

@@ -38,6 +38,9 @@ const HELLO_ONE_VIDEO_STREAM: u8 = 1;
 const HELLO_VIDEO_DATAGRAMS: u8 = 2;
 const HELLO_VIDEO_CHUNKS: u8 = 4;
 const HELLO_HDR: u8 = 8;
+/// The client asks for every unit to end on one of its Wi-Fi receive flushes
+/// (PROTOCOL.md, "Flush alignment"); plain UDP only.
+const HELLO_FLUSH_ALIGN: u8 = 32;
 
 // Client → host control messages.
 const C_HELLO: u8 = 0x01;
@@ -57,10 +60,10 @@ const C_VRR_POLICY: u8 = 0x0e;
 const C_TOUCH: u8 = 0x0f;
 const C_AUTH: u8 = 0x10;
 const C_PARALLELISM: u8 = 0x11;
+const C_ROTATION: u8 = 0x12;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
-const C_ROTATION: u8 = 0x12;
 const H_RELATIVE: u8 = 0x83;
 const H_CURSOR_CLIP: u8 = 0x87;
 const H_ENCODE_FORMAT: u8 = 0x88;
@@ -74,6 +77,9 @@ const VIDEO_FRAGMENT_HEADER: usize = 9;
 const DATAGRAM_PYROWAVE: u8 = 4;
 const DATAGRAM_VIDEO_CHUNK: u8 = 9;
 const DATAGRAM_RIPTIDE: u8 = 10;
+/// One byte, host -> client, dropped by the client: makes up a unit's count
+/// (FlushAlign).
+const DATAGRAM_FILL: u8 = 12;
 const VIDEO_CHUNK_HEADER: usize = 43;
 const CODEC_HEVC: u8 = 1;
 const CODEC_AV1: u8 = 2;
@@ -92,8 +98,57 @@ fn message(ty: u8, payload: &[u8]) -> Vec<u8> {
     m
 }
 
+/// Pads each unit the host sends (a Riptide stripe, a frame in pieces, a
+/// whole frame) with DATAGRAM_FILL so that its datagrams come to a multiple of
+/// FLUSH_PACKETS, for clients that ask (PROTOCOL.md, "Flush alignment").
+/// macOS's Wi-Fi driver hands a burst up to the socket as soon as 32 packets
+/// are pending, and otherwise only on a timer ~1.4 ms into the burst; a unit
+/// that ends on a multiple of 32 is handed up when its last datagram lands.
+/// Up to three datagrams after quiet are handed up at once and do not count,
+/// so a unit that small after quiet is left as it is. Measured in DESIGN.md §14.2.
+#[derive(Default)]
+struct FlushAlign {
+    /// Datagrams sent since the last unit ended on a flush.
+    pending: usize,
+    last_ns: u64,
+}
+
+const FLUSH_PACKETS: usize = 32;
+/// A gap after which the client's receive path has gone back to delivering at
+/// once (it does after ~1 ms; the margin keeps a near miss from misaligning).
+const FLUSH_QUIET_NS: u64 = 2_000_000;
+
+impl FlushAlign {
+    /// `n` more datagrams of a unit are going out; at the unit's end, returns
+    /// how many fillers to send after them.
+    fn add(&mut self, n: usize, end: bool) -> usize {
+        let now = core::now_ns();
+        let quiet = now.saturating_sub(self.last_ns) > FLUSH_QUIET_NS;
+        self.last_ns = now;
+        if quiet {
+            self.pending = 0;
+            if end && n <= 3 {
+                return 0;
+            }
+        }
+        self.pending += n;
+        if !end {
+            return 0;
+        }
+        let fill = (FLUSH_PACKETS - self.pending % FLUSH_PACKETS) % FLUSH_PACKETS;
+        self.pending = 0;
+        fill
+    }
+}
+
+fn fillers(n: usize) -> impl Iterator<Item = Vec<u8>> {
+    (0..n).map(|_| vec![DATAGRAM_FILL])
+}
+
 struct Client {
     conn: Arc<Conn>,
+    /// Some when the client asked for flush alignment.
+    flush: Option<Arc<Mutex<FlushAlign>>>,
     video: mpsc::Sender<(u32, Vec<u8>)>,
     /// Pieces of frames, ready to send; a frame is ~150 of them.
     chunks: mpsc::Sender<Vec<u8>>,
@@ -207,6 +262,12 @@ impl core::Sink for Hub {
             client.stats.queue_full.fetch_add(1, Ordering::Relaxed);
             core::request_keyframe();
         }
+        // The frame is the unit: it ends on a flush.
+        if let Some(f) = &client.flush {
+            for d in fillers(f.lock().unwrap().add(1, c.last)) {
+                let _ = client.chunks.try_send(d);
+            }
+        }
     }
 
     /// A Riptide stripe's packets, one datagram each, out
@@ -243,6 +304,12 @@ impl core::Sink for Hub {
             }
             index += 1;
             rest = &rest[2 + len..];
+        }
+        // The stripe is the unit: it ends on a flush.
+        if let Some(f) = &client.flush {
+            for d in fillers(f.lock().unwrap().add((index - p.first) as usize, true)) {
+                let _ = client.chunks.try_send(d);
+            }
         }
         if p.stripe + 1 == p.stripes {
             client.stats.encoded.fetch_add(1, Ordering::Relaxed);
@@ -447,7 +514,7 @@ fn send_times_summary() -> Option<String> {
     Some(format!("encoded→send {}, send {}", pct(&mut v, |t| t.0), pct(&mut v, |t| t.1)))
 }
 
-async fn send_pyrowave(conn: &Conn, buf: &[u8]) -> bool {
+async fn send_pyrowave(conn: &Conn, buf: &[u8], flush: Option<&Mutex<FlushAlign>>) -> bool {
     let start = core::now_ns();
     let (head, mut rest) = buf.split_at(VIDEO_HEADER);
     let mut packets = Vec::new();
@@ -469,6 +536,10 @@ async fn send_pyrowave(conn: &Conn, buf: &[u8]) -> bool {
         d.extend_from_slice(&head[12..28]); // slot_ns, encoded_ns
         d.extend_from_slice(p);
         ds.push(d);
+    }
+    if let Some(f) = flush {
+        let n = f.lock().unwrap().add(ds.len(), true);
+        ds.extend(fillers(n));
     }
     let ok = conn.send_datagrams_wait(ds).await.is_ok();
     if std::env::var_os("GM_DEBUG_SEND").is_some() {
@@ -531,6 +602,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     let datagrams = conn.is_udp() || flags & HELLO_VIDEO_DATAGRAMS != 0;
     let wants_chunks = flags & HELLO_VIDEO_CHUNKS != 0;
     let wants_hdr = flags & HELLO_HDR != 0;
+    let wants_flush = conn.is_udp() && flags & HELLO_FLUSH_ALIGN != 0;
     let one_stream = !datagrams && flags & HELLO_ONE_VIDEO_STREAM != 0;
     if !(1..=PROTOCOL_VERSION).contains(&version) {
         send_error(&mut send, "Protocol version mismatch; reload the page").await;
@@ -572,7 +644,8 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     // Deep enough for a keyframe, which is a few thousand pieces.
     let (chtx, mut chrx) = mpsc::channel::<Vec<u8>>(8192);
     let (ctx, mut crx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let client = Arc::new(Client { conn: conn.clone(), video: vtx, chunks: chtx, ctrl: ctx, audio_seq: AtomicU32::new(0), stats: Arc::default() });
+    let flush = wants_flush.then(|| Arc::new(Mutex::new(FlushAlign::default())));
+    let client = Arc::new(Client { conn: conn.clone(), flush: flush.clone(), video: vtx, chunks: chtx, ctrl: ctx, audio_seq: AtomicU32::new(0), stats: Arc::default() });
     // HelloAck goes first; the core's cursor and lock state follow it.
     let _ = client.ctrl.send(message(H_HELLO_ACK, &[codec]));
     if let Some(old) = HUB.replace(client.clone()) {
@@ -608,6 +681,9 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     }
     if wants_hdr {
         eprintln!("gmstream: client {n} can show HDR10");
+    }
+    if wants_flush {
+        eprintln!("gmstream: client {n} gets each unit padded to {FLUSH_PACKETS} datagrams");
     }
     core::stream_start(
         codec,
@@ -659,13 +735,14 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
             // fragment loses the frame and the client asks for a keyframe.
             while let Some((id, buf)) = vrx.recv().await {
                 if buf[5] == CODEC_PYROWAVE {
-                    if send_pyrowave(&video_conn, &buf).await {
+                    if send_pyrowave(&video_conn, &buf, flush.as_deref()).await {
                         stats.sent.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
                 }
                 let Some(max) = video_conn.max_datagram_size() else { return };
                 let chunk = max - VIDEO_FRAGMENT_HEADER;
+                let mut ds = Vec::new();
                 let count = buf.len().div_ceil(chunk) as u16;
                 for (i, part) in buf.chunks(chunk).enumerate() {
                     let mut d = Vec::with_capacity(VIDEO_FRAGMENT_HEADER + part.len());
@@ -674,9 +751,14 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
                     d.extend_from_slice(&(i as u16).to_le_bytes());
                     d.extend_from_slice(&count.to_le_bytes());
                     d.extend_from_slice(part);
-                    if video_conn.send_datagram_wait(d).await.is_err() {
-                        return;
-                    }
+                    ds.push(d);
+                }
+                if let Some(f) = &flush {
+                    let n = f.lock().unwrap().add(ds.len(), true);
+                    ds.extend(fillers(n));
+                }
+                if video_conn.send_datagrams_wait(ds).await.is_err() {
+                    return;
                 }
                 stats.sent.fetch_add(1, Ordering::Relaxed);
             }
@@ -687,7 +769,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
             stream.set_priority(i32::MAX);
             while let Some((_, mut buf)) = vrx.recv().await {
                 if buf[5] == CODEC_PYROWAVE {
-                    if send_pyrowave(&video_conn, &buf).await {
+                    if send_pyrowave(&video_conn, &buf, flush.as_deref()).await {
                         stats.sent.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
@@ -702,7 +784,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         } else {
             while let Some((id, buf)) = vrx.recv().await {
                 if buf[5] == CODEC_PYROWAVE {
-                    if send_pyrowave(&video_conn, &buf).await {
+                    if send_pyrowave(&video_conn, &buf, flush.as_deref()).await {
                         stats.sent.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
@@ -764,6 +846,12 @@ async fn control_loop(recv: &mut RecvStream, client: &Client) -> Result<()> {
             // Tiles or slice segments per frame; 0 for the codec's default.
             // The encoder clamps it to what the hardware and the picture allow.
             C_PARALLELISM => core::set_parallelism(r.u16()?.min(256)),
+            C_ROTATION => {
+                let q = r.u8()?;
+                if q == 0 || q == 1 || q == 3 {
+                    core::set_rotation(q);
+                }
+            }
             C_KEY => core::key(r.u16()? as u32, r.u8()? != 0),
             C_BUTTON => core::pointer_button(r.u16()? as u32, r.u8()? != 0),
             C_MOTION => core::pointer_motion(r.f32()?, r.f32()?),
@@ -834,9 +922,3 @@ fn steam_vrr(policy: u8) {
     }
     eprintln!("gmstream: Steam VRR {}", ["left to Steam", "off (fixed refresh)", "on"][policy as usize]);
 }
-            C_ROTATION => {
-                let q = r.u8()?;
-                if q == 0 || q == 1 || q == 3 {
-                    core::set_rotation(q);
-                }
-            }

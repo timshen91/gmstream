@@ -967,10 +967,27 @@ screen (core/compositor.c, "panel"): gamescope stays nested on gmstream-0
 exactly as when streaming, so connecting is a switch of display, not of
 session.
 
-- **Screen:** wlroots' DRM backend through a logind session (libseat, the
-  seat0 session in XDG_SESSION_ID, as native gamescope takes it). An external
-  screen if one is connected, else the built-in panel (native Game Mode's
-  choice), at its preferred mode, adaptive sync on when supported.
+- **Screen:** wlroots' DRM backend through a logind session (libseat, as
+  native gamescope takes it). An external screen if one is connected, else the
+  built-in panel (native Game Mode's choice), at its preferred mode, adaptive
+  sync on when supported.
+- **The session cannot be taken once and kept** (`panel_take`). SDDM logs in
+  again several times in the first seconds of a boot, and once more whenever
+  this service restarts (gamescope dies with our socket), and logind revokes
+  the devices of the session that ended: every flip then fails with EACCES.
+  Waiting for a session to settle before coming up only deadlocks -- nothing
+  settles until gamescope can connect to us -- so the screen is taken at
+  start-up and taken again whenever it stops being ours. Nothing tells us it
+  is gone (libseat only errors when called, and logind removes the session
+  rather than deactivating it, so the session's active signal may never fire),
+  so a 1 Hz check asks the card whether we are still its DRM master, with
+  DRM_IOCTL_AUTH_MAGIC rather than libdrm's `drmIsMaster`, which reads a
+  revoked device (ENODEV) as still ours. On a boot the first screen typically
+  lasts a second or two and the second one stays. The start-up attempt matters
+  even when it does not survive: without a screen, the dmabuf formats offered
+  to gamescope are the generic ones, it binds to a modifier the display engine
+  cannot scan out, and every frame is copied for the life of the session; the
+  formats of the screen the first attempt finds are the ones the second needs.
 - **Frames:** each committed buffer goes to the screen as it is (direct
   scanout) or, if the display engine cannot take it, is copied into the
   screen's own buffer; one flip at a time, the newest frame committed during
@@ -982,7 +999,16 @@ session.
   before, none after. The encoder imports the same buffers.
 - **Input:** libinput (keyboard, touchpad, mouse, touchscreen) into the same
   seat the network's input uses; touch through patch 0006, so SteamOS's
-  touch mode applies. gamescope's cursor goes on the screen's cursor plane.
+  touch mode applies. gamescope's cursor goes on the screen's cursor plane,
+  through `wlr_cursor` (`screen_cursor_update`): gamescope hands its cursor
+  over as a surface, as it does for a streaming client, and only `wlr_cursor`
+  takes a surface. A bare `wlr_output_cursor` takes a buffer, and the one
+  behind a surface is a `wlr_client_buffer` whose source is already released,
+  so `wlr_texture_from_buffer` returns NULL and the cursor is dropped without
+  a word at any log level. `wlr_cursor` also pads the image to a size the
+  plane accepts -- this hardware takes 256x256 only, where gamescope's cursors
+  are 24x24 or 32x32 -- and follows the screens in the layout by itself, so
+  there is nothing to create or destroy as panel mode comes and goes.
 - **Switching:** a client connecting turns the screen off (as native Game
   Mode does when another display is connected) and gamescope's output takes
   the client's mode; when the last client leaves, the screen comes back at
@@ -2212,16 +2238,136 @@ stripes alternating over two compute queues (all measured, all reverted).
 - The host's encode under a GPU-bound game: the motion search over the whole
   frame at once (fewer, fuller dispatches) before the stripes' backs, or fewer
   stripes when the GPU is contended.
-- The hotspot carries a frame's stripes slower than one burst: at 100 Mb/s under
-  vkcube a 104 KB frame arrives over ~3.2 ms in stripes (about 280 Mb/s; the
-  host sends each stripe 0.01 ms after it is ready, `GM_DEBUG_SEND`), against
-  1.7-2.2 ms as one burst, and the client sees each stripe land at once and
-  stripes 1-3 together (`GM_DEBUG_TRACE` now records type 10's packet and
-  stripe). Small bursts aggregate worse on the air, which is likely why longer
-  stripes measured better. Keeping the Mac's Wi-Fi awake at 500-2000 Hz instead
-  of 60 changed nothing. Untried: the hotspot's own aggregation settings
-  (mt76), carefully, from the wired network.
+- (Done, §14.) The hotspot carried a frame's stripes slower than one burst
+  (~3.2 ms for a 104 KB frame, about 280 Mb/s): the access point's video
+  queue's TXOP limit. Without it the frame arrives over ~1.55 ms.
 - The client's display stage (decoded -> on screen) was 22 ms in a window on
   2026-11-04 before the stripes, which is now the biggest part of the total; not
   looked at here (pacing, DESIGN.md §3.7).
 - The iPad app builds but is not installed (not connected).
+
+## 14. The network stage, measured (2026-11-05)
+
+What a frame's network time is made of, from the host's `sendmmsg` to the
+client's socket, and what of it can be had. The path measured: the host is its
+own access point (an MT7925 under Linux, `mt7925e`, NetworkManager's
+wpa_supplicant AP) on 5 GHz channel 44 at 80 MHz; the client a MacBook Air M4
+(Broadcom radio, Apple's DriverKit driver) one hop away at -30 dBm; HE-MCS 11,
+two streams, 1200 Mb/s both ways; 2 retries in 90 000 datagrams.
+
+The tool is `tools/wburst`: a sender that sends frames as gmstream's host does
+(each burst one `sendmmsg`, DSCP AF41, any burst layout: a whole frame, Riptide's
+stripes at their measured times, single datagrams) and a receiver that records
+every datagram's kernel arrival. Its one-way numbers carry the clocks' offset,
+taken from the shortest ping round trip, so they are right only within half of
+it (~0.5 ms); comparisons at the same ping rate are not affected, and the
+conclusions below rest on comparisons and on offset-free measures (spreads,
+thresholds, the host's own timeline). The host's timeline came from tracing the
+driver (`mt76_dma_tx_queue_skb`, the datagram handed to the DMA ring;
+`mt7925_txwi_free`, the radio done with it), with `trace_clock` mono, the clock
+the sender stamps with.
+
+### 14.1 The access point's video queue
+
+hostapd's default EDCA for an access point gives the video queue (AC_VI, where
+AF41 goes) a 3.008 ms TXOP limit. With it this card's firmware sends a frame in
+aggregates of ~32 with 0.6-1.5 ms between them: a 104 KB frame arrived over
+2.2 ms, against 0.75 ms in best effort, whose TXOP is 0. With the video queue's
+TXOP set to 0 and nothing else changed (`tools/wmmset`, nl80211's
+`NL80211_ATTR_WIPHY_TXQ_PARAMS`, what hostapd itself sets at start):
+
+| 104 KB frames at 120 Hz, last datagram after first sent, p50 / p99 | TXOP 3.008 ms | TXOP 0 |
+|---|---|---|
+| one burst | 4.0-4.1 / 5.3-5.5 ms | 2.6 / 4.6 |
+| five stripes, Riptide's timing | 4.2 / 6.3-6.6 | 4.06 / 5.5 |
+
+| Riptide, 2560x1600 @120, vkcube, the app in `--probe` | TXOP 3.008 ms | TXOP 0 |
+|---|---|---|
+| 100 Mb/s: present -> decoded, p50 / p99 | 5.59-5.89 / 7.0-8.1 | 4.43-4.74 / 7.5 |
+| 100 Mb/s: first -> last packet, p50 | 3.16-3.18 | 1.54-1.56 |
+| 300 Mb/s: present -> decoded, p50 / p99 | 6.67-7.42 / 8.7-11.9 | 6.05-6.16 / 8.4-10.3 |
+
+Best effort does as well as the video queue without its TXOP, but gives up the
+video queue's shorter AIFS and contention window over the client's other
+traffic, so the fix is the TXOP, not the marking. Only the access point's own
+EDCA changes; clients keep what the beacon advertises. Any restart of the
+access point (NetworkManager's, Steam's) resets it, so whatever runs the
+hotspot has to apply it again each time; applying it at 10 Hz during a stream
+cost nothing measurable.
+
+### 14.2 The client's receive hold (macOS)
+
+The Mac delivers a burst of three datagrams or fewer as it lands, and holds a
+burst of four or more for ~1.2-1.5 ms more:
+
+| burst, datagrams | 1 | 2 | 3 | 4 | 8 |
+|---|---|---|---|---|---|
+| host: handed to DMA | 18 us | 22 | 29 | 29 | 37 |
+| host: radio done (freed) | 0.84 ms | 1.00 | 1.20 | 1.14 | 1.14 |
+| Mac: delivered | 1.48 ms | 1.97 | 1.62 | 2.85 | 2.80 |
+
+- It counts datagrams, not bytes: four of 350 bytes are held, three of 1472 are
+  not.
+- The host's side is flat across the threshold, so the hold is the Mac's. Its
+  radio has the burst (it acknowledged it) while the socket still waits.
+- After the hold the Mac delivers in multiples of 32 datagrams, and while
+  traffic keeps coming, every ~300 us. A datagram that lands during a hold
+  waits for it: three datagrams 1-1.5 ms behind a 24 KB burst arrive with it,
+  ~3.0 ms after the burst was sent. After ~1 ms of quiet it is back to
+  delivering at once.
+- Nothing a process can do changes it. Not the socket's service type (BE, VI,
+  VO, RV, signalling), the uplink's rate (60 Hz to ~2 kHz), busy CPU cores, or
+  the datagram size. The driver's own real-time mode is already on during a
+  stream (its log: `checkTrafficCounters: realTime before<1> -> after<1>`,
+  counting the client's uplink, whose socket is `NET_SERVICE_TYPE_VI`), and it
+  holds all the same.
+- The driver has boot-args by these names: `wlan.coalesce.timeout`,
+  `wlan.coalesce.qsize`, `wlan.pcie.commitcoalesce`, `wlan.lowlatency.enable`,
+  `wlan.lowlatency.fw`. Tried with SIP off (2026-11-05): `qsize=1`, then
+  `timeout=0`, then all five at once (`qsize=1 timeout=0 commitcoalesce=0
+  lowlatency.enable=1 lowlatency.fw=1`). The kernel booted with each, the
+  driver logged nothing about any of them, and the hold did not move: 4
+  datagrams still ~1.2 ms more than 3. Either this release driver does not read
+  them, or they govern something else. There is no other known lever.
+
+### 14.3 Tried and dropped
+
+- Waking the client before the frame. Four tiny datagrams sent as the encode
+  starts take the hold before the frame's first stripe can. Synthetic: the last
+  stripe 0.5-0.7 ms sooner p50, p99 unchanged; three datagrams do nothing,
+  which is the threshold again. With Riptide it bought nothing p50 on vkcube.
+  On vkmark it bought 0.5-0.7 ms p50 but cost p99 (~11 ms against ~9). It works
+  around the client's driver rather than fixing anything, so it was dropped.
+- A trickle of tiny datagrams between frames, to keep the client polling
+  instead of holding: 0.3-0.45 ms p50 at the cost of a PPDU every 0.3-1 ms of
+  airtime. The hold is not avoided.
+- SO_WIFI_STATUS, the radio's own TX-done report: with it the driver serialises
+  and a frame takes ~50 ms. It measures nothing but itself.
+- The MT7925's runtime PM and firmware deep sleep: no difference. Toggling them
+  live wedged the access point, though: the client's uplink fell to MCS 0, and
+  after a down/up and a chip reset there were still no beacons while every
+  host-side tool said the hotspot was up. Only a restart of the hotspot
+  recovered it. Don't.
+
+### 14.4 Where it stands
+
+At 100 Mb/s the host has a 2560x1600 frame's last stripe out 1.9 ms after the
+frame starts. From there to the client's socket is ~2 ms. Up to ~0.8 ms of it is
+the host's radio (an upper bound: the driver hears late). About 0.2 ms is the
+stripe's airtime. The other 1.2-1.5 ms is the client's hold, which nothing
+outside the client can change, and the driver's boot-args do not either (§14.2). Without the hold, the network for the
+last stripe would be well under a millisecond.
+
+Airtime matters at higher rates. At 300 Mb/s a frame's packets spread over
+~3.5 ms, which is bandwidth-bound. A 160 MHz channel would about halve that,
+but in Japan 160 MHz exists only at 6 GHz: W52 (36-48) is the only 5 GHz block
+without radar detection, and this card cannot do radar detection as an access
+point. A 6 GHz hotspot would also need hostapd (wpa_supplicant's access point
+widens 6 GHz channels only for P2P groups), and every client without 6 GHz
+(the M1 iPad Pro) would lose it.
+
+With the packets now landing together, the client's decode is on the path.
+Several stripes arrive in one of the Mac's deliveries and are decoded one after
+another: last packet -> decoded is 0.85 ms p50, against 0.45 when the network
+spread them out. Decoding the stripes that arrive together as one submission
+would take most of that back.

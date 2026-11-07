@@ -61,7 +61,8 @@ datagrams (see Video; if both are set, datagrams win), bit 2 = video chunks
 BT.2020, ten-bit). Bit 2 belongs to its codecs: a client sets it only when it
 asks for AV1 or HEVC, and the host ignores it for any other codec it settles
 on. Bit 4 once asked for PyroWave inter frames; that is now its own codec,
-Riptide (below), and the bit is unused. Bit 3 states what the client is able to display, not what
+Riptide (below), and the bit is unused. Bit 5 = flush alignment (plain UDP
+only; see "Flush alignment" below), for any codec. Bit 3 states what the client is able to display, not what
 it wants: whether the session is HDR at all is the host's own setting (on
 SteamOS, Steam's display setting, which drives gamescope). The host sends an
 HDR stream only when both agree, and an eight-bit BT.709 one otherwise, so a
@@ -283,6 +284,28 @@ next frame intra. A client with nothing to predict from (it joined late, or
 more frames went missing than the host keeps) sends `KeyframeRequest` and
 decodes nothing until an intra frame comes.
 
+## Flush alignment
+
+macOS's Wi-Fi driver hands received packets to the socket in batches: up to
+three after a quiet spell go up at once; otherwise it holds them until 32 are
+pending or a timer runs out ~1.4 ms in (measured in DESIGN.md §14.2). A
+client that sets Hello bit 5 asks the host to end every unit it sends on a
+multiple of 32 datagrams, so that the unit's last datagram triggers the
+flush. The units are a Riptide stripe, an AV1/HEVC frame sent in pieces, a
+whole frame (types 2 and 4). After a unit's datagrams, in the same burst,
+the host sends filler datagrams:
+
+```
+u8  type = 12         host -> client; nothing else, dropped by the client
+```
+
+as many as bring the datagrams it has sent since the last aligned unit to a
+multiple of 32. A unit of three datagrams or fewer after 2 ms without any is
+left as it is (the driver delivers it at once and does not count it). Other
+datagrams (audio, control) are not counted; one arriving inside a unit puts
+the flush one datagram early, which costs nothing as long as the unit's
+fillers come last.
+
 ## Audio
 
 Datagrams (type 1; type 2 is video in datagram mode, 4 is PyroWave, 10 is Riptide):
@@ -318,6 +341,7 @@ type byte:
 | 9 | a piece of a frame, as in "Video chunks" above |
 | 10 | a Riptide packet, as in "Riptide" above |
 | 11 | a Riptide loss report (client → host), as in "Riptide" above |
+| 12 | filler (host → client), as in "Flush alignment" above |
 
 A session starts with a handshake. Client → host: type 6, an ephemeral X25519
 public key, then zeros up to 129 bytes in all (so a forged request gets back no

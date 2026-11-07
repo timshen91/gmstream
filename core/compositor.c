@@ -31,6 +31,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <drm.h>
 
 #include <drm_fourcc.h>
 #include <linux/input-event-codes.h>
@@ -48,6 +51,7 @@
 #include <wlr/render/wlr_texture.h>
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/types/wlr_keyboard.h>
@@ -207,10 +211,22 @@ struct vd_server {
 	// feedback is answered when its frame is actually on screen. NULL
 	// session: no seat to take the screen from (no panel mode).
 	struct wlr_session *session;
+	struct wlr_backend *drm_backend, *libinput_backend; // panel mode's
+	struct wl_event_source *panel_timer; // takes the seat session, retries
+	struct wl_listener session_active; // the seat session's
+	unsigned panel_fails; // commits refused in a row
+	bool panel_broken; // the session went away: drop it and take a fresh one
+	bool panel_complained; // the first failure is logged, not every retry
 	struct wl_list screens; // vd_screen
 	struct vd_screen *screen; // in use, NULL: none
 	bool panel; // frames go to `screen`
-	struct wlr_output_cursor *screen_cursor;
+	// The cursor on the screen (panel mode). wlr_cursor, not a bare
+	// wlr_output_cursor: a client's cursor is a surface, and only wlr_cursor
+	// takes one (wlr_output_cursor_set_buffer wants a buffer it can import,
+	// which a wlr_client_buffer whose source is gone is not). It also pads
+	// the image to a size the cursor plane takes -- this one wants 256x256 --
+	// and follows the screens in the layout by itself.
+	struct wlr_cursor *cursor;
 	bool flipping; // a commit is on its way to the screen
 	bool cursor_dirty; // the cursor moved during that commit
 	struct wlr_presentation_feedback *flip_feedback; // its frame's
@@ -243,6 +259,7 @@ struct vd_server {
 
 static void try_present(struct vd_server *server);
 static void panel_commit(struct vd_server *server, struct wlr_surface *surface);
+static void panel_lost(struct vd_server *server);
 static void view_outputs(struct vd_server *server, struct vd_view *view);
 
 uint64_t gm_now_ns(void) {
@@ -879,6 +896,17 @@ static void clear_cursor_surface(struct vd_server *server) {
 }
 
 static void screen_cursor_update(struct vd_server *server);
+static void cursor_sync(struct vd_server *server);
+
+// GM_DEBUG_CURSOR=1: what the client offers as a cursor, and what the panel's
+// cursor plane does with it.
+static bool gm_debug_cursor(void) {
+	static int on = -1;
+	if (on < 0) {
+		on = getenv("GM_DEBUG_CURSOR") != NULL;
+	}
+	return on != 0;
+}
 
 static void handle_cursor_commit(struct wl_listener *listener, void *data) {
 	struct vd_server *server =
@@ -904,6 +932,11 @@ static void handle_request_set_cursor(struct wl_listener *listener,
 	struct wlr_seat_pointer_request_set_cursor_event *event = data;
 	if (event->seat_client != server->seat->pointer_state.focused_client) {
 		return;
+	}
+	if (gm_debug_cursor()) {
+		wlr_log(WLR_INFO, "Cursor: client set %s, hotspot %d,%d",
+			event->surface != NULL ? "a surface" : "NOTHING (hidden)",
+			event->hotspot_x, event->hotspot_y);
 	}
 	clear_cursor_surface(server);
 	server->cursor_surface = event->surface;
@@ -1036,10 +1069,7 @@ static void pointer_moved(struct vd_server *server, double dx, double dy,
 		// The view is the whole screen at (0, 0): layout == surface coords.
 		wlr_seat_pointer_notify_motion(server->seat, time,
 			server->cursor_x, server->cursor_y);
-		if (server->screen_cursor != NULL) {
-			wlr_output_cursor_move(server->screen_cursor, server->cursor_x,
-				server->cursor_y);
-		}
+		cursor_sync(server);
 	}
 	wlr_seat_pointer_notify_frame(server->seat);
 }
@@ -1319,11 +1349,17 @@ static void screen_show(struct vd_server *server, struct wlr_buffer *buffer,
 	}
 	server->cursor_dirty = false;
 	if (wlr_output_commit_state(output, &state)) {
+		server->panel_fails = 0;
 		server->flipping = true;
 		server->flip_feedback = feedback;
 		server->stats_presented += buffer != NULL;
 	} else {
-		// Session inactive (another VT), or the screen went away.
+		// Session inactive (another VT), or the screen went away. A few in
+		// a row and the session is not coming back (see panel_take); the
+		// seat session's active signal usually gets there first.
+		if (++server->panel_fails > 10) {
+			panel_lost(server);
+		}
 		answer_now(server, feedback);
 		struct timespec now;
 		clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1404,16 +1440,39 @@ static void handle_screen_needs_frame(struct wl_listener *listener, void *data) 
 	}
 }
 
-static void screen_cursor_update(struct vd_server *server) {
-	if (server->screen_cursor == NULL) {
+// Where the screen shows the cursor. wlr_cursor works in layout coordinates;
+// ours are the screen's own (the view is the whole screen at 0,0).
+static void cursor_sync(struct vd_server *server) {
+	if (server->cursor == NULL || !server->panel || server->screen == NULL) {
 		return;
 	}
-	struct wlr_surface *surface = server->cursor_surface;
-	struct wlr_buffer *buffer = surface != NULL && surface->buffer != NULL ?
-		&surface->buffer->base : NULL;
-	wlr_output_cursor_set_buffer(server->screen_cursor, buffer,
+	struct wlr_box box;
+	wlr_output_layout_get_box(server->layout, server->screen->output, &box);
+	wlr_cursor_warp_closest(server->cursor, NULL, box.x + server->cursor_x,
+		box.y + server->cursor_y);
+}
+
+static void screen_cursor_update(struct vd_server *server) {
+	if (server->cursor == NULL) {
+		return;
+	}
+	if (!server->panel || server->cursor_surface == NULL) {
+		wlr_cursor_unset_image(server->cursor);
+		if (gm_debug_cursor()) {
+			wlr_log(WLR_INFO, "Cursor: hidden (%s)",
+				!server->panel ? "no panel" : "the client set none");
+		}
+		return;
+	}
+	wlr_cursor_set_surface(server->cursor, server->cursor_surface,
 		server->cursor_hotspot_x, server->cursor_hotspot_y);
-	wlr_output_cursor_move(server->screen_cursor, server->cursor_x, server->cursor_y);
+	cursor_sync(server);
+	if (gm_debug_cursor()) {
+		wlr_log(WLR_INFO, "Cursor: on the screen, %dx%d hotspot %d,%d",
+			server->cursor_surface->current.width,
+			server->cursor_surface->current.height,
+			server->cursor_hotspot_x, server->cursor_hotspot_y);
+	}
 }
 
 static void drop_next_frame(struct vd_server *server) {
@@ -1445,14 +1504,18 @@ static void panel_enter(struct vd_server *server) {
 	bool ok = wlr_output_commit_state(output, &state);
 	wlr_output_state_finish(&state);
 	if (!ok) {
-		wlr_log(WLR_ERROR, "Panel: cannot enable %s", output->name);
+		// Almost always the seat session this screen came through: see
+		// panel_take.
+		wlr_log(server->panel_complained ? WLR_DEBUG : WLR_ERROR,
+			"Panel: cannot enable %s", output->name);
+		panel_lost(server);
 		return;
 	}
 	server->panel = true;
+	server->panel_complained = false; // a later loss is worth logging again
 	// The modeset is a flip too: frames wait for it (sending one right
 	// behind it failed with "a page-flip is already pending").
 	server->flipping = true;
-	server->screen_cursor = wlr_output_cursor_create(output);
 	wlr_log(WLR_INFO, "Panel: showing on %s, %dx%d@%.3fHz%s", output->name,
 		output->width, output->height, output->refresh / 1000.0,
 		output->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED ? " VRR" : "");
@@ -1482,9 +1545,8 @@ static void panel_leave(struct vd_server *server) {
 		server->flip_feedback = NULL;
 	}
 	server->flipping = false;
-	if (server->screen_cursor != NULL) {
-		wlr_output_cursor_destroy(server->screen_cursor);
-		server->screen_cursor = NULL;
+	if (server->cursor != NULL) {
+		wlr_cursor_unset_image(server->cursor);
 	}
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
@@ -1563,6 +1625,166 @@ static void screen_added(struct vd_server *server, struct wlr_output *output) {
 	if (server->output != NULL) { // past start-up: hotplug
 		choose_screen(server);
 	}
+}
+
+// Panel mode's seat session (logind, through libseat), which is what the
+// screens and input devices of this machine come through.
+//
+// It cannot be taken once at start-up and kept. The Game Mode session relogs
+// several times in the first seconds of a boot, and once more whenever this
+// service restarts (gamescope dies with our socket, so SDDM logs in again),
+// and logind revokes the devices of the session that went away: every flip
+// then fails with EACCES. Nor can we wait for a session to settle before
+// coming up, because nothing settles until gamescope can connect to us.
+//
+// So the compositor starts without a screen and takes one afterwards, on a
+// timer, dropping it and taking a fresh one whenever it stops working. The
+// session that sticks is the one logind has as the user's display session
+// when the relogins are over.
+static void panel_retry_soon(struct vd_server *server, unsigned ms) {
+	if (server->panel_timer != NULL) {
+		wl_event_source_timer_update(server->panel_timer, ms);
+	}
+}
+
+// Called from output and commit handlers, so the session cannot be destroyed
+// here: the timer does it, out of wlroots' event handling.
+static void panel_lost(struct vd_server *server) {
+	if (server->session == NULL || server->panel_broken) {
+		return;
+	}
+	server->panel_broken = true;
+	panel_retry_soon(server, 0);
+}
+
+static void panel_drop(struct vd_server *server) {
+	server->panel_broken = false;
+	if (server->session == NULL) {
+		return;
+	}
+	panel_leave(server);
+	// The backends take their outputs and input devices with them, so our
+	// screens and inputs go through handle_screen_destroy and the input
+	// destroy handlers.
+	if (server->drm_backend != NULL) {
+		wlr_backend_destroy(server->drm_backend);
+		server->drm_backend = NULL;
+	}
+	if (server->libinput_backend != NULL) {
+		wlr_backend_destroy(server->libinput_backend);
+		server->libinput_backend = NULL;
+	}
+	wl_list_remove(&server->session_active.link);
+	wl_list_init(&server->session_active.link);
+	wlr_session_destroy(server->session);
+	server->session = NULL;
+	server->panel_fails = 0;
+}
+
+// Takes the seat session and this machine's devices with it, without starting
+// the backends: at start-up the multi-backend's own start does that, and it
+// has to happen after the renderer and the allocator exist.
+static bool panel_create(struct vd_server *server) {
+	// libseat's logind backend takes XDG_SESSION_ID when it is set, which
+	// is the session systemd started this service in -- by now often the
+	// dead one. Without it, it asks logind for the user's display session.
+	unsetenv("XDG_SESSION_ID");
+	server->session = wlr_session_create(server->loop);
+	if (server->session == NULL) {
+		return false;
+	}
+	struct wlr_device *gpu;
+	if (wlr_session_find_gpus(server->session, 1, &gpu) != 1) {
+		return false;
+	}
+	server->drm_backend = wlr_drm_backend_create(server->session, gpu, NULL);
+	if (server->drm_backend == NULL) {
+		return false;
+	}
+	wlr_multi_backend_add(server->backend, server->drm_backend);
+	// logind marks the session inactive when it ends, so this is how we
+	// hear that it is gone; see handle_session_active.
+	wl_signal_add(&server->session->events.active, &server->session_active);
+	server->libinput_backend = wlr_libinput_backend_create(server->session);
+	if (server->libinput_backend != NULL) {
+		wlr_multi_backend_add(server->backend, server->libinput_backend);
+	}
+	return true;
+}
+
+// Takes it again while running, where the multi-backend is long since
+// started: starting the DRM backend is what hands us its connectors
+// (new_output, then choose_screen and panel_enter).
+static bool panel_take(struct vd_server *server) {
+	if (!panel_create(server)) {
+		return false;
+	}
+	if (!wlr_backend_start(server->drm_backend)) {
+		return false;
+	}
+	if (server->libinput_backend != NULL) {
+		wlr_backend_start(server->libinput_backend);
+	}
+	return true;
+}
+
+// Whether the devices we took through the seat session are still ours. When
+// SDDM logs in again, logind ends the session we took them through and revokes
+// them: every flip then fails with EACCES, and nothing tells us -- libseat
+// only errors when we call it, and the session is removed rather than
+// deactivated, so its active signal may never fire. So ask the card.
+//
+// (Not libdrm's drmIsMaster: it reads a revoked device, which answers ENODEV,
+// as still being ours.)
+static bool panel_holds_drm(struct vd_server *server) {
+	int fd = server->drm_backend != NULL ?
+		wlr_backend_get_drm_fd(server->drm_backend) : -1;
+	if (fd < 0) {
+		return false;
+	}
+	struct drm_auth auth = {0};
+	if (ioctl(fd, DRM_IOCTL_AUTH_MAGIC, &auth) == 0) {
+		return true;
+	}
+	// Master: magic 0 is simply not in its table (EINVAL). Not master:
+	// EACCES. Revoked with the session: ENODEV.
+	return errno == EINVAL;
+}
+
+static void handle_session_active(struct wl_listener *listener, void *data) {
+	struct vd_server *server = wl_container_of(listener, server, session_active);
+	if (server->session == NULL || server->session->active) {
+		return;
+	}
+	// Either a VT switch (it comes back) or the session has ended, which is
+	// what happens whenever SDDM logs in again. Look once it has had time
+	// to come back.
+	wlr_log(WLR_INFO, "Panel: seat session inactive");
+	panel_retry_soon(server, 2000);
+}
+
+static int handle_panel_retry(void *data) {
+	struct vd_server *server = data;
+	if (server->session != NULL) {
+		if (!server->panel_broken && panel_holds_drm(server)) {
+			panel_retry_soon(server, 1000); // still ours: keep watch
+			return 0;
+		}
+		wlr_log(WLR_INFO, "Panel: the seat session %s went away; "
+			"taking the screen again", server->session->seat);
+		panel_drop(server);
+	}
+	if (!panel_take(server) || server->screen == NULL) {
+		if (!server->panel_complained) {
+			wlr_log(WLR_INFO, "Panel: no screen yet; retrying");
+			server->panel_complained = true;
+		}
+		panel_drop(server);
+		panel_retry_soon(server, 2000);
+		return 0;
+	}
+	panel_retry_soon(server, 1000);
+	return 0;
 }
 
 // Input devices of this machine.
@@ -1825,6 +2047,7 @@ enum cmd_type {
 	CMD_KEYFRAME,
 	CMD_BITRATE,
 	CMD_PARALLELISM,
+	CMD_ROTATION,
 	CMD_MOTION,
 	CMD_POSITION,
 	CMD_BUTTON,
@@ -1936,6 +2159,9 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 		release_all_input(server);
 		gamepads_remove_all(server->gamepads);
 		panel_enter(server);
+		if (server->session == NULL) {
+			panel_retry_soon(server, 500); // never got a screen: try again
+		}
 		break;
 	case CMD_DISPLAY_GRID:
 		if (server->grid_interval_ns == 0 && c->grid.interval_ns != 0) {
@@ -1966,6 +2192,11 @@ static void run_cmd(struct vd_server *server, const struct cmd *c) {
 	case CMD_PARALLELISM:
 		if (server->encoder != NULL) {
 			encoder_set_parallelism(server->encoder, c->parallelism);
+		}
+		break;
+	case CMD_ROTATION:
+		if (server->encoder != NULL) {
+			encoder_set_rotation(server->encoder, c->parallelism);
 		}
 		break;
 	case CMD_MOTION:
@@ -2047,7 +2278,6 @@ void gm_set_vrr_policy(int policy) {
 	push((struct cmd){ .type = CMD_VRR_POLICY, .vrr_policy = policy });
 }
 
-	CMD_ROTATION,
 void gm_set_display_grid(uint64_t anchor_ns, uint64_t interval_ns) {
 	push((struct cmd){ .type = CMD_DISPLAY_GRID,
 		.grid = { anchor_ns, interval_ns } });
@@ -2063,6 +2293,10 @@ void gm_set_bitrate(int bitrate_kbps) {
 
 void gm_set_parallelism(unsigned parts) {
 	push((struct cmd){ .type = CMD_PARALLELISM, .parallelism = parts });
+}
+
+void gm_set_rotation(unsigned rotation) {
+	push((struct cmd){ .type = CMD_ROTATION, .parallelism = rotation });
 }
 
 uint32_t gm_supported_codecs(void) {
@@ -2175,30 +2409,26 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 	}
 	wlr_multi_backend_add(server.backend, server.headless);
 	// Panel mode: this machine's screens and input devices, through the
-	// seat session (logind) as native gamescope takes them. Off unless
-	// GM_PANEL asks for it: the path needs work (it exposes the screen to
-	// clients as a second wl_output, among other things), and a host that
-	// only streams has no use for it. Without a seat it is off anyway.
-	if (getenv("GM_PANEL") != NULL && getenv("GM_NO_PANEL") == NULL &&
-			(server.session = wlr_session_create(server.loop)) != NULL) {
-		struct wlr_device *gpu;
-		if (wlr_session_find_gpus(server.session, 1, &gpu) == 1) {
-			struct wlr_backend *drm = wlr_drm_backend_create(server.session, gpu, NULL);
-			if (drm != NULL) {
-				wlr_multi_backend_add(server.backend, drm);
-			}
-		}
-		struct wlr_backend *libinput = wlr_libinput_backend_create(server.session);
-		if (libinput != NULL) {
-			wlr_multi_backend_add(server.backend, libinput);
-		}
+	// seat session (logind) as native gamescope takes them. On whenever
+	// there is a seat to take, so this machine's screen works as it does
+	// under native Game Mode; GM_NO_PANEL, or no seat, leaves a host that
+	// only streams. Rough edge: the screen also reaches clients as a
+	// second wl_output. The session itself is taken once the event loop
+	// runs and re-taken as needed, see panel_take.
+	if (getenv("GM_NO_PANEL") != NULL) {
+		wlr_log(WLR_INFO, "Panel: off (GM_NO_PANEL); streams only");
 	} else {
-		wlr_log(WLR_INFO, "Panel: no seat session; streams only");
-	case CMD_ROTATION:
-		if (server->encoder != NULL) {
-			encoder_set_rotation(server->encoder, c->parallelism);
-		}
-		break;
+		server.session_active.notify = handle_session_active;
+		wl_list_init(&server.session_active.link);
+		server.panel_timer = wl_event_loop_add_timer(server.loop,
+			handle_panel_retry, &server);
+		// Now, so that the screen exists before the dmabuf formats are
+		// offered (create_linux_dmabuf): a client that binds without a
+		// screen picks a modifier the display engine cannot scan out, and
+		// every frame is copied. This session rarely survives the next
+		// relogin, but the formats of the screen it finds do.
+		panel_create(&server);
+		panel_retry_soon(&server, 1000); // then watch it, see panel_take
 	}
 	server.renderer = wlr_renderer_autocreate(server.backend);
 	if (server.renderer == NULL) {
@@ -2235,6 +2465,10 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 		wlr_presentation_create(server.display, server.backend, 2);
 
 	server.layout = wlr_output_layout_create(server.display);
+	server.cursor = wlr_cursor_create();
+	if (server.cursor != NULL) {
+		wlr_cursor_attach_output_layout(server.cursor, server.layout);
+	}
 	wlr_xdg_output_manager_v1_create(server.display, server.layout);
 	server.new_output.notify = handle_new_output;
 	wl_signal_add(&server.backend->events.new_output, &server.new_output);
@@ -2295,10 +2529,6 @@ int gm_run(const struct gm_config *config, const struct gm_callbacks *cb) {
 	create_linux_dmabuf(&server);
 
 	setenv("WAYLAND_DISPLAY", socket, true);
-void gm_set_rotation(unsigned rotation) {
-	push((struct cmd){ .type = CMD_ROTATION, .parallelism = rotation });
-}
-
 	wlr_log(WLR_INFO, "Running on WAYLAND_DISPLAY=%s", socket);
 
 	server.pace_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);

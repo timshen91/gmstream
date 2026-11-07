@@ -332,9 +332,11 @@ final class Connection {
         // Plain UDP always sends video as datagrams; bit 2 asks for each frame
         // in pieces as the host encodes it (AV1, HEVC; only with them), bit 3
         // says this client can show HDR10. HDR is a capability, not a request:
-        // whether the session is HDR stays SteamOS's setting.
+        // whether the session is HDR stays SteamOS's setting. Bit 5 asks for
+        // every unit padded to the Wi-Fi driver's flush (type 12 fillers,
+        // dropped below).
         let pieces = options.streamFrames && Options.takesFramesInPieces(preferred)
-        w.u8((pieces ? 4 : 0) | (canShowHDR() ? 8 : 0))
+        w.u8((pieces ? 4 : 0) | (canShowHDR() ? 8 : 0) | (options.flushAlign ? 32 : 0))
         w.u16(UInt16(linkMaxDatagram))
         started = true
         send(Msg.hello, w.data)

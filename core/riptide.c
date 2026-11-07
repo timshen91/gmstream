@@ -509,6 +509,19 @@ static void encode_one(struct gm_rtenc *pw, struct job *job, int bitrate_kbps,
 	// Each frame gets its share of the bitrate, exactly.
 	int fps_milli = refresh_mhz > 0 ? refresh_mhz : 60000;
 	size_t budget = (size_t)((int64_t)bitrate_kbps * 1000 / 8 * 1000 / fps_milli);
+	// The codec needs 512 bytes a stripe (riptide_inter_encode refuses less, and
+	// a refused frame sends nothing): below that the stream runs over the asked
+	// rate instead of stopping.
+	size_t least = (size_t)riptide_encoder_get_stripe_count(pw->encoder) * 512;
+	if (budget < least) {
+		static bool said;
+		if (!said) {
+			wlr_log(WLR_INFO, "Riptide: %d kb/s is under the codec's floor; sending %zu bytes a frame",
+				bitrate_kbps, least);
+			said = true;
+		}
+		budget = least;
+	}
 	riptide_rate_control rc = { .maximum_bitstream_size = budget };
 	riptide_gpu_external_reference ref = { .image = image,
 		.queue_family_index = VK_QUEUE_FAMILY_FOREIGN_EXT };
@@ -520,6 +533,7 @@ static void encode_one(struct gm_rtenc *pw, struct job *job, int bitrate_kbps,
 		.output_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
 		.intermediate_plane_format = VK_FORMAT_R8_UNORM,
 		.ycbcr_chroma_midpoint = 0.5f,
+		.rotation = turned ? rotation : 0,
 	};
 	riptide_image_get_image_view(image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_USAGE_SAMPLED_BIT, &si.view);
 
@@ -533,7 +547,6 @@ static void encode_one(struct gm_rtenc *pw, struct job *job, int bitrate_kbps,
 		uint32_t number = 0;
 		riptide_encoder_get_frame_info(pw->encoder, &number, &predicted);
 		int stripes = riptide_encoder_get_stripe_count(pw->encoder);
-		.rotation = turned ? rotation : 0,
 		size_t cap = budget / 256 + 1024;
 		pw->packets = grow(pw->packets, &pw->packets_cap, cap, sizeof(*pw->packets));
 		pw->bitstream = grow(pw->bitstream, &pw->bitstream_cap, budget + 65536, 1);
@@ -709,6 +722,7 @@ void rtenc_destroy(struct gm_rtenc *pw) {
 void rtenc_start(struct gm_rtenc *pw, int bitrate_kbps, int refresh_mhz, int packet_bytes) {
 	pthread_mutex_lock(&pw->lock);
 	pw->active = true;
+	pw->rotation = 0; // until this client asks
 	pw->n_losses = 0;
 	pw->bitrate_kbps = bitrate_kbps;
 	pw->refresh_mhz = refresh_mhz;
@@ -722,7 +736,6 @@ void rtenc_stop(struct gm_rtenc *pw) {
 	job_clear(&pw->pending);
 	pthread_mutex_unlock(&pw->lock);
 }
-	pw->rotation = 0; // until this client asks
 
 void rtenc_set_rate(struct gm_rtenc *pw, int bitrate_kbps, int refresh_mhz) {
 	pthread_mutex_lock(&pw->lock);
@@ -741,6 +754,12 @@ void rtenc_set_stripes(struct gm_rtenc *pw, unsigned stripes) {
 	pthread_mutex_unlock(&pw->lock);
 }
 
+void rtenc_set_rotation(struct gm_rtenc *pw, unsigned rotation) {
+	pthread_mutex_lock(&pw->lock);
+	pw->rotation = rotation;
+	pthread_mutex_unlock(&pw->lock);
+}
+
 void rtenc_request_intra(struct gm_rtenc *pw) {
 	pthread_mutex_lock(&pw->lock);
 	pw->intra_requested = true;
@@ -754,12 +773,6 @@ void rtenc_take_stats(struct gm_rtenc *pw, unsigned *encoded,
 	*dropped = pw->stats_dropped;
 	*encode_ns = pw->stats_encode_ns;
 	pw->stats_encoded = pw->stats_dropped = 0;
-void rtenc_set_rotation(struct gm_rtenc *pw, unsigned rotation) {
-	pthread_mutex_lock(&pw->lock);
-	pw->rotation = rotation;
-	pthread_mutex_unlock(&pw->lock);
-}
-
 	pw->stats_encode_ns = 0;
 	pthread_mutex_unlock(&pw->lock);
 }
