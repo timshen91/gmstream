@@ -37,7 +37,8 @@ debug.gmstream.phase 1` (the phase lock's decisions to logcat),
 `debug.gmstream.trace 1` (Riptide's first steps), `debug.gmstream.stream 1`
 (each streamed frame's claim and slack), `debug.gmstream.planes 1`
 or `debug.gmstream.red 1` (Riptide's output pass shows the raw planes, or a
-clear).
+clear), `debug.gmstream.images N` (the video decoder's reader lends N
+pictures, 2-8, instead of 8: tests running short of them).
 `--ez overLock true` (testing from adb) shows this window over the lock screen.
 
 ## What it does

@@ -59,6 +59,14 @@ private:
 	bool need_key_ = true;
 	std::thread out_thread_;
 	std::atomic<bool> running_{false};
+	// Pictures left in the reader because we held all it allows (maxImages):
+	// taken once one is given back. The reader calls back once per picture,
+	// so one not taken then is never offered again, and its buffer is lost to
+	// the decoder for good; lose enough of them and the decoder stops.
+	std::atomic<bool> backlog_{false};
+	std::mutex acquire_lock_;
+	void take_images(AImageReader *r);
+	void take_image(AImage *img, int fence);
 	std::mutex timings_lock_;
 	struct Pending { FrameTiming t; int w, h; };
 	std::map<int64_t, Pending> timings_; // by pts (us)

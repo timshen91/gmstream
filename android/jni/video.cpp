@@ -1,10 +1,12 @@
 #include "video.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include <android/hardware_buffer.h>
 #include <android/data_space.h>
 #include <media/NdkMediaFormat.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include "log.h"
@@ -100,8 +102,13 @@ bool VideoDecoder::create(uint8_t codec, int w, int h)
 		return false;
 	// The decoder's pictures: buffers SurfaceFlinger can put on a display plane.
 	AImageReader *reader = nullptr;
+	// debug.gmstream.images: fewer pictures lent out, to test running short.
+	char v[PROP_VALUE_MAX] = {};
+	int images = __system_property_get("debug.gmstream.images", v) > 0 ? atoi(v) : 0;
+	if (images < 2 || images > 8)
+		images = 8;
 	if (AImageReader_newWithUsage(w, h, AIMAGE_FORMAT_PRIVATE,
-	                              AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY, 8,
+	                              AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY, images,
 	                              &reader) != AMEDIA_OK) {
 		LOGE("video: no image reader");
 		return false;
@@ -174,6 +181,7 @@ bool VideoDecoder::create(uint8_t codec, int w, int h)
 	width_ = w;
 	height_ = h;
 	running_ = true;
+	backlog_ = false;
 	out_thread_ = std::thread([this] { drain(); });
 	LOGI("video: %s %dx%d", name.c_str(), w, h);
 	if (on_size)
@@ -231,6 +239,8 @@ void VideoDecoder::drain()
 	while (running_) {
 		AMediaCodecBufferInfo info;
 		ssize_t idx = AMediaCodec_dequeueOutputBuffer(codec_, &info, 10000);
+		if (backlog_.exchange(false))
+			take_images(reader_); // pictures the reader still has, now that there is room
 		if (idx < 0)
 			continue;
 		{
@@ -245,10 +255,29 @@ void VideoDecoder::drain()
 
 void VideoDecoder::image_available(AImageReader *r)
 {
-	AImage *img = nullptr;
-	int fence = -1;
-	if (AImageReader_acquireNextImageAsync(r, &img, &fence) != AMEDIA_OK || !img)
-		return;
+	take_images(r);
+}
+
+// Every picture the reader has, oldest first.
+void VideoDecoder::take_images(AImageReader *r)
+{
+	std::lock_guard<std::mutex> g(acquire_lock_);
+	for (;;) {
+		AImage *img = nullptr;
+		int fence = -1;
+		media_status_t st = AImageReader_acquireNextImageAsync(r, &img, &fence);
+		if (st == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED) {
+			backlog_ = true; // the drain thread tries again
+			return;
+		}
+		if (st != AMEDIA_OK || !img)
+			return;
+		take_image(img, fence);
+	}
+}
+
+void VideoDecoder::take_image(AImage *img, int fence)
+{
 	int64_t ts = 0;
 	AImage_getTimestamp(img, &ts);
 	AHardwareBuffer *ahb = nullptr;

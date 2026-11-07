@@ -98,6 +98,7 @@ struct Compositor::Impl {
 	};
 	std::mutex src_lock;
 	std::deque<std::shared_ptr<Source>> sources; // oldest first
+	uint64_t idle_since = 0, idle_said = 0, held_said = 0; // diagnostics
 	uint64_t next_id = 0;
 
 	// The ring's buffers.
@@ -666,19 +667,28 @@ void Compositor::Impl::emit_dropped(std::vector<std::shared_ptr<Source>> &v)
 	v.clear();
 }
 
-// Sources older than the newest one a sample point took: given back once no
-// compose reads them. (Newer ones may still be decoding: they stay.)
+// Sources older than the newest one a sample point took, or than the newest
+// one decoded (no sample point will take an older one): given back once no
+// compose reads them. (Newer ones may still be decoding: they stay.) Given
+// back as soon as they can be: the video decoder's pictures come from a
+// reader that lends only so many, and the decoder stops when it runs out.
 void Compositor::Impl::retire()
 {
 	std::vector<std::shared_ptr<Source>> gone, dropped;
 	{
 		std::lock_guard<std::mutex> g(src_lock);
 		size_t newest = sources.size();
-		for (size_t i = sources.size(); i-- > 0;)
-			if (sources[i]->sampled) {
+		for (size_t i = sources.size(); i-- > 0;) {
+			auto &s = *sources[i];
+			if (!s.ready && s.fence >= 0 && !s.sampled)
+				s.ready = fence_time(s.fence, 0);
+			else if (!s.ready && s.fence < 0)
+				s.ready = now_ns();
+			if (s.sampled || s.ready) {
 				newest = i;
 				break;
 			}
+		}
 		if (newest == sources.size())
 			newest = 0;
 		size_t i = 0;
@@ -918,9 +928,20 @@ void Compositor::Impl::loop()
 			break;
 		}
 		if (!have) {
+			if (!idle_since)
+				idle_since = now;
+			else if (now - idle_since > 200000000ull && now - idle_said > 1000000000ull) {
+				idle_said = now;
+				LOGW("compositor: no upcoming refresh for %.0f ms", double(now - idle_since) / 1e6);
+			}
+			{
+				std::lock_guard<std::mutex> gl(gpu_lock);
+				retire(); // no refresh to sample for yet: still give back what is overtaken
+			}
 			usleep(500);
 			continue;
 		}
+		idle_since = 0;
 		uint64_t sample = uint64_t(std::max(double(now), double(next.predicted) - ps.prefill_ns - budget));
 		sleep_until(sample);
 		uint64_t woke = now_ns();
@@ -930,6 +951,22 @@ void Compositor::Impl::loop()
 			break;
 		reap(false);
 		retire();
+		{
+			std::lock_guard<std::mutex> g(src_lock);
+			if (sources.size() >= 5 && woke - held_said > 1000000000ull) {
+				held_said = woke;
+				std::string d;
+				for (auto &s : sources) {
+					char b[96];
+					snprintf(b, sizeof b, " [%llu %s%s%s uses %d fence %d%s]", (unsigned long long)s->id,
+					         s->ready ? "ready" : "pending", s->sampled ? " sampled" : "",
+					         s->emitted ? " emitted" : "", s->uses, s->fence,
+					         s->fence >= 0 && !s->ready && fence_time(s->fence, 0) ? " (signalled)" : "");
+					d += b;
+				}
+				LOGW("compositor: holding %zu pictures:%s", sources.size(), d.c_str());
+			}
+		}
 		// The newest picture that is ready now; the ones before it that no
 		// sample point took are overtaken.
 		std::shared_ptr<Source> pick;
