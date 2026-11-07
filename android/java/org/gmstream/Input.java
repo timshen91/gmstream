@@ -62,6 +62,17 @@ final class Input {
         Native.gamepadRemove(h, p.slot);
     }
 
+    /** The settings opened: every pad let go on the host (they steer the menu now). */
+    void releaseAll() {
+        for (int i = 0; i < pads.size(); i++) {
+            Pad p = pads.valueAt(i);
+            p.buttons = 0;
+            p.lx = p.ly = p.rx = p.ry = p.lt = p.rt = p.hatX = p.hatY = 0;
+            p.last = "";
+            send(p);
+        }
+    }
+
     /** After (re)connecting: every pad's state again. */
     void resend() {
         for (int i = 0; i < pads.size(); i++) {

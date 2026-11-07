@@ -1,6 +1,7 @@
 package org.gmstream;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -31,21 +32,18 @@ import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
-import android.widget.ArrayAdapter;
-import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
-import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Toast;
 import android.window.OnBackInvokedDispatcher;
 
 /**
  * The stream, full screen: the video on a SurfaceView (MediaCodec or Riptide's
- * Vulkan swapchain draws into it directly), the stats over it, and a settings
- * panel (three-finger tap or the Back key, as on the iPad).
+ * Vulkan swapchain draws into it directly), the stats over it, and the
+ * settings at its side (SettingsPanel: three-finger tap or the Back key), the
+ * stream running on behind them.
  */
 public final class MainActivity extends Activity implements Native.Listener, SurfaceHolder.Callback {
     private long h;
@@ -55,12 +53,11 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
     private FrameLayout root;
     private SurfaceView video;
     private TextView stats;
-    private ScrollView settings;
+    private SettingsPanel settings;
     private WifiManager.WifiLock wifiLock;
     private String status = "";
     private int streamW = 16, streamH = 9;
     private boolean streaming;
-    private String startedWith = "";
     private int startedRotation;
     private boolean relative;
     private final int[] touchIds = new int[32]; // pointer id -> protocol touch id + 1 (0: none)
@@ -147,10 +144,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
     protected void onNewIntent(android.content.Intent i) {
         super.onNewIntent(i);
         applyExtras(i);
-        if (streaming) {
-            stopStream();
-            startStream();
-        }
+        if (streaming) applyToStream();
     }
 
     /** The refresh of the mode asked for: the display may not have switched to it yet when a stream starts. */
@@ -206,22 +200,38 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         h = 0;
     }
 
-    private void startStream() {
-        if (prefs.host.isEmpty() || settings != null) return;
+    /** The size asked of the host: the setting, or this screen's (landscape). */
+    private int[] streamSize() {
         int[] size = prefs.parsedSize();
-        if (size == null) {
-            Rect b = getWindowManager().getCurrentWindowMetrics().getBounds();
-            size = new int[] {Math.max(b.width(), b.height()), Math.min(b.width(), b.height())};
-        }
-        double hz = prefs.refresh > 0 ? prefs.refresh : fastestHz > 0 ? fastestHz : getDisplay().getRefreshRate();
-        Native.start(h, prefs.host.trim(), prefs.port, prefs.codec, prefs.mbps, size[0], size[1], hz,
+        if (size != null) return size;
+        Rect b = getWindowManager().getCurrentWindowMetrics().getBounds();
+        return new int[] {Math.max(b.width(), b.height()), Math.min(b.width(), b.height())};
+    }
+
+    private double streamHz() {
+        return prefs.refresh > 0 ? prefs.refresh : fastestHz > 0 ? fastestHz : getDisplay().getRefreshRate();
+    }
+
+    private void startStream() {
+        if (prefs.host.isEmpty()) return;
+        int[] size = streamSize();
+        Native.start(h, prefs.host.trim(), prefs.port, prefs.codec, prefs.mbps, size[0], size[1], streamHz(),
             prefs.streamFrames, prefs.parallelism, prefs.stripes, prefs.keepWiFiAwake, prefs.keepGPUAwake, prefs.pacing,
             prefs.scanout, getDisplay().getRotation());
         startedRotation = getDisplay().getRotation();
         if (prefs.keepWiFiAwake) wifiLock.acquire();
         streaming = true;
-        startedWith = prefs.connectionKey();
         input.resend();
+    }
+
+    /** The settings as they are now, to the running stream: applied in place. */
+    private void applyToStream() {
+        int[] size = streamSize();
+        Native.update(h, prefs.host.trim(), prefs.port, prefs.codec, prefs.mbps, size[0], size[1], streamHz(),
+            prefs.streamFrames, prefs.parallelism, prefs.stripes, prefs.keepWiFiAwake, prefs.keepGPUAwake, prefs.pacing,
+            prefs.scanout, getDisplay().getRotation());
+        startedRotation = getDisplay().getRotation();
+        if (prefs.keepWiFiAwake) wifiLock.acquire(); else if (wifiLock.isHeld()) wifiLock.release();
     }
 
     private void stopStream() {
@@ -336,9 +346,11 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
-        if (settings != null) return super.dispatchKeyEvent(e);
-        if (input.padKey(e)) return true;
         int k = e.getKeyCode();
+        if (k == KeyEvent.KEYCODE_VOLUME_UP || k == KeyEvent.KEYCODE_VOLUME_DOWN || k == KeyEvent.KEYCODE_VOLUME_MUTE)
+            return super.dispatchKeyEvent(e);
+        if (settings != null) return settings.key(e) || super.dispatchKeyEvent(e);
+        if (input.padKey(e)) return true;
         if (k == KeyEvent.KEYCODE_BACK) {
             if (e.getAction() == KeyEvent.ACTION_UP) toggleSettings();
             return true;
@@ -353,7 +365,8 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
 
     @Override
     public boolean dispatchGenericMotionEvent(MotionEvent e) {
-        if (settings == null && input.padMotion(e)) return true;
+        if (settings != null) return settings.motion(e) || super.dispatchGenericMotionEvent(e);
+        if (input.padMotion(e)) return true;
         return super.dispatchGenericMotionEvent(e);
     }
 
@@ -425,7 +438,11 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
     private int maxPointers;
 
     private boolean touch(MotionEvent e) {
-        if (settings != null) return false;
+        if (settings != null) {
+            // A tap on the stream, beside the panel, closes it.
+            if (e.getActionMasked() == MotionEvent.ACTION_UP) closeSettings();
+            return true;
+        }
         if (e.isFromSource(InputDevice.SOURCE_MOUSE)) {
             // A mouse with a button held arrives as touches.
             if (e.getActionMasked() == MotionEvent.ACTION_MOVE) {
@@ -512,10 +529,7 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         super.onConfigurationChanged(c);
         root.post(this::layoutVideo);
         // Turned the other way up: the output is drawn for the panel's orientation.
-        if (streaming && getDisplay().getRotation() != startedRotation) {
-            stopStream();
-            startStream();
-        }
+        if (streaming && getDisplay().getRotation() != startedRotation) applyToStream();
     }
 
     // ---- Settings -------------------------------------------------------------------------
@@ -524,163 +538,87 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
         if (settings != null) closeSettings(); else showSettings();
     }
 
-    private TextView label(String s) {
-        TextView t = new TextView(this);
-        t.setText(s);
-        t.setTextColor(0xffcccccc);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        t.setPadding(0, 18, 0, 2);
-        return t;
-    }
+    private final SettingsPanel.Owner panelOwner = new SettingsPanel.Owner() {
+        @Override public void applySettings() {
+            prefs.save(MainActivity.this);
+            if (streaming) applyToStream();
+            else startStream();
+        }
+        @Override public void editHost() { askHost(); }
+        @Override public void copyKey() {
+            String line = keyLine();
+            ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE))
+                .setPrimaryClip(ClipData.newPlainText("gmstream key", line));
+            Toast.makeText(MainActivity.this, "Key line copied: add it to ~/.ssh/authorized_keys on the host",
+                Toast.LENGTH_LONG).show();
+        }
+        @Override public void forgetHosts() {
+            Native.forgetHosts(h);
+            Toast.makeText(MainActivity.this, "Host keys forgotten", Toast.LENGTH_SHORT).show();
+        }
+        @Override public void closeSettings() { MainActivity.this.closeSettings(); }
+    };
 
-    private EditText field(String value, boolean number) {
-        EditText e = new EditText(this);
-        e.setText(value);
-        e.setTextColor(Color.WHITE);
-        e.setSingleLine(true);
-        if (number) e.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-        return e;
-    }
-
-    private CheckBox check(String text, boolean on) {
-        CheckBox c = new CheckBox(this);
-        c.setText(text);
-        c.setTextColor(Color.WHITE);
-        c.setChecked(on);
-        return c;
-    }
-
-    private Spinner spinner(String[] items, int selected) {
-        Spinner s = new Spinner(this);
-        ArrayAdapter<String> a = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, items);
-        s.setAdapter(a);
-        s.setSelection(Math.max(0, selected));
-        return s;
-    }
-
-    private static int intOf(EditText e, int fallback) {
-        try { return Integer.parseInt(e.getText().toString().trim()); } catch (NumberFormatException x) { return fallback; }
+    private String keyLine() {
+        return Native.authorizedLine(h, Build.MODEL.replaceAll("[^A-Za-z0-9_-]", ""));
     }
 
     private void showSettings() {
         if (settings != null) return;
-        settings = new ScrollView(this);
-        settings.setBackgroundColor(0xee101014);
-        LinearLayout l = new LinearLayout(this);
-        l.setOrientation(LinearLayout.VERTICAL);
-        l.setPadding(48, 32, 48, 48);
-        settings.addView(l);
-
-        TextView title = new TextView(this);
-        title.setText("gmstream");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-        l.addView(title);
-
-        l.addView(label("Host (name or address)"));
-        EditText host = field(prefs.host, false);
-        host.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        l.addView(host);
-        l.addView(label("Port (plain UDP)"));
-        EditText port = field(String.valueOf(prefs.port), true);
-        l.addView(port);
-
-        l.addView(label("Codec"));
-        int sel = 0;
-        for (int i = 0; i < Prefs.CODEC_IDS.length; i++) if (Prefs.CODEC_IDS[i] == prefs.codec) sel = i;
-        Spinner codec = spinner(Prefs.CODECS, sel);
-        l.addView(codec);
-        l.addView(label("Bitrate (Mb/s)"));
-        EditText mbps = field(String.valueOf(prefs.mbps), true);
-        l.addView(mbps);
-        l.addView(label("Size (WxH; empty: this screen's)"));
-        EditText size = field(prefs.size, false);
-        l.addView(size);
-        l.addView(label("Refresh (Hz; empty: this screen's)"));
-        EditText refresh = field(prefs.refresh > 0 ? String.valueOf(prefs.refresh) : "", true);
-        l.addView(refresh);
-
-        l.addView(label("Pacing"));
-        Spinner pacing = spinner(new String[] {"Auto (phase lock to this screen)", "Low latency (frames as they come)"}, prefs.pacing);
-        l.addView(pacing);
-        CheckBox pieces = check("AV1/HEVC: take frames in pieces as the host encodes them", prefs.streamFrames);
-        l.addView(pieces);
-        l.addView(label("AV1/HEVC parallelism (tiles or slice segments; 0: the host's default)"));
-        EditText par = field(String.valueOf(prefs.parallelism), true);
-        l.addView(par);
-        l.addView(label("Riptide stripes (0: the host's default)"));
-        EditText stripes = field(String.valueOf(prefs.stripes), true);
-        l.addView(stripes);
-        CheckBox awake = check("Keep Wi-Fi awake (low-latency mode, uplink at 60 Hz)", prefs.keepWiFiAwake);
-        l.addView(awake);
-        CheckBox gpu = check("Keep the GPU awake for Riptide", prefs.keepGPUAwake);
-        l.addView(gpu);
-        CheckBox scan = check("Scanout: frames go straight into the buffer the panel reads next, not through SurfaceFlinger", prefs.scanout);
-        l.addView(scan);
-        CheckBox touch = check("Fingers are a touchscreen (off: a mouse)", prefs.touchscreen);
-        l.addView(touch);
-        CheckBox showStats = check("Show stats", prefs.showStats);
-        l.addView(showStats);
-
-        l.addView(label("This device's key: add the line to ~/.ssh/authorized_keys on the host"));
-        String line = Native.authorizedLine(h, Build.MODEL.replaceAll("[^A-Za-z0-9_-]", ""));
-        TextView key = new TextView(this);
-        key.setText(line);
-        key.setTextColor(0xff99ccff);
-        key.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        key.setTextIsSelectable(true);
-        l.addView(key);
-        LinearLayout row = new LinearLayout(this);
-        Button copy = new Button(this);
-        copy.setText("Copy key line");
-        copy.setOnClickListener(v -> ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE))
-            .setPrimaryClip(ClipData.newPlainText("gmstream key", line)));
-        row.addView(copy);
-        Button forget = new Button(this);
-        forget.setText("Forget host keys");
-        forget.setOnClickListener(v -> Native.forgetHosts(h));
-        row.addView(forget);
-        l.addView(row);
-
-        Button done = new Button(this);
-        done.setText("Connect");
-        done.setOnClickListener(v -> {
-            prefs.host = host.getText().toString().trim();
-            prefs.port = intOf(port, 8444);
-            prefs.codec = Prefs.CODEC_IDS[codec.getSelectedItemPosition()];
-            prefs.mbps = Math.max(1, intOf(mbps, prefs.mbps));
-            prefs.size = size.getText().toString().trim();
-            try { prefs.refresh = refresh.getText().toString().trim().isEmpty() ? 0 : Double.parseDouble(refresh.getText().toString().trim()); }
-            catch (NumberFormatException x) { prefs.refresh = 0; }
-            prefs.pacing = pacing.getSelectedItemPosition();
-            prefs.streamFrames = pieces.isChecked();
-            prefs.parallelism = Math.max(0, intOf(par, 0));
-            prefs.stripes = Math.max(0, intOf(stripes, 0));
-            prefs.keepWiFiAwake = awake.isChecked();
-            prefs.keepGPUAwake = gpu.isChecked();
-            prefs.scanout = scan.isChecked();
-            prefs.touchscreen = touch.isChecked();
-            prefs.showStats = showStats.isChecked();
-            prefs.save(this);
-            closeSettings();
-        });
-        l.addView(done);
-        root.addView(settings, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        host.requestFocus();
+        int[] screen = streamSize();
+        String here = prefs.parsedSize() == null ? screen[0] + "x" + screen[1] : "";
+        if (here.isEmpty()) {
+            Rect b = getWindowManager().getCurrentWindowMetrics().getBounds();
+            here = Math.max(b.width(), b.height()) + "x" + Math.min(b.width(), b.height());
+        }
+        settings = new SettingsPanel(this, prefs, panelOwner, here, "This device's key: " + keyLine());
+        root.addView(settings.view, SettingsPanel.layout(root.getWidth()));
+        input.releaseAll();
+        if (prefs.host.isEmpty()) askHost();
     }
 
     private void closeSettings() {
         if (settings == null) return;
-        root.removeView(settings);
+        root.removeView(settings.view);
         settings = null;
         hideSystemBars();
         root.requestFocus();
-        if (prefs.host.isEmpty()) return;
-        if (!streaming || !prefs.connectionKey().equals(startedWith)) {
-            stopStream();
-            startStream();
-        } else {
-            Native.setBitrate(h, prefs.mbps);
-        }
+        if (!streaming) startStream();
+    }
+
+    /** Host and port: the one setting that is typed, and the one that reconnects. */
+    private void askHost() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        l.setPadding(48, 16, 48, 0);
+        EditText host = new EditText(this);
+        host.setHint("Host name or address");
+        host.setText(prefs.host);
+        host.setSingleLine(true);
+        host.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        l.addView(host);
+        EditText port = new EditText(this);
+        port.setHint("Port (plain UDP)");
+        port.setText(String.valueOf(prefs.port));
+        port.setSingleLine(true);
+        port.setInputType(InputType.TYPE_CLASS_NUMBER);
+        l.addView(port);
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Host")
+            .setView(l)
+            .setPositiveButton("Connect", (d, w) -> {
+                String newHost = host.getText().toString().trim();
+                int newPort;
+                try { newPort = Integer.parseInt(port.getText().toString().trim()); } catch (NumberFormatException x) { newPort = 8444; }
+                boolean changed = !newHost.equals(prefs.host) || newPort != prefs.port;
+                prefs.host = newHost;
+                prefs.port = newPort;
+                prefs.save(this);
+                if (settings != null) settings.refresh();
+                if (changed && streaming) stopStream();
+                if (!streaming) startStream();
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
     }
 }

@@ -61,6 +61,9 @@ const C_TOUCH: u8 = 0x0f;
 const C_AUTH: u8 = 0x10;
 const C_PARALLELISM: u8 = 0x11;
 const C_ROTATION: u8 = 0x12;
+/// `u8 preferred codec, u8 flags` (as in Hello): the stream restarted with
+/// another codec in the same session; answered with HelloAck.
+const C_STREAM_CODEC: u8 = 0x13;
 // Host → client.
 const H_HELLO_ACK: u8 = 0x81;
 const H_CURSOR: u8 = 0x82;
@@ -608,23 +611,6 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         send_error(&mut send, "Protocol version mismatch; reload the page").await;
         bail!("{peer}: protocol version {version}");
     }
-    // Riptide only over plain UDP, where the client reports its losses.
-    let host = core::supported_codecs() & if conn.is_udp() { !0 } else { !(1 << CODEC_RIPTIDE) };
-    let both = mask as u32 & host;
-    let codec = if both & (1 << pref) != 0 {
-        pref
-    } else if let Some(c) = (0..5).find(|c| both & (1 << c) != 0) {
-        c
-    } else {
-        send_error(&mut send, "No video codec in common with this host").await;
-        bail!("{peer}: no common codec (client {mask:#x}, host {:#x})", core::supported_codecs());
-    };
-    let kbps = kbps.clamp(1000, 500_000);
-    // A frame in pieces as the encoder writes it (core/vkencode.c): the two
-    // codecs the Vulkan encoder takes, and only for a client that asked, since
-    // the pieces are a different datagram. The host falls back to whole frames
-    // on its own if that encoder is not the one running.
-    let chunked = wants_chunks && (codec == CODEC_AV1 || codec == CODEC_HEVC);
     // The largest datagram this link carries unfragmented, so a piece of a
     // frame or a PyroWave packet fills one (each datagram has a fixed cost;
     // see core/pyrowave.c). 0: the core's default.
@@ -633,12 +619,22 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
         (false, _) => conn.max_datagram_size(),
         _ => None,
     };
-    let packet = match (chunked, link_max) {
-        (true, Some(max)) => max.saturating_sub(VIDEO_CHUNK_HEADER),
-        (false, Some(max)) if codec == CODEC_PYROWAVE && conn.is_udp() => max.saturating_sub(PYROWAVE_HEADER),
-        (false, Some(max)) if codec == CODEC_RIPTIDE => max.saturating_sub(RIPTIDE_HEADER),
-        _ => 0,
+    let mut setup = StreamSetup {
+        mask,
+        udp: conn.is_udp(),
+        link_max,
+        width,
+        height,
+        refresh,
+        kbps: kbps.clamp(1000, 500_000),
+        hdr: wants_hdr,
     };
+    let Some(codec) = setup.codec(pref) else {
+        send_error(&mut send, "No video codec in common with this host").await;
+        bail!("{peer}: no common codec (client {mask:#x}, host {:#x})", core::supported_codecs());
+    };
+    let kbps = setup.kbps;
+    let (chunked, packet) = setup.layout(codec, wants_chunks);
 
     let (vtx, mut vrx) = mpsc::channel::<(u32, Vec<u8>)>(4);
     // Deep enough for a keyframe, which is a few thousand pieces.
@@ -685,16 +681,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     if wants_flush {
         eprintln!("gmstream: client {n} gets each unit padded to {FLUSH_PACKETS} datagrams");
     }
-    core::stream_start(
-        codec,
-        width,
-        height,
-        refresh,
-        kbps,
-        packet,
-        (if chunked { core::STREAM_CHUNKED } else { 0 })
-            | (if wants_hdr { core::STREAM_HDR } else { 0 }),
-    );
+    setup.start(codec, chunked, packet);
 
     let writer = tokio::spawn(async move {
         while let Some(m) = crx.recv().await {
@@ -821,7 +808,7 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     if let Conn::Udp(udp) = &*conn {
         udp.accept_mouse();
     }
-    let result = control_loop(&mut recv, &client).await;
+    let result = control_loop(&mut recv, &client, &mut setup, n).await;
 
     writer.abort();
     video.abort();
@@ -835,14 +822,92 @@ async fn session(conn: Arc<Conn>, mut send: SendStream, mut recv: RecvStream) ->
     result
 }
 
-async fn control_loop(recv: &mut RecvStream, client: &Client) -> Result<()> {
+/// What a session's stream is started from: the Hello, then what the client
+/// has changed since, so it can be started again with another codec
+/// (StreamCodec) without a new session.
+struct StreamSetup {
+    mask: u8,
+    udp: bool,
+    link_max: Option<usize>,
+    width: u16,
+    height: u16,
+    refresh: u32,
+    kbps: u32,
+    hdr: bool,
+}
+
+impl StreamSetup {
+    /// The client's preferred codec if both ends have it, else the first both have.
+    fn codec(&self, pref: u8) -> Option<u8> {
+        // Riptide only over plain UDP, where the client reports its losses.
+        let host = core::supported_codecs() & if self.udp { !0 } else { !(1 << CODEC_RIPTIDE) };
+        let both = self.mask as u32 & host;
+        if pref < 32 && both & (1 << pref) != 0 {
+            Some(pref)
+        } else {
+            (0..5).find(|c| both & (1 << c) != 0)
+        }
+    }
+
+    /// Whether frames go in pieces, and the most payload per datagram.
+    fn layout(&self, codec: u8, wants_chunks: bool) -> (bool, usize) {
+        // A frame in pieces as the encoder writes it (core/vkencode.c): the two
+        // codecs the Vulkan encoder takes, and only for a client that asked, since
+        // the pieces are a different datagram. The host falls back to whole frames
+        // on its own if that encoder is not the one running.
+        let chunked = wants_chunks && (codec == CODEC_AV1 || codec == CODEC_HEVC);
+        let packet = match (chunked, self.link_max) {
+            (true, Some(max)) => max.saturating_sub(VIDEO_CHUNK_HEADER),
+            (false, Some(max)) if codec == CODEC_PYROWAVE && self.udp => max.saturating_sub(PYROWAVE_HEADER),
+            (false, Some(max)) if codec == CODEC_RIPTIDE => max.saturating_sub(RIPTIDE_HEADER),
+            _ => 0,
+        };
+        (chunked, packet)
+    }
+
+    fn start(&self, codec: u8, chunked: bool, packet: usize) {
+        core::stream_start(
+            codec,
+            self.width,
+            self.height,
+            self.refresh,
+            self.kbps,
+            packet,
+            (if chunked { core::STREAM_CHUNKED } else { 0 }) | (if self.hdr { core::STREAM_HDR } else { 0 }),
+        );
+    }
+}
+
+async fn control_loop(recv: &mut RecvStream, client: &Client, setup: &mut StreamSetup, n: u64) -> Result<()> {
     loop {
         let (ty, body) = read_message(recv).await?;
         let mut r = Reader(&body);
         match ty {
-            C_CONFIGURE => core::stream_configure(r.u16()?, r.u16()?, r.u32()?),
+            C_CONFIGURE => {
+                (setup.width, setup.height, setup.refresh) = (r.u16()?, r.u16()?, r.u32()?);
+                core::stream_configure(setup.width, setup.height, setup.refresh);
+            }
             C_KEYFRAME => core::request_keyframe(),
-            C_BITRATE => core::set_bitrate(r.u32()?.clamp(1000, 500_000)),
+            C_BITRATE => {
+                setup.kbps = r.u32()?.clamp(1000, 500_000);
+                core::set_bitrate(setup.kbps);
+            }
+            C_STREAM_CODEC => {
+                let (pref, flags) = (r.u8()?, r.u8()?);
+                if let Some(codec) = setup.codec(pref) {
+                    let (chunked, packet) = setup.layout(codec, flags & HELLO_VIDEO_CHUNKS != 0);
+                    // The encoder starts over (its first frame is a keyframe);
+                    // stripes, tiles and the rotation are the new codec's own,
+                    // and the client sends them again on the HelloAck.
+                    core::stream_stop();
+                    setup.start(codec, chunked, packet);
+                    let _ = client.ctrl.send(message(H_HELLO_ACK, &[codec]));
+                    eprintln!(
+                        "gmstream: client {n} switched to codec {codec}{}",
+                        if chunked { format!(", frames in pieces, {packet}-byte chunks") } else { String::new() }
+                    );
+                }
+            }
             // Tiles or slice segments per frame; 0 for the codec's default.
             // The encoder clamps it to what the hardware and the picture allow.
             C_PARALLELISM => core::set_parallelism(r.u16()?.min(256)),

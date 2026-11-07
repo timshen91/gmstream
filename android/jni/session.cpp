@@ -111,6 +111,69 @@ public:
 		ticker_ = std::thread([this] { run(); });
 	}
 
+	// Settings changed while streaming: each applied in place (the host's
+	// bitrate, size, codec, tiles or stripes; pacing, scanout, Wi-Fi and GPU
+	// awake here). Only another host or port starts a new session.
+	void update(const Options &o)
+	{
+		if (!running_ || o.host != opt_.host || o.port != opt_.port) {
+			start(o);
+			return;
+		}
+		Options old = opt_;
+		if (o.mbps != old.mbps)
+			set_bitrate(o.mbps);
+		if (o.width != old.width || o.height != old.height || o.refresh_hz != old.refresh_hz) {
+			opt_.width = o.width;
+			opt_.height = o.height;
+			opt_.refresh_hz = o.refresh_hz;
+			Writer m;
+			m.u16(uint16_t(o.width & ~1));
+			m.u16(uint16_t(o.height & ~1));
+			m.u32(uint32_t(o.refresh_hz * 1000));
+			send(msg::configure, m.d);
+			if (o.refresh_hz != old.refresh_hz) {
+				phase_.restart(o.refresh_hz);
+				presenter_.set_schedule(PanelSchedule::load(o.refresh_hz));
+			}
+		}
+		if (o.keep_awake != old.keep_awake) {
+			opt_.keep_awake = o.keep_awake;
+			std::lock_guard<std::mutex> g(conn_lock_);
+			if (conn_)
+				conn_->keep_awake(o.keep_awake);
+		}
+		if (o.keep_gpu_awake != old.keep_gpu_awake) {
+			opt_.keep_gpu_awake = o.keep_gpu_awake;
+			riptide_.set_keep_gpu_awake(o.keep_gpu_awake);
+		}
+		if (o.pacing != old.pacing) {
+			opt_.pacing = o.pacing;
+			send(msg::vrr_policy, {uint8_t(o.pacing == 1 ? 2 : 1)});
+			if (o.pacing == 0)
+				phase_.restart(opt_.refresh_hz);
+		}
+		opt_.parallelism = o.parallelism;
+		opt_.stripes = o.stripes;
+		if (o.codec != old.codec || o.pieces != old.pieces) {
+			// The host starts the stream over with it and answers HelloAck
+			// (on_hello_ack), which resets the decoders here.
+			opt_.codec = o.codec;
+			opt_.pieces = o.pieces;
+			send(msg::stream_codec, {uint8_t(o.codec), uint8_t(o.pieces ? 4 : 0)});
+		} else if (o.parallelism != old.parallelism || o.stripes != old.stripes) {
+			send_parallelism();
+		}
+		if (o.scanout != old.scanout || o.rotation != old.rotation) {
+			opt_.scanout = o.scanout;
+			opt_.rotation = o.rotation;
+			riptide_.set_rotation(o.rotation);
+			send_rotation();
+			reset_pending_ = true; // done on the network thread, with the next frame
+			send(msg::keyframe);
+		}
+	}
+
 	void stop()
 	{
 		{
@@ -186,6 +249,8 @@ public:
 	}
 	void on_riptide(const RiptidePacket &p) override
 	{
+		if (reset_pending_.exchange(false))
+			reset_pipeline();
 		through_.bytes(p.size);
 		int64_t off = 0;
 		bool known;
@@ -197,7 +262,17 @@ public:
 	}
 	void on_hello_ack(uint8_t codec) override
 	{
+		// Again in a session: the host switched codec (StreamCodec). The
+		// decoders start over, and the new codec gets its tiles or stripes
+		// and its rotation, which the host's encoder starts without.
+		bool again = stream_codec_ != 255;
 		stream_codec_ = codec;
+		if (again) {
+			reset_pipeline();
+			send_parallelism();
+			send_rotation();
+			send(msg::keyframe);
+		}
 		static const char *names[] = {"H.264", "HEVC", "AV1", "PyroWave", "Riptide"};
 		codec_name_ = names[std::min<int>(codec, 4)];
 		LOGI("hello ack: %s", codec_name_.c_str());
@@ -308,6 +383,35 @@ private:
 	std::mutex pipe_lock_;
 	std::vector<double> pipe_; // recent latch -> present, ns
 
+	// The decoders and the compositor from scratch (scanout or the codec
+	// changed): the next keyframe sets them up again (stream_size). Network
+	// thread, where the decoders take their input.
+	void reset_pipeline()
+	{
+		gate_.reset();
+		compositor_.stop();
+		stream_w_ = stream_h_ = 0;
+		riptide_.reset();
+		video_.reset();
+	}
+	void send_parallelism()
+	{
+		int c = stream_codec_ != 255 ? stream_codec_ : opt_.codec;
+		int parts = (c == 1 || c == 2) ? opt_.parallelism : c == 4 ? opt_.stripes : 0;
+		Writer par;
+		par.u16(uint16_t(std::clamp(parts, 0, 65535)));
+		send(msg::parallelism, par.d);
+	}
+	// Scanout on a panel that scans the picture's columns: Riptide's picture
+	// turned so that its stripes are bands of scan lines (streamed into the
+	// buffer on screen as each is decoded). Other codecs ignore it.
+	void send_rotation()
+	{
+		bool turn = opt_.scanout && (opt_.rotation == 1 || opt_.rotation == 3);
+		send(msg::rotation, {uint8_t(turn ? opt_.rotation : 0)});
+	}
+	std::atomic<bool> reset_pending_{false};
+
 	void connect();
 	void disconnect();
 	void send_grid();
@@ -344,6 +448,8 @@ private:
 
 void Session::on_frame(Frame &&f)
 {
+	if (reset_pending_.exchange(false))
+		reset_pipeline();
 	through_.bytes(f.bits.size());
 	bool request = false;
 	if (!gate_.admit(f.id, f.key, request, through_)) {
@@ -377,6 +483,8 @@ void Session::connect()
 		closed_reason_.clear();
 		host_format_.clear();
 	}
+	stream_codec_ = 255; // until this session's HelloAck
+	reset_pending_ = false;
 	auto c = std::make_unique<Connection>(id_, *this);
 	std::string err;
 	status("Connecting to " + opt_.host + "…");
@@ -409,15 +517,9 @@ void Session::connect()
 	if (!audio_)
 		audio_ = std::make_unique<AudioPlayer>();
 	send(msg::vrr_policy, {uint8_t(opt_.pacing == 1 ? 2 : 1)});
-	Writer par;
-	int parts = (opt_.codec == 1 || opt_.codec == 2) ? opt_.parallelism : opt_.codec == 4 ? opt_.stripes : 0;
-	par.u16(uint16_t(std::clamp(parts, 0, 65535)));
-	send(msg::parallelism, par.d);
-	// Scanout on a panel that scans the picture's columns: Riptide's picture
-	// turned so that its stripes are bands of scan lines (streamed into the
-	// buffer on screen as each is decoded). Other codecs ignore it.
+	send_parallelism();
 	if (opt_.scanout && (opt_.rotation == 1 || opt_.rotation == 3))
-		send(msg::rotation, {uint8_t(opt_.rotation)});
+		send_rotation();
 	status("");
 }
 
@@ -612,9 +714,9 @@ FN(jstring, authorizedLine)(JNIEnv *env, jclass, jlong h, jstring device)
 
 FN(void, forgetHosts)(JNIEnv *, jclass, jlong h) { S(h)->identity().forget_hosts(); }
 
-FN(void, start)(JNIEnv *env, jclass, jlong h, jstring host, jint port, jint codec, jint mbps, jint w, jint hgt,
-                jdouble hz, jboolean pieces, jint parallelism, jint stripes, jboolean awake, jboolean gpu_awake,
-                jint pacing, jboolean scanout, jint rotation)
+static gm::Options options(JNIEnv *env, jstring host, jint port, jint codec, jint mbps, jint w, jint hgt, jdouble hz,
+                           jboolean pieces, jint parallelism, jint stripes, jboolean awake, jboolean gpu_awake,
+                           jint pacing, jboolean scanout, jint rotation)
 {
 	gm::Options o;
 	o.host = str(env, host);
@@ -632,7 +734,23 @@ FN(void, start)(JNIEnv *env, jclass, jlong h, jstring host, jint port, jint code
 	o.pacing = pacing;
 	o.scanout = scanout;
 	o.rotation = rotation;
-	S(h)->start(o);
+	return o;
+}
+
+FN(void, start)(JNIEnv *env, jclass, jlong h, jstring host, jint port, jint codec, jint mbps, jint w, jint hgt,
+                jdouble hz, jboolean pieces, jint parallelism, jint stripes, jboolean awake, jboolean gpu_awake,
+                jint pacing, jboolean scanout, jint rotation)
+{
+	S(h)->start(options(env, host, port, codec, mbps, w, hgt, hz, pieces, parallelism, stripes, awake, gpu_awake, pacing,
+	                    scanout, rotation));
+}
+
+FN(void, update)(JNIEnv *env, jclass, jlong h, jstring host, jint port, jint codec, jint mbps, jint w, jint hgt,
+                 jdouble hz, jboolean pieces, jint parallelism, jint stripes, jboolean awake, jboolean gpu_awake,
+                 jint pacing, jboolean scanout, jint rotation)
+{
+	S(h)->update(options(env, host, port, codec, mbps, w, hgt, hz, pieces, parallelism, stripes, awake, gpu_awake, pacing,
+	                     scanout, rotation));
 }
 
 FN(void, stop)(JNIEnv *, jclass, jlong h) { S(h)->stop(); }

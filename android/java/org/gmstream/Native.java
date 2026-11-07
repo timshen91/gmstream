@@ -24,6 +24,10 @@ final class Native {
     static native void start(long h, String host, int port, int codec, int mbps, int width, int height,
                              double refreshHz, boolean pieces, int parallelism, int stripes,
                              boolean keepWiFiAwake, boolean keepGPUAwake, int pacing, boolean scanout, int displayRotation);
+    /** The same settings while streaming: applied in place (a new host or port reconnects). */
+    static native void update(long h, String host, int port, int codec, int mbps, int width, int height,
+                              double refreshHz, boolean pieces, int parallelism, int stripes,
+                              boolean keepWiFiAwake, boolean keepGPUAwake, int pacing, boolean scanout, int displayRotation);
     static native void stop(long h);
     static native void setSurface(long h, android.view.Surface surface);
     static native String stats(long h);

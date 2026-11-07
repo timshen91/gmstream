@@ -23,10 +23,23 @@ known-answer tests) and builds `probe`, a headless client from the same core:
 
 ## Using it
 
-Open it: the settings come up the first time (later: a three-finger tap, or
-Back). Set the host and port (plain UDP, 8444 by default), then add the line
-under "This device's key" to `~/.ssh/authorized_keys` on the host ("Copy key
-line" puts it on the clipboard); the host refuses the device until then.
+Open it: the settings come up the first time, asking for the host and port
+(plain UDP, 8444 by default). Then add this device's key line to
+`~/.ssh/authorized_keys` on the host ("Device key" in the settings puts it on
+the clipboard; it is also shown at the bottom); the host refuses the device
+until then.
+
+The settings (a three-finger tap, or Back; `java/.../SettingsPanel.java`) are
+a panel at the side of the stream, which keeps running behind it. Every row is
+a list of choices or a switch: the D-pad, the hat or the left stick moves and
+changes (A switches, L1/R1 jump, B or Back closes), or touch the arrows or the
+row; a tap on the stream closes it. Gamepads reach the host again once it is
+closed (they are let go on the host when it opens). Each change applies as it
+is made, without a new session (`Session::update`): the bitrate, size,
+tiles and stripes through their messages, the codec and "frames in pieces"
+through StreamCodec (0x13: the host starts its encoder over in the same
+session and answers HelloAck, and the decoders here start over), pacing,
+scanout, Wi-Fi and GPU awake here. Only another host or port reconnects.
 
 For scripts, the launch intent takes the settings and saves them:
 `adb shell am start -n org.gmstream/.MainActivity --es host H --ei port P
