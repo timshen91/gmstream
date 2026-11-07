@@ -602,8 +602,21 @@ static uint64_t send_feedback(struct vd_server *server, struct wlr_surface *surf
 				now, when_ns, frame, release);
 		}
 	}
-	uint64_t fixed_refresh_ns = server->grid_interval_ns != 0 ? server->grid_interval_ns
-		: 1000000000000ull / (uint64_t)server->refresh;
+	// The refresh gamescope is told: the mode's, unless the client's grid is
+	// really another rate. The grid's interval is the client's measurement and
+	// moves by nanoseconds each time it is sent; passed on as it is, gamescope
+	// read 120.000 / 120.001 Hz turn about and updated Xwayland's mode (and
+	// reallocated its buffers) on every change, ~5 times a minute, which the
+	// game sees. Frames are still placed on the grid itself (grid_vblank).
+	uint64_t mode_ns = 1000000000000ull / (uint64_t)server->refresh;
+	uint64_t fixed_refresh_ns = mode_ns;
+	if (server->grid_interval_ns != 0) {
+		uint64_t g = server->grid_interval_ns;
+		uint64_t off = g > mode_ns ? g - mode_ns : mode_ns - g;
+		if (off * 200 > mode_ns) { // more than 0.5% away
+			fixed_refresh_ns = g / 1000 * 1000; // to the microsecond: steady
+		}
+	}
 	struct wlr_presentation_event event = {
 		.output = server->output,
 		.tv_sec = when_ns / 1000000000,

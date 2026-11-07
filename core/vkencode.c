@@ -295,6 +295,11 @@ struct gm_vkencode {
 	// doubling of bytes, about 6 HEVC qp. next_q() moves a third of the error
 	// per frame and will not jump more than two thirds of a doubling.
 	unsigned q_per_doubling;
+	// The rate frames are actually encoded at (a game below the refresh
+	// rate): each frame's budget is the bitrate over this, not over the
+	// refresh, or the stream comes out short of the bitrate asked for.
+	uint64_t last_frame_ns;
+	double frame_ns_avg;
 	unsigned parallelism; // want_parallelism, as the worker last read it
 	bool sao; // HEVC: GM_HEVC_SAO, off until it is measured
 
@@ -1500,9 +1505,29 @@ static void encode_one(struct gm_vkencode *vk, struct job *job, bool keyframe,
 		keyframe = true;
 	}
 
-	// What this frame is allowed to cost, and the q index to get there.
+	// What this frame is allowed to cost, and the q index to get there: the
+	// bitrate over the rate frames come at, which is the refresh rate unless
+	// the game is slower (averaged over ~30 frames; a pause of more than a
+	// quarter second is not a rate). Never less than a quarter of the
+	// refresh rate, so one long gap cannot make a frame huge.
 	unsigned fps_milli = refresh_mhz > 0 ? (unsigned)refresh_mhz : 60000;
-	unsigned target = (unsigned)((uint64_t)bitrate_kbps * 1000 / 8 * 1000 / fps_milli);
+	uint64_t now_frame = gm_now_ns();
+	if (vk->last_frame_ns != 0 && now_frame > vk->last_frame_ns) {
+		double gap = (double)(now_frame - vk->last_frame_ns);
+		if (gap < 250e6) {
+			vk->frame_ns_avg = vk->frame_ns_avg > 0 ? vk->frame_ns_avg + (gap - vk->frame_ns_avg) / 32
+				: gap;
+		}
+	}
+	vk->last_frame_ns = now_frame;
+	unsigned budget_milli = fps_milli;
+	if (vk->frame_ns_avg > 0) {
+		double measured = 1e12 / vk->frame_ns_avg;
+		if (measured < (double)fps_milli) {
+			budget_milli = measured > fps_milli / 4.0 ? (unsigned)measured : fps_milli / 4;
+		}
+	}
+	unsigned target = (unsigned)((uint64_t)bitrate_kbps * 1000 / 8 * 1000 / budget_milli);
 	unsigned q = vk->pinned_q > 0 ? vk->pinned_q
 		: (keyframe ? vk->q_key : vk->q_inter);
 	// How many tiles: from what this frame is allowed to cost, never from what
@@ -2380,6 +2405,8 @@ void vkencode_start(struct gm_vkencode *vk, enum gm_codec codec, int bitrate_kbp
 	vk->keyframe_wanted = true;
 	vk->bitrate_kbps = bitrate_kbps;
 	vk->refresh_mhz = refresh_mhz;
+	vk->last_frame_ns = 0; // the frame rate is measured afresh
+	vk->frame_ns_avg = 0;
 	vk->packet_bytes = packet_bytes > 0 ? packet_bytes : DEFAULT_PACKET;
 	vk->chunked = (flags & GM_STREAM_CHUNKED) != 0;
 	vk->client_hdr = (flags & GM_STREAM_HDR) != 0;
