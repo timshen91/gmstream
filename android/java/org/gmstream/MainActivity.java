@@ -240,7 +240,9 @@ public final class MainActivity extends Activity implements Native.Listener, Sur
                 stats.setText(text);
                 stats.setVisibility((prefs.showStats || !status.isEmpty()) && !text.isEmpty() ? View.VISIBLE : View.GONE);
             }
-            ui.postDelayed(this, 500);
+            // Once a second: the overlay's counts (fps shown, drops, tears,
+            // composes) are since the last poll.
+            ui.postDelayed(this, 1000);
         }
     };
 

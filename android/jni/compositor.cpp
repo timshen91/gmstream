@@ -1467,6 +1467,19 @@ void Compositor::ring_presented(uint64_t seq, int, uint64_t present)
 	src->emitted = true;
 	FrameTiming t = src->t;
 	t.presented = present;
+	// Whole frames steer the phase lock the same way as streamed ones: how
+	// long it waited, ready, for the sample point that took it, modulo a
+	// refresh (one that only just missed the sample point before shows as a
+	// little late, not as a whole refresh early).
+	if (on_slack && src->ready && t.latched) {
+		double period = ps.period_ns;
+		double wait = std::fmod(double(t.latched) - double(src->ready), period);
+		if (wait < 0)
+			wait += period;
+		if (wait > period / 2)
+			wait -= period;
+		on_slack(wait);
+	}
 	double fetch = double(present) - ps.prefill_ns;
 	if (!done || double(done) <= fetch) {
 		if (on_presented)

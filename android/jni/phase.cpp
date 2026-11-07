@@ -156,7 +156,7 @@ bool PhaseLock::step(uint64_t &anchor, uint64_t &interval_out)
 		return result();
 	}
 	if (slack_.size() >= 20) {
-		// Streamed frames: each says how much later it could have come and
+		// Scanout frames: each says how much later it could have come and
 		// still gone out whole at its refresh (Compositor::on_slack). Move the
 		// host's frames later until the earliest percent of them have just a
 		// small margin left; back at once on one that tore or went late. (No
@@ -177,7 +177,7 @@ bool PhaseLock::step(uint64_t &anchor, uint64_t &interval_out)
 		expected_ = double(std::count_if(s.begin(), s.end(), [](double x) { return x >= 0; })) / double(s.size());
 		slack_steps_++;
 		if (debug_phase())
-			LOGI("phase: streamed, slack p1 %.2f min %.2f p50 %.2f ms, shift %+.2f (moved %+.2f)", low / 1e6,
+			LOGI("phase: slack p1 %.2f min %.2f p50 %.2f ms, shift %+.2f (moved %+.2f)", low / 1e6,
 			     least / 1e6, s[s.size() / 2] / 1e6, shift_ / 1e6, move / 1e6);
 		since_ = now_ns() + 100000000ull;
 		return result();
@@ -312,7 +312,7 @@ std::string PhaseLock::summary()
 		snprintf(b, sizeof(b), "phase: sweeping %zu/%d, shift %+.1f ms, refresh %.3f ms", sweep_.size(),
 		         int(std::ceil(interval() / sweep_step)), shift_ / 1e6, interval() / 1e6);
 	else if (slack_steps_ > 0)
-		snprintf(b, sizeof(b), "phase: streamed, shift %+.1f ms, refresh %.3f ms, slack p1 %.2f ms, %.1f%% untorn",
+		snprintf(b, sizeof(b), "phase: on slack, shift %+.1f ms, refresh %.3f ms, slack p1 %.2f ms, %.1f%% made it",
 		         shift_ / 1e6, interval() / 1e6, target_ / 1e6, expected_ * 100);
 	else if (has_target_)
 		snprintf(b, sizeof(b), "phase: locked, shift %+.1f ms, refresh %.3f ms, host lead %.2f ms, %.0f%% shown expected",

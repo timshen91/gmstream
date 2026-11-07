@@ -57,9 +57,10 @@ public:
 	// torn (its compose ended after the buffer's prefetch began).
 	std::function<void(const FrameTiming &)> on_presented, on_dropped;
 	std::function<void(const FrameTiming &, int row)> on_torn;
-	// Streamed frames: how much later the frame could have come and still made
-	// its refresh, whole (negative: it tore, or only just missed the refresh
-	// before and went out a refresh late). The phase lock steers on it.
+	// How much later each shown frame could have come and still made its
+	// refresh (streamed: whole, against its rows' deadlines; whole frames:
+	// its sample point). Negative: it tore, or only just missed the refresh
+	// before and went out a refresh late. The phase lock steers on it.
 	std::function<void(double ns)> on_slack;
 
 	// Starts (or restarts, for a new size) with pictures of w x h shown turned

@@ -130,10 +130,18 @@ What root would add, and the independent root service to hold it: ROOT.md.
 Streamed, the last stripe is typically done as the transfer starts, and a row r
 leaves for the panel at the transfer's start + r x 4.0 us. What is not hidden
 is stripe 0's own path: its encode, network and decode (128 rows, Riptide's
-smallest stripe) and the margin the phase lock keeps. In a game on the live
-session, AV1's frames waited a whole refresh for their sample point (a phase
-lock issue on the whole-frame path, open); streamed frames are steered on
-their own slack and do not.
+smallest stripe) and the margin the phase lock keeps.
+
+In scanout mode the phase lock steers on each shown frame's slack (how much
+later it could have come and still made its refresh: streamed frames against
+their rows' deadlines, whole frames against their sample point, modulo a
+refresh so that just missing reads as late), moving the host until the
+earliest percent have ~0.5 ms left. Its usual servo could not do this: a frame
+that just misses a sample point goes out at the next and counts as on time, so
+it never learned that shorter waits were safe, and parked AV1 frames ~4 ms
+early (Ender Lilies, live: total 10.5 -> 7.5 / 8.2 ms p50 / p99). Low latency
+pacing (no lock) gains nothing here: the panel's grid is fixed, so free-running
+frames wait 0-8.3 ms for it.
 
 ## Measured (2026-11-06, through SurfaceFlinger; Odin 3 over the router to the host's wired port, vkcube 1920x1080)
 
