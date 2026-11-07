@@ -2,6 +2,7 @@
 
 #include "riptide_inter.hpp"
 #include <algorithm>
+#include <stdlib.h>
 #include <string.h>
 
 namespace Riptide
@@ -14,6 +15,15 @@ InterGeometry::InterGeometry(int width, int height)
 	mh = (height + 31) / 32;
 	tw = (vw + 3) / 4;
 	th = (vh + 3) / 4;
+}
+
+uint32_t inter_side_cap_bits(size_t target_bytes)
+{
+	static const double share = getenv("RT_SIDE_CAP") ? atof(getenv("RT_SIDE_CAP")) : 0.5;
+	if (target_bytes == 0 || share <= 0.0)
+		return UINT32_MAX;
+	double bits = double(target_bytes) * 8.0 * share;
+	return bits >= double(UINT32_MAX) ? UINT32_MAX : uint32_t(bits);
 }
 
 static uint32_t zigzag(int d)

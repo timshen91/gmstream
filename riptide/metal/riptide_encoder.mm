@@ -1041,8 +1041,9 @@ riptide_result encode_frame(riptide_encoder encoder, id<MTLTexture> const planes
 		// and the map's size to the rate control (it only adds to the payload
 		// analyze_rate_control accumulates, so nothing waits for it but resolve).
 		[enc setComputePipelineState:device->side_cost_pipeline];
-		const uint32_t inter_boundary = uint32_t(encoder->inter_packet_boundary);
-		[enc setBytes:&inter_boundary length:sizeof(inter_boundary) atIndex:0];
+		const struct { uint32_t boundary, side_cap_bits; } side = {
+			uint32_t(encoder->inter_packet_boundary), Riptide::inter_side_cap_bits(target_size) };
+		[enc setBytes:&side length:sizeof(side) atIndex:0];
 		[enc setBuffer:encoder->bucket_buffer offset:0 atIndex:4];
 		[enc setTexture:encoder->vectors[1] atIndex:1];
 		[enc setTexture:encoder->vectors_prev atIndex:2];

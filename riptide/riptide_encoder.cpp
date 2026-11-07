@@ -128,6 +128,9 @@ struct Encoder::Impl final : public WaveletBuffers
 		ImageHandle weights, vectors_prev, vectors[2], prediction[NumComponents];
 		BufferHandle readback; // the map (padded to a word), then the vectors
 		size_t packet_boundary = 1100;
+		// The side information's share of this frame's target at most, in bits
+		// (inter_side_cost.comp); unlimited when the front runs on its own.
+		uint32_t side_cap_bits = UINT32_MAX;
 		// The vectors the next frame codes against (CPU copy of vectors_prev to be),
 		// whether to upload them, and the ones this frame was coded against.
 		std::vector<int16_t> mv_state, mv_frame_prev, mv;
@@ -1334,8 +1337,8 @@ bool Encoder::Impl::inter_search_and_decide(CommandBuffer &cmd, const ViewBuffer
 	cmd.set_program(shaders.inter_side_cost);
 	cmd.set_specialization_constant_mask(1);
 	cmd.set_specialization_constant(0, true);
-	const uint32_t boundary = uint32_t(inter.packet_boundary);
-	cmd.push_constants(&boundary, 0, sizeof(boundary));
+	const struct { uint32_t boundary, side_cap_bits; } side = { uint32_t(inter.packet_boundary), inter.side_cap_bits };
+	cmd.push_constants(&side, 0, sizeof(side));
 	cmd.set_storage_texture(0, 1, inter.vectors[1]->get_view());
 	cmd.set_texture(0, 2, inter.vectors_prev->get_view(), *mirror_repeat_sampler);
 	cmd.set_texture(0, 3, inter.weights->get_view(), *mirror_repeat_sampler);
@@ -1431,7 +1434,10 @@ bool Encoder::Impl::encode_back(CommandBuffer &cmd, const ViewBuffers &views, co
 
 bool Encoder::Impl::encode(CommandBuffer &cmd, const ViewBuffers &views, const BitstreamBuffers &buffers)
 {
-	return encode_front(cmd, views) && encode_back(cmd, views, buffers);
+	inter.side_cap_bits = inter_side_cap_bits(buffers.target_size);
+	bool ok = encode_front(cmd, views);
+	inter.side_cap_bits = UINT32_MAX;
+	return ok && encode_back(cmd, views, buffers);
 }
 
 Encoder::Encoder()

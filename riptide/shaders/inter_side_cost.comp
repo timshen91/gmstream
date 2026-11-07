@@ -12,6 +12,14 @@
 // frame's, which costs nothing to send: its own value only reaches the
 // prediction in the blend toward its predicted neighbours. (Experiment knob:
 // FreeIntraVectors, default on.)
+//
+// Then the cap. The side information cannot be dropped by the rate control, so
+// when it alone would take more than `side_cap_bits` of the target, the tiles
+// whose records cost the most go back to last frame's vectors (a tile record of
+// map bits and two zero widths) until the rest fits. Without it a low target
+// left the coefficients nothing: the frame overran its budget, the prediction's
+// errors were never corrected, a worse reference made noisier vectors, and the
+// picture decayed for good. A frame whose side information fits is untouched.
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const bool FreeIntraVectors = true;
 
@@ -27,12 +35,16 @@ layout(set = 0, binding = 3) uniform mediump sampler2D uWeights;
 layout(push_constant) uniform Registers
 {
     uint packet_boundary; // bytes per inter packet at most
+    uint side_cap_bits;   // the side information's share of the target at most
 };
 
 const int MaxTiles = 4096; // 5K; beyond, an estimate
 shared uint s_tile_bits[MaxTiles];
 
 shared uint s_bits[256];
+const uint Bins = 512u; // a tile record is at most 4 + 8 + 16 * 2 * 15 bits
+shared uint s_saved[Bins]; // bits saved by freezing the tiles of each record size
+shared uint s_threshold;
 
 uint zigzag(int d)
 {
@@ -70,6 +82,8 @@ void main()
             s_tile_bits[t] = tb;
         bits += tb;
     }
+    for (uint b = gl_LocalInvocationIndex; b < Bins; b += 256u)
+        s_saved[b] = 0u;
     s_bits[gl_LocalInvocationIndex] = bits;
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u)
@@ -78,10 +92,50 @@ void main()
             s_bits[gl_LocalInvocationIndex] += s_bits[gl_LocalInvocationIndex + s];
         barrier();
     }
+
+    int count = tiles.x * tiles.y;
+    if (s_bits[0] > side_cap_bits && count <= MaxTiles)
+    {
+        // What freezing each tile saves, by its record size.
+        for (int t = int(gl_LocalInvocationIndex); t < count; t += 256)
+        {
+            ivec2 base = ivec2(t % tiles.x, t / tiles.x) * 4;
+            ivec2 tm = min(ivec2(2), msize - (base / 2));
+            uint frozen = uint(tm.x * tm.y) + 8u;
+            atomicAdd(s_saved[min(s_tile_bits[t], Bins - 1u)], s_tile_bits[t] - frozen);
+        }
+        barrier();
+        if (gl_LocalInvocationIndex == 0u)
+        {
+            // The smallest record size from which up freezing brings it under the cap.
+            uint total = s_bits[0];
+            uint b = Bins;
+            while (b > 0u && total > side_cap_bits)
+            {
+                b--;
+                total -= s_saved[b];
+            }
+            s_threshold = b;
+            s_bits[0] = total;
+        }
+        barrier();
+        uint threshold = s_threshold;
+        for (int t = int(gl_LocalInvocationIndex); t < count; t += 256)
+        {
+            if (min(s_tile_bits[t], Bins - 1u) < threshold)
+                continue;
+            ivec2 base = ivec2(t % tiles.x, t / tiles.x) * 4;
+            for (int y = base.y; y < min(base.y + 4, size.y); y++)
+                for (int x = base.x; x < min(base.x + 4, size.x); x++)
+                    imageStore(uVectors, ivec2(x, y), ivec4(texelFetch(uVectorsPrev, ivec2(x, y), 0).xy, 0, 0));
+            ivec2 tm = min(ivec2(2), msize - (base / 2));
+            s_tile_bits[t] = uint(tm.x * tm.y) + 8u;
+        }
+        barrier();
+    }
     if (gl_LocalInvocationIndex == 0u)
     {
         uint total = 0u;
-        int count = tiles.x * tiles.y;
         if (count <= MaxTiles)
         {
             // Greedily in tile order, whole records per packet: 8 header bytes,

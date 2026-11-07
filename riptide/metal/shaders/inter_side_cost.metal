@@ -70,6 +70,7 @@ constant bool FreeIntraVectors = is_function_constant_defined(FreeIntraVectors_t
 struct Registers
 {
     uint packet_boundary;
+    uint side_cap_bits;
 };
 
 struct Buckets
@@ -93,10 +94,12 @@ uint zigzag(thread const int& d)
     return _18;
 }
 
-kernel void riptide_inter_side_cost(constant Registers& _336 [[buffer(0)]], device Buckets& buckets [[buffer(4)]], texture2d<int, access::read_write> uVectors [[texture(1)]], texture2d<int> uVectorsPrev [[texture(2)]], texture2d<float> uWeights [[texture(3)]], sampler uVectorsPrevSmplr [[sampler(2)]], sampler uWeightsSmplr [[sampler(3)]], uint gl_LocalInvocationIndex [[thread_index_in_threadgroup]])
+kernel void riptide_inter_side_cost(constant Registers& _316 [[buffer(0)]], device Buckets& buckets [[buffer(4)]], texture2d<int, access::read_write> uVectors [[texture(1)]], texture2d<int> uVectorsPrev [[texture(2)]], texture2d<float> uWeights [[texture(3)]], sampler uVectorsPrevSmplr [[sampler(2)]], sampler uWeightsSmplr [[sampler(3)]], uint gl_LocalInvocationIndex [[thread_index_in_threadgroup]])
 {
     threadgroup spvUnsafeArray<uint, 4096> s_tile_bits;
+    threadgroup spvUnsafeArray<uint, 512> s_saved;
     threadgroup spvUnsafeArray<uint, 256> s_bits;
+    threadgroup uint s_threshold;
     int2 size = int2(uVectors.get_width(), uVectors.get_height());
     int2 tiles = (size + int2(3)) / int2(4);
     int2 msize = int2(uWeights.get_width(), uWeights.get_height());
@@ -144,6 +147,10 @@ kernel void riptide_inter_side_cost(constant Registers& _336 [[buffer(0)]], devi
         }
         bits += tb;
     }
+    for (uint b = gl_LocalInvocationIndex; b < 512u; b += 256u)
+    {
+        s_saved[b] = 0u;
+    }
     s_bits[gl_LocalInvocationIndex] = bits;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = 128u; s > 0u; s = s >> 1u)
@@ -154,29 +161,92 @@ kernel void riptide_inter_side_cost(constant Registers& _336 [[buffer(0)]], devi
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    int count = tiles.x * tiles.y;
+    if ((s_bits[0] > _316.side_cap_bits) && (count <= 4096))
+    {
+        int _328 = int(gl_LocalInvocationIndex);
+        for (int t_1 = _328; t_1 < count; t_1 += 256)
+        {
+            int2 base_1 = int2(spvSMod(t_1, tiles.x), t_1 / tiles.x) * int2(4);
+            int2 tm_1 = min(int2(2), (msize - (base_1 / int2(2))));
+            uint frozen = uint(tm_1.x * tm_1.y) + 8u;
+            uint _375 = atomic_fetch_add_explicit((threadgroup atomic_uint*)&s_saved[min(s_tile_bits[t_1], 511u)], s_tile_bits[t_1] - frozen, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (gl_LocalInvocationIndex == 0u)
+        {
+            uint total = s_bits[0];
+            uint b_1 = 512u;
+            for (;;)
+            {
+                bool _392 = b_1 > 0u;
+                bool _399;
+                if (_392)
+                {
+                    _399 = total > _316.side_cap_bits;
+                }
+                else
+                {
+                    _399 = _392;
+                }
+                if (_399)
+                {
+                    b_1--;
+                    total -= s_saved[b_1];
+                    continue;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            s_threshold = b_1;
+            s_bits[0] = total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint threshold = s_threshold;
+        int _415 = int(gl_LocalInvocationIndex);
+        for (int t_2 = _415; t_2 < count; t_2 += 256)
+        {
+            if (min(s_tile_bits[t_2], 511u) < threshold)
+            {
+                continue;
+            }
+            int2 base_2 = int2(spvSMod(t_2, tiles.x), t_2 / tiles.x) * int2(4);
+            for (int y_1 = base_2.y; y_1 < min((base_2.y + 4), size.y); y_1++)
+            {
+                for (int x_1 = base_2.x; x_1 < min((base_2.x + 4), size.x); x_1++)
+                {
+                    uVectors.write(int4(uVectorsPrev.read(uint2(int2(x_1, y_1)), 0).xy, 0, 0), uint2(int2(x_1, y_1)));
+                }
+            }
+            int2 tm_2 = min(int2(2), (msize - (base_2 / int2(2))));
+            s_tile_bits[t_2] = uint(tm_2.x * tm_2.y) + 8u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (gl_LocalInvocationIndex == 0u)
     {
-        uint total = 0u;
-        int count = tiles.x * tiles.y;
+        uint total_1 = 0u;
         if (count <= 4096)
         {
             uint open_bits = 0u;
             bool open = false;
-            for (int t_1 = 0; t_1 < count; t_1++)
+            for (int t_3 = 0; t_3 < count; t_3++)
             {
-                uint b = s_tile_bits[t_1];
-                bool _341;
+                uint b_2 = s_tile_bits[t_3];
+                bool _555;
                 if (open)
                 {
-                    _341 = (8u + (4u * (((open_bits + b) + 31u) / 32u))) > _336.packet_boundary;
+                    _555 = (8u + (4u * (((open_bits + b_2) + 31u) / 32u))) > _316.packet_boundary;
                 }
                 else
                 {
-                    _341 = open;
+                    _555 = open;
                 }
-                if (_341)
+                if (_555)
                 {
-                    total += (8u + (4u * ((open_bits + 31u) / 32u)));
+                    total_1 += (8u + (4u * ((open_bits + 31u) / 32u)));
                     open = false;
                 }
                 if (!open)
@@ -184,19 +254,19 @@ kernel void riptide_inter_side_cost(constant Registers& _336 [[buffer(0)]], devi
                     open_bits = 0u;
                     open = true;
                 }
-                open_bits += b;
+                open_bits += b_2;
             }
             if (open)
             {
-                total += (8u + (4u * ((open_bits + 31u) / 32u)));
+                total_1 += (8u + (4u * ((open_bits + 31u) / 32u)));
             }
         }
         else
         {
             uint bytes = (s_bits[0] + 7u) / 8u;
-            total = bytes + (((bytes / max((_336.packet_boundary - 80u), 1u)) + 1u) * 80u);
+            total_1 = bytes + (((bytes / max((_316.packet_boundary - 80u), 1u)) + 1u) * 80u);
         }
-        uint _398 = atomic_fetch_add_explicit((device atomic_uint*)&buckets.consumed_payload, (total + 3u) / 4u, memory_order_relaxed);
+        uint _612 = atomic_fetch_add_explicit((device atomic_uint*)&buckets.consumed_payload, (total_1 + 3u) / 4u, memory_order_relaxed);
     }
 }
 

@@ -370,3 +370,23 @@ decode within 0.01% of luma samples, loss replay across stripes exact.
   stripe; a completion mark polled instead of the fence; the packing and rate
   analysis bands in one dispatch each (`Batched`); the stripes over two compute
   queues; on Metal, the dequant bands in one dispatch (slower).
+
+**Step 18** (fix: low rates collapsed). The side information (map and
+vectors) is charged to the rate control but cannot be dropped by it, and at
+2560x1600 a moving clip's vectors alone came to 15-20 KB a frame. Below ~20 KB
+the P frames overran their target 2-3x, the coefficients got almost nothing,
+the prediction's errors were never corrected, the worse reference made noisier
+vectors, and the picture decayed for good (Euro Truck 2560x1600, 5 stripes,
+30 frames, PSNR-Y from frame 10: 20 KB 20.8 dB, 10 KB 15.0, 5 KB 14.5, all
+below the intra frame's). Now `inter_side_cost.comp` caps the side information
+at half the stripe's target (`inter_side_cap_bits`, `RT_SIDE_CAP` to measure):
+past it, the tiles whose records cost the most are sent as last frame's
+vectors (a tile record of map bits and two zero widths). Same clip: 25.2 /
+23.2 / 21.3 dB, every frame on its target; 100 KB unchanged byte for byte.
+Share 0.25 / 0.35 / 0.5 / 0.7 at 40 / 20 / 10 / 5 KB (one stripe): 27.8 /
+28.7 / 28.8 / 28.8, 25.1 / 25.2 / 25.2 / 25.3, 23.6 / 23.5 / 23.2 / 23.1,
+22.2 / 22.0 / 21.5 / 20.7. The Metal decode matches the encoder's to rounding
+(MSE <= 0.0006). Left: at 2.6 KB the map bits of a frozen field are ~60% of the
+budget and inter (17.9 dB) is under intra (21.3); gmstream's host also lifts a
+budget under 512 bytes a stripe to that floor (the encoder refused it, so 1 Mb/s
+at 120 Hz sent nothing).

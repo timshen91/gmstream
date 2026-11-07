@@ -44,6 +44,11 @@ struct InterGeometry
 // shaders/inter_side_cost.comp.
 uint32_t inter_tile_bits(const InterGeometry &g, int tile, const int16_t *mv, const int16_t *mv_prev);
 
+// The side information's share of a frame's target at most, in bits: past it,
+// shaders/inter_side_cost.comp sends the costliest tiles as last frame's
+// vectors. RT_SIDE_CAP (a fraction of the target) is for measuring.
+uint32_t inter_side_cap_bits(size_t target_bytes);
+
 // How the records are split into packets: greedily in tile order, each packet
 // as many whole records as fit in `packet_boundary` bytes (header and padding
 // to a word included). Returns the total bytes, and the packets' first tiles
